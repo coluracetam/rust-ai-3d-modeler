@@ -1,6 +1,7 @@
 struct GlobalUniforms {
     view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
+    clip_plane: vec4<f32>,
 };
 
 struct ObjectUniforms {
@@ -12,6 +13,7 @@ struct ObjectUniforms {
     tex_params: vec4<f32>,
     // xyz = emission_color, w = emission_strength
     emission: vec4<f32>,
+    inspection: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -206,6 +208,7 @@ fn evaluate_procedural_pattern(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if (dot(global.clip_plane.xyz, in.world_pos) + global.clip_plane.w < 0.0) { discard; }
     let mode = i32(round(object.params.z));
     if (mode == 2) {
         return vec4<f32>(in.color, 1.0);
@@ -236,7 +239,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let spec = pow(max(dot(N, H), 0.0), 28.0) * 0.18;
         let ambient = mix(vec3<f32>(0.18, 0.14, 0.13), vec3<f32>(0.34, 0.28, 0.25), N.y * 0.5 + 0.5);
         let col = clay_base * (ambient + vec3<f32>(0.85, 0.82, 0.78) * ndotl + fill) + vec3<f32>(spec + rim) + emissive;
-        return vec4<f32>(col, 1.0);
+        return vec4<f32>(col, object.inspection.x);
     }
 
     // Mode 0: Studio 3-Point PBR-inspired lighting + Procedural Texture + Emissive Glow
@@ -261,5 +264,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let spec_color = mix(vec3<f32>(1.0), surface_color, metallic);
 
     let final_rgb = surface_color * diffuse_light * (1.0 - metallic * 0.45) + spec_color * spec + emissive;
-    return vec4<f32>(final_rgb, 1.0);
+    return vec4<f32>(final_rgb, object.inspection.x);
 }

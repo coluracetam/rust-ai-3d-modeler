@@ -2,16 +2,16 @@ use crate::camera::OrbitCamera;
 use crate::history::UndoHistory;
 use crate::io;
 use crate::mesh::{EditElementMode, Mesh};
-use crate::renderer::{render_scene_headless_to_png, ViewportShading};
+use crate::renderer::{ViewportShading, render_scene_headless_to_png};
 use crate::scene::{InteractionMode, ProceduralPattern, Scene};
 use crate::ui::UiState;
 use crate::voxel::{
-    apply_sculpt_stroke, voxel_remesh, SculptBrush, SculptSettings, VoxelBrushOp, VoxelGrid,
-    VoxelMeshingMode,
+    SculptBrush, SculptSettings, VoxelBrushOp, VoxelGrid, VoxelMeshingMode, apply_sculpt_stroke,
+    voxel_remesh,
 };
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 pub const IPC_SOCKET_PATH: &str = "/tmp/rust_modeler_ipc.sock";
@@ -172,16 +172,17 @@ pub fn summarize_scene(
 
     let current_targets = scene.collect_current_target_sections(0.45);
     let active_selection = scene.active_object().map(|obj| {
-        let bounds_info = obj.mesh.selected_faces_bounds_and_normal().map(
-            |(c, n, min_b, max_b)| {
-                json!({
-                    "local_centroid": c.to_array(),
-                    "local_normal": n.to_array(),
-                    "local_bounds_min": min_b.to_array(),
-                    "local_bounds_max": max_b.to_array(),
-                })
-            },
-        );
+        let bounds_info =
+            obj.mesh
+                .selected_faces_bounds_and_normal()
+                .map(|(c, n, min_b, max_b)| {
+                    json!({
+                        "local_centroid": c.to_array(),
+                        "local_normal": n.to_array(),
+                        "local_bounds_min": min_b.to_array(),
+                        "local_bounds_max": max_b.to_array(),
+                    })
+                });
         json!({
             "object_id": obj.id,
             "object_name": obj.name,
@@ -207,6 +208,10 @@ pub fn summarize_scene(
         "unresolved_comments_count": unresolved_comments.len(),
         "unresolved_comments": unresolved_comments,
         "active_selection": active_selection,
+        "project_name": scene.project_name,
+        "units": scene.units,
+        "project_path": scene.project_path,
+        "revision_count": scene.revisions.len(),
         "camera": {
             "target": camera.target.to_array(),
             "distance": camera.distance,
@@ -222,7 +227,38 @@ pub fn summarize_scene(
     })
 }
 
-/// Executes an MCP tool command against the scene and state.
+pub fn allowed_during_operation(tool: &str) -> bool {
+    is_read_only(tool)
+        || matches!(
+            tool,
+            "update_comment" | "reattach_comment" | "delete_comment" | "save_project"
+        )
+}
+
+pub fn is_geometry_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "clear_scene"
+            | "add_primitive"
+            | "transform_object"
+            | "set_material"
+            | "duplicate_object"
+            | "delete_object"
+            | "edit_mesh"
+            | "sculpt_stroke"
+            | "voxel_brush"
+            | "voxel_remesh"
+            | "import_model"
+    )
+}
+
+pub fn is_read_only(tool: &str) -> bool {
+    matches!(
+        tool,
+        "get_scene_info" | "get_comments" | "get_revisions" | "capture_viewport" | "capture_studio"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn execute_ipc_command(
     req: &IpcRequest,
@@ -234,9 +270,296 @@ pub fn execute_ipc_command(
     show_wireframe: &mut bool,
     show_grid: &mut bool,
 ) -> IpcResponse {
+    let start = std::time::Instant::now();
+    let response = dispatch(
+        req,
+        scene,
+        camera,
+        history,
+        ui_state,
+        shading,
+        show_wireframe,
+        show_grid,
+    );
+    if !is_read_only(&req.tool) {
+        ui_state.activity.push(format!(
+            "{} · {} · {:.2}s",
+            req.tool,
+            if response.ok { "Done" } else { "Failed" },
+            start.elapsed().as_secs_f32()
+        ));
+        if ui_state.activity.len() > 24 {
+            ui_state.activity.remove(0);
+        }
+        if response.ok {
+            ui_state.scene_dirty_for_disk = true;
+            ui_state.last_error = None;
+        }
+    }
+    if !response.ok {
+        ui_state.last_error = Some(response.message.clone());
+    }
+    response
+}
+
+/// Executes an MCP tool command against the scene and state.
+#[allow(clippy::too_many_arguments)]
+fn dispatch(
+    req: &IpcRequest,
+    scene: &mut Scene,
+    camera: &mut OrbitCamera,
+    history: &mut UndoHistory,
+    ui_state: &mut UiState,
+    shading: &mut ViewportShading,
+    show_wireframe: &mut bool,
+    show_grid: &mut bool,
+) -> IpcResponse {
     let args = &req.args;
+    if scene
+        .revisions
+        .iter()
+        .any(|r| r.status == crate::review::RevisionStatus::ReadyForReview)
+        && (is_geometry_tool(&req.tool)
+            || matches!(req.tool.as_str(), "undo" | "redo" | "open_project"))
+    {
+        return IpcResponse::error(
+            "Accept or revert the pending revision before changing geometry",
+        );
+    }
+    if scene.preview_revision.is_some()
+        && !is_read_only(&req.tool)
+        && !matches!(
+            req.tool.as_str(),
+            "accept_revision" | "revert_revision" | "cancel_revision" | "preview_revision"
+        )
+    {
+        return IpcResponse::error("Return to the live scene before editing");
+    }
+    if scene
+        .revisions
+        .iter()
+        .any(|r| r.status == crate::review::RevisionStatus::InProgress)
+        && matches!(req.tool.as_str(), "undo" | "redo" | "open_project")
+    {
+        return IpcResponse::error("Finish or cancel the active revision first");
+    }
 
     match req.tool.as_str() {
+        "save_project" => {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| scene.project_path.clone());
+            let Some(path) = path.filter(|p| !p.trim().is_empty()) else {
+                return IpcResponse::error("Choose a project file path");
+            };
+            let path = match crate::project::absolute_path(&path) {
+                Ok(p) => p,
+                Err(e) => return IpcResponse::error(e),
+            };
+            let old_path = scene.project_path.clone();
+            scene.project_path = Some(path.clone());
+            match crate::project::save(Path::new(&path), scene, camera) {
+                Ok(()) => {
+                    ui_state.status_message = format!("Saved {path}");
+                    IpcResponse::success("Project saved", json!({"path":path}))
+                }
+                Err(e) => {
+                    scene.project_path = old_path;
+                    IpcResponse::error(e)
+                }
+            }
+        }
+        "open_project" => {
+            let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+                return IpcResponse::error("Missing project path");
+            };
+            let path = match crate::project::absolute_path(path) {
+                Ok(p) => p,
+                Err(e) => return IpcResponse::error(e),
+            };
+            let source = if args
+                .get("recover")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                crate::project::autosave_path(Path::new(&path))
+            } else {
+                Path::new(&path).to_path_buf()
+            };
+            match crate::project::load(&source) {
+                Ok(mut project) => {
+                    history.record("Open project", scene);
+                    project.scene.project_path = Some(path.clone());
+                    *scene = project.scene;
+                    *camera = project.camera;
+                    ui_state.hover_preview_faces.clear();
+                    ui_state.hover_preview_obj_id = None;
+                    ui_state.clip_enabled = false;
+                    ui_state.measure_points.clear();
+                    ui_state.screenshot_cache.clear();
+                    ui_state.status_message = format!("Opened {path}");
+                    IpcResponse::success("Project opened", json!({"path":path}))
+                }
+                Err(e) => IpcResponse::error(e),
+            }
+        }
+        "begin_revision" => {
+            let label = args
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Agent revision")
+                .to_string();
+            let before = scene.clone();
+            match scene.begin_revision(label, args.get("comment_id").and_then(|v| v.as_u64())) {
+                Ok(id) => {
+                    history.record("Agent revision", &before);
+                    IpcResponse::success("Revision started", json!({"revision_id":id}))
+                }
+                Err(e) => IpcResponse::error(e),
+            }
+        }
+        "finish_revision" => {
+            let id = args
+                .get("revision_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let screenshots = args
+                .get("screenshots")
+                .and_then(|v| v.as_array())
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match scene.finish_revision(
+                id,
+                args.get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into(),
+                screenshots,
+            ) {
+                Ok(()) => IpcResponse::success("Ready for review", json!({"revision_id":id})),
+                Err(e) => IpcResponse::error(e),
+            }
+        }
+        "accept_revision" | "revert_revision" | "cancel_revision" => {
+            let id = args
+                .get("revision_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let before = scene.clone();
+            match scene.review_revision(id, req.tool == "accept_revision") {
+                Ok(()) => {
+                    if req.tool != "accept_revision" {
+                        history.record("Revert revision", &before);
+                    }
+                    IpcResponse::success("Revision reviewed", json!({"revision_id":id}))
+                }
+                Err(e) => IpcResponse::error(e),
+            }
+        }
+        "preview_revision" => {
+            if args.get("live").and_then(|v| v.as_bool()).unwrap_or(false) {
+                scene.preview_revision = None;
+            } else {
+                let id = args
+                    .get("revision_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if !scene.revisions.iter().any(|r| r.id == id) {
+                    return IpcResponse::error("Revision not found");
+                }
+                scene.preview_revision = Some((
+                    id,
+                    args.get("before").and_then(|v| v.as_bool()).unwrap_or(true),
+                ));
+            }
+            IpcResponse::success("Updated comparison", json!({}))
+        }
+        "get_revisions" => {
+            let revisions: Vec<_> = scene.revisions.iter().map(|r| json!({"id":r.id,"label":r.label,"comment_id":r.comment_id,"status":r.status,"summary":r.summary,"screenshots":r.screenshots,"changed_objects":scene.changed_objects(r.id)})).collect();
+            IpcResponse::success("Revision history", json!({"revisions":revisions}))
+        }
+        "update_comment" => {
+            let id = args.get("comment_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            if args.get("status").is_some()
+                && scene.revisions.iter().any(|r| {
+                    r.comment_id == Some(id)
+                        && matches!(
+                            r.status,
+                            crate::review::RevisionStatus::InProgress
+                                | crate::review::RevisionStatus::ReadyForReview
+                        )
+                })
+            {
+                return IpcResponse::error(
+                    "Use the linked revision to update this comment's review status",
+                );
+            }
+            if let Some(status) = args.get("status") {
+                let Ok(status) =
+                    serde_json::from_value::<crate::scene::CommentStatus>(status.clone())
+                else {
+                    return IpcResponse::error("Invalid comment status");
+                };
+                if let Err(e) = scene.set_comment_status(id, status) {
+                    return IpcResponse::error(e);
+                }
+            }
+            let Some(c) = scene.comments.iter_mut().find(|c| c.id == id) else {
+                return IpcResponse::error("Comment not found");
+            };
+            if let Some(text) = args
+                .get("reply")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.trim().is_empty())
+            {
+                c.replies.push(crate::scene::CommentReply {
+                    author: args
+                        .get("author")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Agent")
+                        .into(),
+                    text: text.into(),
+                });
+            }
+            IpcResponse::success("Comment updated", json!({"comment":c}))
+        }
+        "delete_comment" => {
+            let id = args.get("comment_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            if scene.revisions.iter().any(|r| {
+                r.comment_id == Some(id)
+                    && matches!(
+                        r.status,
+                        crate::review::RevisionStatus::InProgress
+                            | crate::review::RevisionStatus::ReadyForReview
+                    )
+            }) {
+                return IpcResponse::error(
+                    "Review the linked revision before deleting its comment",
+                );
+            }
+            if !scene.comments.iter().any(|c| c.id == id) {
+                return IpcResponse::error("Comment not found");
+            }
+            scene.comments.retain(|c| c.id != id);
+            if scene.active_comment_id == Some(id) {
+                scene.active_comment_id = None;
+            }
+            IpcResponse::success("Comment deleted", json!({}))
+        }
+        "reattach_comment" => {
+            let id = args.get("comment_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            match scene.reattach_comment(id, ui_state.selection_radius) {
+                Ok(()) => IpcResponse::success("Comment reattached", json!({})),
+                Err(e) => IpcResponse::error(e),
+            }
+        }
+
         "get_scene_info" => {
             let info = summarize_scene(scene, camera, *shading, *show_wireframe, *show_grid);
             IpcResponse::success("Retrieved scene info", info)
@@ -359,7 +682,8 @@ pub fn execute_ipc_command(
             let obj = &mut scene.objects[idx];
 
             if !args["position"].is_null() {
-                obj.transform.translation = parse_vec3(&args["position"], obj.transform.translation);
+                obj.transform.translation =
+                    parse_vec3(&args["position"], obj.transform.translation);
             }
             if !args["translate_delta"].is_null() {
                 obj.transform.translation += parse_vec3(&args["translate_delta"], Vec3::ZERO);
@@ -442,8 +766,7 @@ pub fn execute_ipc_command(
                     .unwrap_or(0.45) as f32;
                 let crevice = parse_color(&args["crevice_color"], [0.16, 0.16, 0.20]);
                 let wear = parse_color(&args["wear_color"], [1.0, 0.96, 0.88]);
-                obj.mesh
-                    .bake_ao_and_curvature(ao_s, wear_s, crevice, wear);
+                obj.mesh.bake_ao_and_curvature(ao_s, wear_s, crevice, wear);
             }
 
             if !args["top_coat_color"].is_null() || !args["bottom_color"].is_null() {
@@ -466,9 +789,8 @@ pub fn execute_ipc_command(
                     .get("top_coat_strength")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.65) as f32;
-                obj.mesh.paint_gradient_and_normal_coat(
-                    bot, top, g_blend, coat, thresh, strength,
-                );
+                obj.mesh
+                    .paint_gradient_and_normal_coat(bot, top, g_blend, coat, thresh, strength);
             }
 
             obj.mesh.bump_version();
@@ -561,10 +883,7 @@ pub fn execute_ipc_command(
             } else if !args["select_faces_by_normal"].is_null() {
                 let target_n =
                     parse_vec3(&args["select_faces_by_normal"], Vec3::Y).normalize_or_zero();
-                let min_dot = args
-                    .get("min_dot")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.65) as f32;
+                let min_dot = args.get("min_dot").and_then(|v| v.as_f64()).unwrap_or(0.65) as f32;
                 obj.mesh.selected_faces.clear();
                 for fi in 0..obj.mesh.faces.len() {
                     if obj.mesh.face_normal(fi).dot(target_n) >= min_dot {
@@ -986,6 +1305,40 @@ pub fn execute_ipc_command(
             }
         }
 
+        "capture_studio" => {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("/tmp/spatial_studio.png");
+            let width = args
+                .get("width")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1440)
+                .clamp(1100, 2560) as u32;
+            let height = args
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(960)
+                .clamp(700, 1600) as u32;
+            let tab = args.get("tab").and_then(|v| v.as_u64()).unwrap_or(0).min(1) as usize;
+            match crate::renderer::render_headless(
+                camera,
+                scene,
+                *shading,
+                *show_wireframe,
+                *show_grid,
+                width,
+                height,
+                Path::new(path),
+                Some(tab),
+            ) {
+                Ok(()) => IpcResponse::success(
+                    "Studio captured",
+                    json!({"path":path,"width":width,"height":height}),
+                ),
+                Err(e) => IpcResponse::error(e),
+            }
+        }
         "capture_viewport" => {
             let path_str = args
                 .get("path")
@@ -1058,16 +1411,19 @@ pub fn execute_ipc_command(
                         "object_id": c.object_id,
                         "object_name": c.object_name,
                         "comment": c.comment,
-                        "world_anchor": c.world_anchor.to_array(),
+                        "world_anchor": scene.current_comment_anchor(c).to_array(),
                         "local_anchor": c.local_anchor.to_array(),
                         "surface_normal": c.surface_normal.to_array(),
                         "selection_radius": c.selection_radius,
                         "selected_faces_count": c.selected_faces.len(),
-                        "selected_faces": c.selected_faces,
+                        "selected_faces": c.targets.first().and_then(|t| scene.target_faces(t)).unwrap_or_else(|| c.selected_faces.clone()),
                         "local_bounds_min": c.local_bounds_min.to_array(),
                         "local_bounds_max": c.local_bounds_max.to_array(),
                         "targets_count": c.targets.len().max(if c.is_general { 0 } else { 1 }),
-                        "targets": c.targets,
+                        "targets": c.targets.iter().map(|t| scene.refreshed_target(t).unwrap_or_else(|| t.clone())).collect::<Vec<_>>(),
+                        "status": c.status,
+                        "needs_reattachment": scene.comment_needs_reattachment(c),
+                        "replies": c.replies,
                         "resolved": c.resolved,
                         "agent_reply": c.agent_reply,
                     })
@@ -1132,10 +1488,8 @@ pub fn execute_ipc_command(
             }
 
             if let Some(added) = scene.add_comment_for_selection(comment_text, radius) {
-                ui_state.status_message = format!(
-                    "Added Comment #{} on '{}'",
-                    added.id, added.object_name
-                );
+                ui_state.status_message =
+                    format!("Added Comment #{} on '{}'", added.id, added.object_name);
                 IpcResponse::success(
                     format!(
                         "Added Comment #{} on '{}' ({} faces)",
@@ -1172,17 +1526,27 @@ pub fn execute_ipc_command(
         }
 
         "select_comment_region" | "focus_comment" => {
-            let Some(cid) = args.get("comment_id").or_else(|| args.get("id")).and_then(|v| v.as_u64()) else {
+            let Some(cid) = args
+                .get("comment_id")
+                .or_else(|| args.get("id"))
+                .and_then(|v| v.as_u64())
+            else {
                 return IpcResponse::error("Missing 'comment_id' integer argument");
             };
             if let Some(wp) = scene.focus_comment(cid) {
-                if args.get("focus_camera").and_then(|v| v.as_bool()).unwrap_or(true) {
+                if args
+                    .get("focus_camera")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+                {
                     camera.target = wp;
                 }
                 let comment = scene.comments.iter().find(|c| c.id == cid).cloned();
                 ui_state.status_message = format!("AI focused Comment #{cid}");
                 IpcResponse::success(
-                    format!("Selected object and restored highlighted face region for Comment #{cid}"),
+                    format!(
+                        "Selected object and restored highlighted face region for Comment #{cid}"
+                    ),
                     json!({
                         "comment_id": cid,
                         "world_anchor": wp.to_array(),
@@ -1190,23 +1554,49 @@ pub fn execute_ipc_command(
                     }),
                 )
             } else {
-                IpcResponse::error(format!("Comment #{cid} not found"))
+                IpcResponse::error(format!(
+                    "Comment #{cid} could not be focused; it may need reattachment"
+                ))
             }
         }
 
         "resolve_comment" => {
-            let Some(cid) = args.get("comment_id").or_else(|| args.get("id")).and_then(|v| v.as_u64()) else {
+            let Some(cid) = args
+                .get("comment_id")
+                .or_else(|| args.get("id"))
+                .and_then(|v| v.as_u64())
+            else {
                 return IpcResponse::error("Missing 'comment_id' integer argument");
             };
-            let resolved = args.get("resolved").and_then(|v| v.as_bool()).unwrap_or(true);
+            let resolved = args
+                .get("resolved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let reply = args
                 .get("reply")
                 .or_else(|| args.get("agent_reply"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
+            if scene.revisions.iter().any(|r| {
+                r.comment_id == Some(cid)
+                    && matches!(
+                        r.status,
+                        crate::review::RevisionStatus::InProgress
+                            | crate::review::RevisionStatus::ReadyForReview
+                    )
+            }) {
+                return IpcResponse::error(
+                    "Submit and review the linked revision instead of resolving its comment directly",
+                );
+            }
             if let Some(c) = scene.comments.iter_mut().find(|c| c.id == cid) {
                 c.resolved = resolved;
+                c.status = if resolved {
+                    crate::scene::CommentStatus::Accepted
+                } else {
+                    crate::scene::CommentStatus::Open
+                };
                 if let Some(r) = reply {
                     c.agent_reply = Some(r);
                 }
@@ -1215,11 +1605,15 @@ pub fn execute_ipc_command(
                 if resolved {
                     if !updated.targets.is_empty() {
                         for t in &updated.targets {
-                            if let Some(obj) = scene.objects.iter_mut().find(|o| o.id == t.object_id) {
+                            if let Some(obj) =
+                                scene.objects.iter_mut().find(|o| o.id == t.object_id)
+                            {
                                 obj.mesh.clear_selection();
                             }
                         }
-                    } else if let Some(obj) = scene.objects.iter_mut().find(|o| o.id == updated.object_id) {
+                    } else if let Some(obj) =
+                        scene.objects.iter_mut().find(|o| o.id == updated.object_id)
+                    {
                         obj.mesh.clear_selection();
                     }
                     scene.pending_anchor = None;

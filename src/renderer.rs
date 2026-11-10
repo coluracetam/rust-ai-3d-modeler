@@ -12,6 +12,7 @@ use wgpu::util::DeviceExt;
 pub struct GlobalUniforms {
     pub view_proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
+    pub clip_plane: [f32; 4],
 }
 
 #[repr(C)]
@@ -22,6 +23,7 @@ pub struct ObjectUniforms {
     pub params: [f32; 4],
     pub tex_params: [f32; 4],
     pub emission: [f32; 4],
+    pub inspection: [f32; 4],
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub struct PreparedDrawCall {
 
 pub struct Renderer3D {
     pub triangle_pipeline: wgpu::RenderPipeline,
+    pub ghost_pipeline: wgpu::RenderPipeline,
     pub line_depth_pipeline: wgpu::RenderPipeline,
     pub line_overlay_pipeline: wgpu::RenderPipeline,
     pub global_buffer: wgpu::Buffer,
@@ -64,13 +67,19 @@ pub struct Renderer3D {
     pub depth_size: (u32, u32),
     pub grid_vertex_buffer: wgpu::Buffer,
     pub grid_vertex_count: u32,
+    pub ghost_unselected: bool,
     pub show_grid: bool,
     pub show_wireframe_overlay: bool,
     pub shading: ViewportShading,
+    pub viewport: Option<[f32; 4]>,
     mesh_cache: HashMap<u64, CachedGpuMesh>,
 }
 
 impl Renderer3D {
+    pub fn invalidate_cache(&mut self) {
+        self.mesh_cache.clear();
+    }
+
     pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
     pub fn new(
@@ -117,6 +126,7 @@ impl Renderer3D {
         let global_uniforms = GlobalUniforms {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0, 3.0, 6.0, 1.0],
+            clip_plane: [0.0, 0.0, 0.0, 1.0],
         };
 
         let global_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -140,6 +150,7 @@ impl Renderer3D {
             params: [0.5, 0.0, 2.0, 0.0],
             tex_params: [0.3, 0.3, 0.3, 1.0],
             emission: [0.0, 0.0, 0.0, 0.0],
+            inspection: [1.0, 0.0, 0.0, 0.0],
         };
         let identity_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Identity Line Object Uniform Buffer"),
@@ -211,6 +222,47 @@ impl Renderer3D {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: Self::DEPTH_FORMAT,
                 depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 1.5,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let ghost_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Inspection Ghost Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &vertex_buffers,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Self::DEPTH_FORMAT,
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState {
@@ -308,6 +360,7 @@ impl Renderer3D {
 
         Self {
             triangle_pipeline,
+            ghost_pipeline,
             line_depth_pipeline,
             line_overlay_pipeline,
             global_buffer,
@@ -319,8 +372,10 @@ impl Renderer3D {
             grid_vertex_buffer,
             grid_vertex_count,
             show_grid: true,
+            ghost_unselected: false,
             show_wireframe_overlay: false,
             shading: ViewportShading::StudioLit,
+            viewport: None,
             mesh_cache: HashMap::new(),
         }
     }
@@ -361,9 +416,9 @@ impl Renderer3D {
             let z_col = if i == 0 {
                 [0.75, 0.25, 0.25]
             } else if i % 5 == 0 {
-                [0.34, 0.36, 0.40]
+                [0.12, 0.14, 0.17]
             } else {
-                [0.23, 0.25, 0.28]
+                [0.065, 0.08, 0.10]
             };
             verts.push(GpuVertex {
                 position: [-max_coord, 0.0, coord],
@@ -379,9 +434,9 @@ impl Renderer3D {
             let x_col = if i == 0 {
                 [0.25, 0.48, 0.85]
             } else if i % 5 == 0 {
-                [0.34, 0.36, 0.40]
+                [0.12, 0.14, 0.17]
             } else {
-                [0.23, 0.25, 0.28]
+                [0.065, 0.08, 0.10]
             };
             verts.push(GpuVertex {
                 position: [coord, 0.0, -max_coord],
@@ -410,12 +465,14 @@ impl Renderer3D {
         texture_scale: f32,
         emission_color: [f32; 3],
         emission_strength: f32,
+        opacity: f32,
     ) -> wgpu::BindGroup {
         let normal_mat = model.inverse().transpose();
         let u = ObjectUniforms {
             model: model.to_cols_array_2d(),
             normal_mat: normal_mat.to_cols_array_2d(),
             params: [roughness, metallic, shading_mode, pattern_id],
+            inspection: [opacity, 0.0, 0.0, 0.0],
             tex_params: [
                 secondary_color[0],
                 secondary_color[1],
@@ -456,6 +513,7 @@ impl Renderer3D {
             1.0,
             [0.0, 0.0, 0.0],
             0.0,
+            1.0,
         )
     }
 
@@ -472,10 +530,13 @@ impl Renderer3D {
         brush_cursor: Option<(Vec3, Vec3, f32)>,
         hover_preview: Option<(u64, &std::collections::HashSet<usize>)>,
     ) {
+        let display = scene.display_scene();
+        let scene = display.as_ref();
         let eye = camera.eye();
         let global_u = GlobalUniforms {
             view_proj: camera.view_proj_matrix().to_cols_array_2d(),
             camera_pos: [eye.x, eye.y, eye.z, 1.0],
+            clip_plane: scene.clip_plane.unwrap_or([0.0, 0.0, 0.0, 1.0]),
         };
         queue.write_buffer(&self.global_buffer, 0, bytemuck::cast_slice(&[global_u]));
 
@@ -525,11 +586,9 @@ impl Renderer3D {
                     [0.32, 0.35, 0.40]
                 };
                 // Build wireframe in local space (Mat4::IDENTITY) so object transform is applied on GPU
-                let lines = obj.mesh.build_wireframe_lines(
-                    Mat4::IDENTITY,
-                    base_wire_col,
-                    has_face_sel,
-                );
+                let lines =
+                    obj.mesh
+                        .build_wireframe_lines(Mat4::IDENTITY, base_wire_col, has_face_sel);
                 let wire_buffer = if !lines.is_empty() {
                     let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("Cached Mesh Wire VB"),
@@ -565,6 +624,7 @@ impl Renderer3D {
             ViewportShading::WireframeOnly => 2.0,
         };
 
+        let mut ghost_draws: Vec<(u64, wgpu::BindGroup, f32)> = Vec::new();
         let mut solid_draws: Vec<(u64, wgpu::BindGroup)> = Vec::new();
         let mut wire_draws: Vec<(u64, wgpu::BindGroup)> = Vec::new();
         let mut depth_line_draws: Vec<PreparedDrawCall> = Vec::new();
@@ -590,8 +650,29 @@ impl Renderer3D {
                     obj.texture_scale,
                     obj.emission_color,
                     obj.emission_strength,
+                    if self.ghost_unselected
+                        && scene.has_any_selection()
+                        && !is_selected
+                        && !has_face_sel
+                    {
+                        0.16
+                    } else {
+                        1.0
+                    },
                 );
-                solid_draws.push((obj.id, bg));
+                if self.ghost_unselected
+                    && scene.has_any_selection()
+                    && !is_selected
+                    && !has_face_sel
+                {
+                    ghost_draws.push((
+                        obj.id,
+                        bg,
+                        (obj.transform.translation - eye).length_squared(),
+                    ));
+                } else {
+                    solid_draws.push((obj.id, bg));
+                }
             }
 
             let want_wire = self.shading == ViewportShading::WireframeOnly
@@ -652,7 +733,11 @@ impl Renderer3D {
         // Live Hover Preview Wireframe (Smart Sub-Part / Smart Surface highlight before clicking)
         if let Some((hover_obj_id, hover_faces)) = hover_preview {
             if !hover_faces.is_empty() {
-                if let Some(obj) = scene.objects.iter().find(|o| o.id == hover_obj_id && o.visible) {
+                if let Some(obj) = scene
+                    .objects
+                    .iter()
+                    .find(|o| o.id == hover_obj_id && o.visible)
+                {
                     let preview_lines = obj.mesh.build_face_subset_lines(
                         hover_faces,
                         obj.transform.matrix(),
@@ -678,7 +763,8 @@ impl Renderer3D {
         // 3D Spatial Comment Pin & Region Markers (for AI-driven review workflow)
         let mut pin_lines = Vec::new();
         for c in &scene.comments {
-            if c.resolved || c.is_general || c.object_id == 0 {
+            if c.resolved || c.is_general || c.object_id == 0 || scene.comment_needs_reattachment(c)
+            {
                 continue;
             }
             let is_active = scene.active_comment_id == Some(c.id);
@@ -691,8 +777,14 @@ impl Renderer3D {
             if !c.targets.is_empty() {
                 for t in &c.targets {
                     pin_lines.extend(Self::build_comment_pin_lines(
-                        t.world_anchor,
-                        t.surface_normal,
+                        scene
+                            .refreshed_target(t)
+                            .map(|t| t.world_anchor)
+                            .unwrap_or(t.world_anchor),
+                        scene
+                            .refreshed_target(t)
+                            .map(|t| t.surface_normal)
+                            .unwrap_or(t.surface_normal),
                         r,
                         col,
                     ));
@@ -781,9 +873,9 @@ impl Renderer3D {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.11,
-                        g: 0.12,
-                        b: 0.14,
+                        r: 0.025,
+                        g: 0.035,
+                        b: 0.052,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -801,6 +893,9 @@ impl Renderer3D {
             occlusion_query_set: None,
         });
 
+        if let Some([x, y, w, h]) = self.viewport {
+            rpass.set_viewport(x, y, w.max(1.0), h.max(1.0), 0.0, 1.0);
+        }
         // 1. Solid Meshes (using cached GPU vertex buffers)
         if !solid_draws.is_empty() {
             rpass.set_pipeline(&self.triangle_pipeline);
@@ -813,6 +908,17 @@ impl Renderer3D {
                         rpass.draw(0..*count, 0..1);
                     }
                 }
+            }
+        }
+
+        ghost_draws.sort_by(|a, b| b.2.total_cmp(&a.2));
+        rpass.set_pipeline(&self.ghost_pipeline);
+        rpass.set_bind_group(0, &self.global_bind_group, &[]);
+        for (id, bg, _) in &ghost_draws {
+            if let Some((vb, count)) = self.mesh_cache.get(id).and_then(|m| m.tri_buffer.as_ref()) {
+                rpass.set_bind_group(1, bg, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.draw(0..*count, 0..1);
             }
         }
 
@@ -1006,6 +1112,7 @@ impl Renderer3D {
         width: u32,
         height: u32,
         path: &std::path::Path,
+        studio: Option<usize>,
     ) -> Result<(), String> {
         let w = width.clamp(64, 4096);
         let h = height.clamp(64, 4096);
@@ -1013,6 +1120,7 @@ impl Renderer3D {
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let mut offscreen_renderer = Self::new(device, format, w, h);
         offscreen_renderer.shading = self.shading;
+        offscreen_renderer.ghost_unselected = self.ghost_unselected;
         offscreen_renderer.show_wireframe_overlay = self.show_wireframe_overlay;
         offscreen_renderer.show_grid = self.show_grid;
 
@@ -1035,6 +1143,46 @@ impl Renderer3D {
         let mut cam = camera.clone();
         cam.aspect = (w as f32) / (h as f32);
 
+        let mut ui_scene = scene.clone();
+        let mut ui_renderer = egui_wgpu::Renderer::new(device, format, None, 1, false);
+        let mut ui_output = None;
+        let ctx = egui::Context::default();
+        if let Some(tab) = studio {
+            crate::ui::apply_theme(&ctx);
+            let mut state = crate::ui::UiState::default();
+            state.review_tab = tab;
+            let mut history = crate::history::UndoHistory::default();
+            let mut ui_gizmo = GizmoState::default();
+            for frame in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w as f32, h as f32),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                };
+                let output = ctx.run(input, |ctx| {
+                    crate::ui::draw_ui(
+                        ctx,
+                        &mut ui_scene,
+                        &mut cam,
+                        &mut ui_gizmo,
+                        &mut offscreen_renderer,
+                        &mut history,
+                        &mut state,
+                        None,
+                    )
+                });
+                for (id, delta) in &output.textures_delta.set {
+                    ui_renderer.update_texture(device, queue, *id, delta);
+                }
+                let r = state.viewport_rect;
+                cam.aspect = r.width() / r.height().max(1.0);
+                offscreen_renderer.viewport = Some([r.left(), r.top(), r.width(), r.height()]);
+                ui_output = Some(output);
+            }
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Screenshot Command Encoder"),
         });
@@ -1045,11 +1193,34 @@ impl Renderer3D {
             &mut encoder,
             &color_view,
             &cam,
-            scene,
+            if studio.is_some() { &ui_scene } else { scene },
             gizmo,
             None,
             None,
         );
+        if let Some(output) = ui_output {
+            let triangles = ctx.tessellate(output.shapes, output.pixels_per_point);
+            let descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [w, h],
+                pixels_per_point: output.pixels_per_point,
+            };
+            ui_renderer.update_buffers(device, queue, &mut encoder, &triangles, &descriptor);
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Studio screenshot UI"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            ui_renderer.render(&mut pass.forget_lifetime(), &triangles, &descriptor);
+        }
 
         let unpadded_bytes_per_row = w * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -1127,6 +1298,31 @@ pub fn render_scene_headless_to_png(
     height: u32,
     path: &std::path::Path,
 ) -> Result<(), String> {
+    render_headless(
+        camera,
+        scene,
+        shading,
+        show_wireframe,
+        show_grid,
+        width,
+        height,
+        path,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_headless(
+    camera: &OrbitCamera,
+    scene: &Scene,
+    shading: ViewportShading,
+    show_wireframe: bool,
+    show_grid: bool,
+    width: u32,
+    height: u32,
+    path: &std::path::Path,
+    studio: Option<usize>,
+) -> Result<(), String> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
@@ -1160,6 +1356,7 @@ pub fn render_scene_headless_to_png(
     renderer.show_grid = show_grid;
 
     let gizmo = GizmoState::default();
-    renderer.render_to_png_file(&device, &queue, camera, scene, &gizmo, width, height, path)
+    renderer.render_to_png_file(
+        &device, &queue, camera, scene, &gizmo, width, height, path, studio,
+    )
 }
-

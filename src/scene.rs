@@ -51,11 +51,7 @@ impl Transform {
     }
 
     pub fn matrix(&self) -> Mat4 {
-        Mat4::from_scale_rotation_translation(
-            self.scale,
-            self.rotation_quat(),
-            self.translation,
-        )
+        Mat4::from_scale_rotation_translation(self.scale, self.rotation_quat(), self.translation)
     }
 
     pub fn inverse_matrix(&self) -> Mat4 {
@@ -232,6 +228,10 @@ pub struct WorldRayHit {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommentTargetSection {
+    #[serde(default)]
+    pub topology_hash: Option<u64>,
+    #[serde(default)]
+    pub face_signatures: Vec<u64>,
     pub object_id: u64,
     pub object_name: String,
     pub world_anchor: Vec3,
@@ -242,8 +242,54 @@ pub struct CommentTargetSection {
     pub local_bounds_max: Vec3,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentStatus {
+    #[default]
+    Open,
+    InProgress,
+    ReadyForReview,
+    Accepted,
+}
+impl CommentStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::InProgress => "In progress",
+            Self::ReadyForReview => "Ready for review",
+            Self::Accepted => "Accepted",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommentReply {
+    pub author: String,
+    pub text: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedSelection {
+    pub name: String,
+    pub targets: Vec<CommentTargetSection>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedView {
+    pub name: String,
+    pub camera: crate::camera::OrbitCamera,
+}
+fn default_project_name() -> String {
+    "Untitled project".into()
+}
+fn default_units() -> String {
+    "m".into()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpatialComment {
+    #[serde(default)]
+    pub status: CommentStatus,
+    #[serde(default)]
+    pub replies: Vec<CommentReply>,
     pub id: u64,
     #[serde(default)]
     pub is_general: bool,
@@ -269,6 +315,28 @@ fn default_next_comment_id() -> u64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Scene {
+    #[serde(default = "default_project_name")]
+    pub project_name: String,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub last_camera: Option<crate::camera::OrbitCamera>,
+    #[serde(default = "default_units")]
+    pub units: String,
+    #[serde(default)]
+    pub revisions: Vec<crate::review::Revision>,
+    #[serde(default = "default_next_comment_id")]
+    pub next_revision_id: u64,
+    #[serde(default)]
+    pub saved_selections: Vec<SavedSelection>,
+    #[serde(default)]
+    pub saved_views: Vec<SavedView>,
+    #[serde(skip)]
+    pub preview_revision: Option<(u64, bool)>,
+    #[serde(skip)]
+    pub highlight_changes: bool,
+    #[serde(skip)]
+    pub clip_plane: Option<[f32; 4]>,
     pub objects: Vec<SceneObject>,
     pub selected_object: Option<usize>,
     pub next_id: u64,
@@ -287,6 +355,17 @@ pub struct Scene {
 impl Default for Scene {
     fn default() -> Self {
         let mut scene = Self {
+            project_name: "Untitled project".into(),
+            project_path: None,
+            last_camera: None,
+            units: default_units(),
+            revisions: Vec::new(),
+            next_revision_id: 1,
+            saved_selections: Vec::new(),
+            saved_views: Vec::new(),
+            preview_revision: None,
+            highlight_changes: false,
+            clip_plane: None,
             objects: Vec::new(),
             selected_object: None,
             next_id: 1,
@@ -304,6 +383,281 @@ impl Default for Scene {
 }
 
 impl Scene {
+    pub fn empty() -> Self {
+        // Avoid constructing the default voxel object for display snapshots.
+        Self {
+            project_name: "Untitled project".into(),
+            project_path: None,
+            last_camera: None,
+            units: default_units(),
+            revisions: Vec::new(),
+            next_revision_id: 1,
+            saved_selections: Vec::new(),
+            saved_views: Vec::new(),
+            preview_revision: None,
+            highlight_changes: false,
+            clip_plane: None,
+            objects: Vec::new(),
+            selected_object: None,
+            next_id: 1,
+            mode: InteractionMode::Object,
+            comments: Vec::new(),
+            next_comment_id: 1,
+            active_comment_id: None,
+            pending_anchor: None,
+        }
+    }
+
+    pub fn validate(&mut self) -> Result<(), String> {
+        fn check(objects: &[SceneObject]) -> Result<(), String> {
+            let mut ids = std::collections::HashSet::new();
+            for o in objects {
+                if !ids.insert(o.id) {
+                    return Err("Duplicate object IDs in project".into());
+                }
+                if o.mesh.positions.iter().any(|p| !p.is_finite())
+                    || o.mesh
+                        .faces
+                        .iter()
+                        .any(|f| f.len() < 3 || f.iter().any(|&v| v >= o.mesh.positions.len()))
+                {
+                    return Err(format!("Invalid mesh in '{}'", o.name));
+                }
+                if let Some(grid) = &o.voxel_grid {
+                    let count = grid.dims.iter().try_fold(1usize, |n, &d| {
+                        if (2..=512).contains(&d) {
+                            n.checked_mul(d)
+                        } else {
+                            None
+                        }
+                    });
+                    if count != Some(grid.sdf.len())
+                        || grid.sdf.len() != grid.colors.len()
+                        || !grid.voxel_size.is_finite()
+                        || grid.voxel_size <= 0.0
+                    {
+                        return Err("Invalid voxel grid".into());
+                    }
+                }
+                if !o.transform.rotation_deg.is_finite()
+                    || !o.transform.translation.is_finite()
+                    || !o.transform.scale.is_finite()
+                    || o.transform.scale.abs().min_element() < 1e-8
+                {
+                    return Err("Invalid object transform".into());
+                }
+            }
+            Ok(())
+        }
+        check(&self.objects)?;
+        for r in &self.revisions {
+            check(&r.before)?;
+            if let Some(after) = &r.after {
+                check(after)?;
+            }
+        }
+        self.selected_object = self.selected_object.filter(|&i| i < self.objects.len());
+        self.next_id = self.next_id.max(
+            self.objects
+                .iter()
+                .map(|o| o.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        self.next_comment_id = self.next_comment_id.max(
+            self.comments
+                .iter()
+                .map(|c| c.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        self.next_revision_id = self.next_revision_id.max(
+            self.revisions
+                .iter()
+                .map(|r| r.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        for o in &mut self.objects {
+            o.mesh.selected_faces.retain(|&i| i < o.mesh.faces.len());
+            o.mesh.recalculate_normals();
+        }
+        for c in &mut self.comments {
+            if c.resolved {
+                c.status = CommentStatus::Accepted;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_comment_status(&mut self, id: u64, status: CommentStatus) -> Result<(), String> {
+        let c = self
+            .comments
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or("Comment not found")?;
+        c.status = status;
+        c.resolved = status == CommentStatus::Accepted;
+        Ok(())
+    }
+
+    pub fn unit_factor(&self) -> f32 {
+        match self.units.as_str() {
+            "mm" => 1000.0,
+            "cm" => 100.0,
+            "in" => 39.37008,
+            _ => 1.0,
+        }
+    }
+
+    pub fn target_faces(&self, target: &CommentTargetSection) -> Option<Vec<usize>> {
+        let obj = self.objects.iter().find(|o| o.id == target.object_id)?;
+        if target.selected_faces.is_empty() {
+            return Some(Vec::new());
+        }
+        if target.topology_hash == Some(obj.mesh.topology_hash())
+            && target
+                .selected_faces
+                .iter()
+                .all(|&i| i < obj.mesh.faces.len())
+        {
+            return Some(target.selected_faces.clone());
+        }
+        if target.face_signatures.len() != target.selected_faces.len() {
+            return None;
+        }
+        let mut map = std::collections::HashMap::<u64, Vec<usize>>::new();
+        for i in 0..obj.mesh.faces.len() {
+            map.entry(obj.mesh.face_signature(i)).or_default().push(i);
+        }
+        target
+            .face_signatures
+            .iter()
+            .map(|hash| map.get(hash).filter(|ids| ids.len() == 1).map(|ids| ids[0]))
+            .collect()
+    }
+
+    pub fn refreshed_target(&self, target: &CommentTargetSection) -> Option<CommentTargetSection> {
+        let faces = self.target_faces(target)?;
+        let object = self.objects.iter().find(|o| o.id == target.object_id)?;
+        let mut result = target.clone();
+        result.topology_hash = Some(object.mesh.topology_hash());
+        result.face_signatures = faces
+            .iter()
+            .map(|&i| object.mesh.face_signature(i))
+            .collect();
+        if !faces.is_empty() {
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(f32::MIN);
+            let mut center = Vec3::ZERO;
+            let mut normal = Vec3::ZERO;
+            for &fi in &faces {
+                center += object.mesh.face_center(fi);
+                normal += object.mesh.face_normal(fi);
+                for &vi in &object.mesh.faces[fi] {
+                    min = min.min(object.mesh.positions[vi]);
+                    max = max.max(object.mesh.positions[vi]);
+                }
+            }
+            result.local_anchor = center / faces.len() as f32;
+            result.local_bounds_min = min;
+            result.local_bounds_max = max;
+            result.surface_normal = object
+                .transform
+                .matrix()
+                .inverse()
+                .transpose()
+                .transform_vector3(normal.normalize_or_zero())
+                .normalize_or_zero();
+        }
+        result.world_anchor = object
+            .transform
+            .matrix()
+            .transform_point3(result.local_anchor);
+        result.object_name = object.name.clone();
+        result.selected_faces = faces;
+        Some(result)
+    }
+
+    pub fn comment_needs_reattachment(&self, comment: &SpatialComment) -> bool {
+        !comment.is_general
+            && (comment.targets.is_empty()
+                || comment
+                    .targets
+                    .iter()
+                    .any(|t| self.target_faces(t).is_none()))
+    }
+
+    pub fn reattach_comment(&mut self, id: u64, radius: f32) -> Result<(), String> {
+        let targets = self.collect_current_target_sections(radius);
+        let first = targets
+            .first()
+            .ok_or("Select a replacement region first")?
+            .clone();
+        let c = self
+            .comments
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or("Comment not found")?;
+        c.is_general = false;
+        c.object_id = first.object_id;
+        c.object_name = first.object_name.clone();
+        c.local_anchor = first.local_anchor;
+        c.world_anchor = first.world_anchor;
+        c.surface_normal = first.surface_normal;
+        c.selected_faces = first.selected_faces.clone();
+        c.local_bounds_min = first.local_bounds_min;
+        c.local_bounds_max = first.local_bounds_max;
+        c.targets = targets;
+        Ok(())
+    }
+
+    pub fn current_comment_anchor(&self, comment: &SpatialComment) -> Vec3 {
+        let points: Vec<Vec3> = comment
+            .targets
+            .iter()
+            .filter_map(|t| {
+                let obj = self.objects.iter().find(|o| o.id == t.object_id)?;
+                let faces = self.target_faces(t)?;
+                let local = if faces.is_empty() {
+                    t.local_anchor
+                } else {
+                    faces.iter().map(|&i| obj.mesh.face_center(i)).sum::<Vec3>()
+                        / faces.len() as f32
+                };
+                Some(obj.transform.matrix().transform_point3(local))
+            })
+            .collect();
+        if points.is_empty() {
+            comment.world_anchor
+        } else {
+            points.iter().sum::<Vec3>() / points.len() as f32
+        }
+    }
+
+    pub fn restore_targets(&mut self, targets: &[CommentTargetSection]) -> Result<(), String> {
+        let selections: Option<Vec<_>> = targets
+            .iter()
+            .map(|t| self.target_faces(t).map(|faces| (t.object_id, faces)))
+            .collect();
+        let selections = selections
+            .ok_or("Geometry changed: select the intended region and reattach this comment")?;
+        self.clear_all_selections();
+        self.selected_object = None;
+        for (id, faces) in selections {
+            if let Some(i) = self.objects.iter().position(|o| o.id == id) {
+                self.selected_object = Some(i);
+                self.objects[i].visible = true;
+                self.objects[i].mesh.selected_faces.extend(faces);
+                self.objects[i].mesh.bump_version();
+            }
+        }
+        Ok(())
+    }
+
     pub fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -383,7 +737,12 @@ impl Scene {
                 continue;
             }
             let local_ray = obj.transform.transform_ray_to_local(world_ray);
-            if let Some(local_hit) = obj.mesh.ray_intersect(&local_ray) {
+            if let Some(local_hit) = obj.mesh.ray_intersect_filtered(&local_ray, |p| {
+                self.clip_plane.is_none_or(|plane| {
+                    let world = obj.transform.matrix().transform_point3(p);
+                    Vec3::from_array([plane[0], plane[1], plane[2]]).dot(world) + plane[3] >= 0.0
+                })
+            }) {
                 let model = obj.transform.matrix();
                 let world_pt = model.transform_point3(local_hit.point);
                 let normal_mat = model.inverse().transpose();
@@ -392,7 +751,10 @@ impl Scene {
                     .normalize_or_zero();
                 let world_dist = (world_pt - world_ray.origin).length();
 
-                if best.as_ref().map_or(true, |b| world_dist < b.world_distance) {
+                if best
+                    .as_ref()
+                    .map_or(true, |b| world_dist < b.world_distance)
+                {
                     best = Some(WorldRayHit {
                         object_idx: i,
                         world_point: world_pt,
@@ -415,7 +777,12 @@ impl Scene {
             return None;
         }
         let local_ray = obj.transform.transform_ray_to_local(world_ray);
-        let local_hit = obj.mesh.ray_intersect(&local_ray)?;
+        let local_hit = obj.mesh.ray_intersect_filtered(&local_ray, |p| {
+            self.clip_plane.is_none_or(|plane| {
+                let world = obj.transform.matrix().transform_point3(p);
+                Vec3::from_array([plane[0], plane[1], plane[2]]).dot(world) + plane[3] >= 0.0
+            })
+        })?;
         let model = obj.transform.matrix();
         let world_pt = model.transform_point3(local_hit.point);
         let normal_mat = model.inverse().transpose();
@@ -464,36 +831,40 @@ impl Scene {
         let mut sections = Vec::new();
 
         for obj in &self.objects {
-            if obj.mesh.selected_faces.is_empty() {
-                continue;
-            }
             let model = obj.transform.matrix();
             let normal_mat = model.inverse().transpose();
-            let mut selected_faces: Vec<usize> = obj.mesh.selected_faces.iter().copied().collect();
-            selected_faces.sort_unstable();
-
-            let (local_anchor, local_normal, b_min, b_max) =
-                if let Some((c, n, min_p, max_p)) = obj.mesh.selected_faces_bounds_and_normal() {
-                    (c, n, min_p, max_p)
-                } else {
-                    let (min_p, max_p) = obj.mesh.bounds();
-                    ((min_p + max_p) * 0.5, Vec3::Y, min_p, max_p)
-                };
-            let world_anchor = model.transform_point3(local_anchor);
-            let surface_normal = normal_mat
-                .transform_vector3(local_normal)
-                .normalize_or_zero();
-
-            sections.push(CommentTargetSection {
-                object_id: obj.id,
-                object_name: obj.name.clone(),
-                world_anchor,
-                local_anchor,
-                surface_normal,
-                selected_faces,
-                local_bounds_min: b_min,
-                local_bounds_max: b_max,
-            });
+            for selected_faces in obj.mesh.selected_components() {
+                let mut min = Vec3::splat(f32::MAX);
+                let mut max = Vec3::splat(f32::MIN);
+                let mut center = Vec3::ZERO;
+                let mut normal = Vec3::ZERO;
+                for &fi in &selected_faces {
+                    center += obj.mesh.face_center(fi);
+                    normal += obj.mesh.face_normal(fi);
+                    for &vi in &obj.mesh.faces[fi] {
+                        min = min.min(obj.mesh.positions[vi]);
+                        max = max.max(obj.mesh.positions[vi]);
+                    }
+                }
+                center /= selected_faces.len() as f32;
+                sections.push(CommentTargetSection {
+                    topology_hash: Some(obj.mesh.topology_hash()),
+                    face_signatures: selected_faces
+                        .iter()
+                        .map(|&i| obj.mesh.face_signature(i))
+                        .collect(),
+                    object_id: obj.id,
+                    object_name: obj.name.clone(),
+                    world_anchor: model.transform_point3(center),
+                    local_anchor: center,
+                    surface_normal: normal_mat
+                        .transform_vector3(normal.normalize_or_zero())
+                        .normalize_or_zero(),
+                    selected_faces,
+                    local_bounds_min: min,
+                    local_bounds_max: max,
+                });
+            }
         }
 
         if sections.is_empty() {
@@ -533,6 +904,8 @@ impl Scene {
                     .transform_vector3(local_normal)
                     .normalize_or_zero();
                 sections.push(CommentTargetSection {
+                    topology_hash: Some(obj.mesh.topology_hash()),
+                    face_signatures: Vec::new(),
                     object_id: obj.id,
                     object_name: obj.name.clone(),
                     world_anchor,
@@ -591,6 +964,8 @@ impl Scene {
         self.next_comment_id = cid + 1;
 
         let item = SpatialComment {
+            status: CommentStatus::Open,
+            replies: Vec::new(),
             id: cid,
             is_general: false,
             object_id: obj_id,
@@ -619,6 +994,8 @@ impl Scene {
         self.next_comment_id = cid + 1;
 
         let item = SpatialComment {
+            status: CommentStatus::Open,
+            replies: Vec::new(),
             id: cid,
             is_general: true,
             object_id: 0,
@@ -644,53 +1021,21 @@ impl Scene {
     /// Selects the object(s) and restores all highlighted face regions associated with comment `comment_id`.
     pub fn focus_comment(&mut self, comment_id: u64) -> Option<Vec3> {
         let comment = self.comments.iter().find(|c| c.id == comment_id)?.clone();
-        self.active_comment_id = Some(comment_id);
-
-        if comment.is_general || comment.object_id == 0 {
-            self.pending_anchor = None;
+        if comment.is_general {
+            self.active_comment_id = Some(comment_id);
             return Some(Vec3::ZERO);
         }
-
-        self.clear_all_selections();
-
-        if !comment.targets.is_empty() {
-            for target in &comment.targets {
-                if let Some(idx) = self.objects.iter().position(|o| o.id == target.object_id) {
-                    self.selected_object = Some(idx);
-                    let obj = &mut self.objects[idx];
-                    for &fi in &target.selected_faces {
-                        if fi < obj.mesh.faces.len() {
-                            obj.mesh.selected_faces.insert(fi);
-                        }
-                    }
-                    obj.mesh.bump_version();
-                }
-            }
-            if let Some(first) = comment.targets.first() {
-                self.pending_anchor = Some((
-                    first.object_id,
-                    first.world_anchor,
-                    first.local_anchor,
-                    first.surface_normal,
-                ));
-            }
-        } else if let Some(idx) = self.objects.iter().position(|o| o.id == comment.object_id) {
-            self.selected_object = Some(idx);
-            let obj = &mut self.objects[idx];
-            for &fi in &comment.selected_faces {
-                if fi < obj.mesh.faces.len() {
-                    obj.mesh.selected_faces.insert(fi);
-                }
-            }
-            obj.mesh.bump_version();
+        self.restore_targets(&comment.targets).ok()?;
+        let anchor = self.current_comment_anchor(&comment);
+        self.active_comment_id = Some(comment_id);
+        if let Some(first) = comment.targets.first() {
             self.pending_anchor = Some((
-                comment.object_id,
-                comment.world_anchor,
-                comment.local_anchor,
-                comment.surface_normal,
+                first.object_id,
+                anchor,
+                first.local_anchor,
+                first.surface_normal,
             ));
         }
-
-        Some(comment.world_anchor)
+        Some(anchor)
     }
 }

@@ -1,12 +1,12 @@
 use crate::camera::OrbitCamera;
 use crate::history::UndoHistory;
 use crate::ipc::{
-    execute_ipc_command, IpcRequest, IpcResponse, FALLBACK_SCENE_PATH, IPC_SOCKET_PATH,
+    FALLBACK_SCENE_PATH, IPC_SOCKET_PATH, IpcRequest, IpcResponse, execute_ipc_command,
 };
 use crate::renderer::ViewportShading;
 use crate::scene::Scene;
 use crate::ui::UiState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -16,25 +16,46 @@ use std::time::Duration;
 /// Sends an `IpcRequest` to the running GUI over `/tmp/rust_modeler_ipc.sock`.
 pub fn send_to_live_gui(req: &IpcRequest) -> Option<IpcResponse> {
     let mut stream = UnixStream::connect(IPC_SOCKET_PATH).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
     let mut payload = serde_json::to_vec(req).ok()?;
     payload.push(b'\n');
-    stream.write_all(&payload).ok()?;
-    stream.flush().ok()?;
+    if stream.write_all(&payload).is_err() || stream.flush().is_err() {
+        return Some(IpcResponse::error(
+            "Could not send command to the live editor; inspect its state before retrying",
+        ));
+    }
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    if line.trim().is_empty() {
-        return None;
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        return Some(IpcResponse::error(
+            "The live editor did not reply. Inspect its state before retrying; the command may have completed.",
+        ));
     }
-    serde_json::from_str::<IpcResponse>(&line).ok()
+    Some(
+        serde_json::from_str::<IpcResponse>(&line)
+            .unwrap_or_else(|_| IpcResponse::error("Invalid response from live editor")),
+    )
 }
 
 pub fn mcp_tool_definitions() -> Value {
     json!([
+        { "name":"delete_comment", "description":"Delete a comment after its pending revision has been reviewed.", "inputSchema":{"type":"object","properties":{"comment_id":{"type":"integer"}},"required":["comment_id"]} },
+        { "name":"cancel_operation", "description":"Cancel a running GUI operation and discard its result without changing live geometry.", "inputSchema":{"type":"object","properties":{}} },
+        { "name":"capture_studio", "description":"Capture the full studio UI and viewport as a PNG for visual review.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"tab":{"type":"integer","enum":[0,1]}}} },
+        { "name":"save_project", "description":"Save the full project, camera, comments, selections and revisions atomically with a backup.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"}}} },
+        { "name":"open_project", "description":"Open a project, or recover its autosave. Existing work remains undoable.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"recover":{"type":"boolean"}},"required":["path"]} },
+        { "name":"begin_revision", "description":"Start one named, cancellable geometry revision, optionally linked to a user comment. Finish it for user review.", "inputSchema":{"type":"object","properties":{"label":{"type":"string"},"comment_id":{"type":"integer"}},"required":["label"]} },
+        { "name":"finish_revision", "description":"Submit grouped changes for review with a summary and optional screenshot paths. The user can compare, accept or revert.", "inputSchema":{"type":"object","properties":{"revision_id":{"type":"integer"},"summary":{"type":"string"},"screenshots":{"type":"array","items":{"type":"string"}}},"required":["revision_id","summary"]} },
+        { "name":"get_revisions", "description":"List revision status, changed object IDs, summaries and screenshot paths.", "inputSchema":{"type":"object","properties":{}} },
+        { "name":"preview_revision", "description":"Compare a revision before or after without changing live geometry; live=true exits comparison.", "inputSchema":{"type":"object","properties":{"revision_id":{"type":"integer"},"before":{"type":"boolean"},"live":{"type":"boolean"}}} },
+        { "name":"accept_revision", "description":"Accept a ready revision and its linked comment.", "inputSchema":{"type":"object","properties":{"revision_id":{"type":"integer"}},"required":["revision_id"]} },
+        { "name":"revert_revision", "description":"Revert a pending revision without deleting comments; rejects conflicts with newer geometry edits.", "inputSchema":{"type":"object","properties":{"revision_id":{"type":"integer"}},"required":["revision_id"]} },
+        { "name":"cancel_revision", "description":"Cancel an in-progress revision and restore its starting geometry between tool calls.", "inputSchema":{"type":"object","properties":{"revision_id":{"type":"integer"}},"required":["revision_id"]} },
+        { "name":"update_comment", "description":"Update a comment lifecycle status or append a discussion reply.", "inputSchema":{"type":"object","properties":{"comment_id":{"type":"integer"},"status":{"type":"string","enum":["open","in_progress","ready_for_review","accepted"]},"reply":{"type":"string"},"author":{"type":"string"}},"required":["comment_id"]} },
+        { "name":"reattach_comment", "description":"Attach an existing comment to the user's current selected regions after topology changes.", "inputSchema":{"type":"object","properties":{"comment_id":{"type":"integer"}},"required":["comment_id"]} },
         {
             "name": "get_scene_info",
             "description": "Inspect the current 3D scene: all objects (IDs, names, transforms, materials, vertex/face counts, bounding boxes), active selection, interaction mode, and camera/viewport state.",
@@ -491,7 +512,7 @@ pub fn mcp_tool_definitions() -> Value {
 /// Runs the stdio JSON-RPC 2.0 MCP Server loop.
 pub fn run_mcp_stdio_server() {
     let mut fallback_scene = load_fallback_scene().unwrap_or_default();
-    let mut fallback_camera = OrbitCamera::default();
+    let mut fallback_camera = fallback_scene.last_camera.clone().unwrap_or_default();
     let mut fallback_history = UndoHistory::default();
     let mut fallback_ui = UiState::default();
     let mut fallback_shading = ViewportShading::StudioLit;
@@ -572,55 +593,10 @@ pub fn run_mcp_stdio_server() {
                         tool: tool_name,
                         args,
                     };
-                    let pre_disk_scene = load_fallback_scene();
                     if let Some(live_resp) = send_to_live_gui(&req) {
-                        if !live_resp.ok && live_resp.message.starts_with("Unknown MCP tool") {
-                            if let Some(disk_scene) = pre_disk_scene.or_else(load_fallback_scene) {
-                                fallback_scene = disk_scene;
-                            }
-                            let resp = execute_ipc_command(
-                                &req,
-                                &mut fallback_scene,
-                                &mut fallback_camera,
-                                &mut fallback_history,
-                                &mut fallback_ui,
-                                &mut fallback_shading,
-                                &mut fallback_wire,
-                                &mut fallback_grid,
-                            );
-                            save_fallback_scene(&fallback_scene);
-                            resp
-                        } else {
-                            // If live GUI is an older binary that doesn't persist new procedural fields yet,
-                            // also apply set_material on the disk scene so screenshots & restarts preserve them.
-                            if req.tool == "set_material"
-                                && live_resp.data.get("pattern").is_none()
-                            {
-                                if let Some(disk_scene) = pre_disk_scene.or_else(load_fallback_scene) {
-                                    fallback_scene = disk_scene;
-                                }
-                                let resp = execute_ipc_command(
-                                    &req,
-                                    &mut fallback_scene,
-                                    &mut fallback_camera,
-                                    &mut fallback_history,
-                                    &mut fallback_ui,
-                                    &mut fallback_shading,
-                                    &mut fallback_wire,
-                                    &mut fallback_grid,
-                                );
-                                save_fallback_scene(&fallback_scene);
-                                resp
-                            } else {
-                                live_resp
-                            }
-                        }
+                        live_resp
                     } else {
-                        // Execute against fallback scene and persist to /tmp/rust_modeler_scene.json
-                        if let Some(disk_scene) = load_fallback_scene() {
-                            fallback_scene = disk_scene;
-                        }
-                        let resp = execute_ipc_command(
+                        execute_headless(
                             &req,
                             &mut fallback_scene,
                             &mut fallback_camera,
@@ -629,9 +605,7 @@ pub fn run_mcp_stdio_server() {
                             &mut fallback_shading,
                             &mut fallback_wire,
                             &mut fallback_grid,
-                        );
-                        save_fallback_scene(&fallback_scene);
-                        resp
+                        )
                     }
                 };
 
@@ -709,7 +683,9 @@ fn launch_gui_if_needed() -> IpcResponse {
                 std::thread::sleep(Duration::from_millis(100));
                 if let Some(resp) = send_to_live_gui(&ping_req) {
                     return IpcResponse::success(
-                        format!("Launched 3D Modeler GUI window (PID {pid}) and connected live IPC."),
+                        format!(
+                            "Launched 3D Modeler GUI window (PID {pid}) and connected live IPC."
+                        ),
                         resp.data,
                     );
                 }
@@ -723,10 +699,60 @@ fn launch_gui_if_needed() -> IpcResponse {
     }
 }
 
+/// Serialize headless read/modify/write transactions across CLI and MCP processes.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_headless(
+    req: &IpcRequest,
+    scene: &mut Scene,
+    camera: &mut OrbitCamera,
+    history: &mut UndoHistory,
+    ui: &mut UiState,
+    shading: &mut ViewportShading,
+    wire: &mut bool,
+    grid: &mut bool,
+) -> IpcResponse {
+    let lock = match fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open("/tmp/rust_modeler_scene.lock")
+    {
+        Ok(file) => file,
+        Err(e) => return IpcResponse::error(format!("Could not lock scene: {e}")),
+    };
+    if let Err(e) = lock.lock() {
+        return IpcResponse::error(format!("Could not lock scene: {e}"));
+    }
+    if let Some(disk) = load_fallback_scene() {
+        *camera = disk.last_camera.clone().unwrap_or_else(|| camera.clone());
+        *scene = disk;
+    }
+    let mut response = execute_ipc_command(req, scene, camera, history, ui, shading, wire, grid);
+    if response.ok && !crate::ipc::is_read_only(&req.tool) {
+        if let Err(e) = persist_scene(scene, camera) {
+            response =
+                IpcResponse::error(format!("Command completed, but persistence failed: {e}"));
+        }
+    }
+    response
+}
+
 pub fn load_fallback_scene() -> Option<Scene> {
     if let Ok(text) = fs::read_to_string(FALLBACK_SCENE_PATH) {
-        if let Ok(scene) = serde_json::from_str::<Scene>(&text) {
-            return Some(scene);
+        if let Ok(mut scene) = serde_json::from_str::<Scene>(&text) {
+            if scene.validate().is_ok() {
+                return Some(scene);
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(crate::project::backup_path(std::path::Path::new(
+        FALLBACK_SCENE_PATH,
+    ))) {
+        if let Ok(mut scene) = serde_json::from_str::<Scene>(&text) {
+            if scene.validate().is_ok() {
+                return Some(scene);
+            }
         }
     }
     if let Ok(text) = fs::read_to_string("assets/scenes/clockwork_astral_cathedral_scene.json") {
@@ -739,9 +765,25 @@ pub fn load_fallback_scene() -> Option<Scene> {
 }
 
 pub fn save_fallback_scene(scene: &Scene) {
-    if let Ok(json_str) = serde_json::to_string(scene) {
-        let _ = fs::write(FALLBACK_SCENE_PATH, json_str);
+    if let Err(error) = try_save_fallback_scene(scene) {
+        log::error!("{error}");
     }
+}
+
+pub fn try_save_fallback_scene(scene: &Scene) -> Result<(), String> {
+    let bytes = serde_json::to_vec(scene).map_err(|e| e.to_string())?;
+    crate::project::atomic_write(std::path::Path::new(FALLBACK_SCENE_PATH), &bytes, true)
+}
+
+/// Preserve a recoverable project alongside its explicit saved version.
+pub fn persist_scene(scene: &mut Scene, camera: &OrbitCamera) -> Result<(), String> {
+    scene.last_camera = Some(camera.clone());
+    try_save_fallback_scene(scene)?;
+    if let Some(path) = &scene.project_path {
+        let autosave = crate::project::autosave_path(std::path::Path::new(path));
+        crate::project::save(&autosave, scene, camera)?;
+    }
+    Ok(())
 }
 
 /// Reads either a newline-delimited JSON-RPC message or a `Content-Length:` framed JSON-RPC message.

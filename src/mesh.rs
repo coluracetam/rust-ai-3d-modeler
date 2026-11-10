@@ -64,7 +64,81 @@ impl Mesh {
 
     #[inline]
     pub fn bump_version(&mut self) {
-        self.version = self.version.wrapping_add(1);
+        static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10);
+        self.version = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stable topology identity, independent of selection and rendering caches.
+    pub fn topology_hash(&self) -> u64 {
+        let mut hash = 14695981039346656037u64;
+        for n in std::iter::once(self.positions.len()).chain(
+            self.faces
+                .iter()
+                .flat_map(|f| std::iter::once(f.len()).chain(f.iter().copied())),
+        ) {
+            for byte in (n as u64).to_le_bytes() {
+                hash = (hash ^ byte as u64).wrapping_mul(1099511628211);
+            }
+        }
+        hash
+    }
+
+    pub fn face_signature(&self, index: usize) -> u64 {
+        let mut points: Vec<_> = self.faces[index]
+            .iter()
+            .map(|&i| {
+                let p = self.positions[i] * 100000.0;
+                (p.x.round() as i64, p.y.round() as i64, p.z.round() as i64)
+            })
+            .collect();
+        points.sort_unstable();
+        let mut hash = 14695981039346656037u64;
+        for (x, y, z) in points {
+            for v in [x, y, z] {
+                for b in v.to_le_bytes() {
+                    hash = (hash ^ b as u64).wrapping_mul(1099511628211);
+                }
+            }
+        }
+        hash
+    }
+
+    /// Connected islands within the selected subset, including split imported vertices.
+    pub fn selected_components(&self) -> Vec<Vec<usize>> {
+        let mut adjacency: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        let mut remaining: HashSet<_> = self
+            .selected_faces
+            .iter()
+            .copied()
+            .filter(|&i| i < self.faces.len())
+            .collect();
+        for &fi in &remaining {
+            for &vi in &self.faces[fi] {
+                adjacency
+                    .entry(Self::quantize_pos(self.positions[vi]))
+                    .or_default()
+                    .push(fi);
+            }
+        }
+        let mut result = Vec::new();
+        while let Some(&seed) = remaining.iter().min() {
+            remaining.remove(&seed);
+            let mut group = vec![seed];
+            let mut cursor = 0;
+            while cursor < group.len() {
+                for &vi in &self.faces[group[cursor]] {
+                    for &fi in &adjacency[&Self::quantize_pos(self.positions[vi])] {
+                        if remaining.remove(&fi) {
+                            group.push(fi);
+                        }
+                    }
+                }
+                cursor += 1;
+            }
+            group.sort_unstable();
+            result.push(group);
+        }
+        result
     }
 
     pub fn canonical_edge(a: usize, b: usize) -> (usize, usize) {
@@ -258,7 +332,11 @@ impl Mesh {
         // Top ring: 0..segs
         for s in 0..segs {
             let theta = 2.0 * std::f32::consts::PI * (s as f32) / (segs as f32);
-            positions.push(Vec3::new(radius * theta.sin(), half_h, radius * theta.cos()));
+            positions.push(Vec3::new(
+                radius * theta.sin(),
+                half_h,
+                radius * theta.cos(),
+            ));
         }
         // Bottom ring: segs..2*segs
         for s in 0..segs {
@@ -1068,12 +1146,7 @@ impl Mesh {
     // =========================================================================
 
     /// Möller–Trumbore ray-triangle intersection
-    fn ray_triangle_intersect(
-        ray: &Ray,
-        v0: Vec3,
-        v1: Vec3,
-        v2: Vec3,
-    ) -> Option<(f32, Vec3)> {
+    fn ray_triangle_intersect(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<(f32, Vec3)> {
         let eps = 1e-6;
         let edge1 = v1 - v0;
         let edge2 = v2 - v0;
@@ -1104,6 +1177,14 @@ impl Mesh {
 
     /// Intersect a local-space ray with the mesh. Returns the closest `RayHit`.
     pub fn ray_intersect(&self, local_ray: &Ray) -> Option<RayHit> {
+        self.ray_intersect_filtered(local_ray, |_| true)
+    }
+
+    pub fn ray_intersect_filtered(
+        &self,
+        local_ray: &Ray,
+        visible: impl Fn(Vec3) -> bool,
+    ) -> Option<RayHit> {
         let mut closest: Option<RayHit> = None;
 
         for (fi, face) in self.faces.iter().enumerate() {
@@ -1115,7 +1196,8 @@ impl Mesh {
                 let v1 = self.positions[face[i]];
                 let v2 = self.positions[face[i + 1]];
                 if let Some((t, normal)) = Self::ray_triangle_intersect(local_ray, v0, v1, v2) {
-                    if closest.as_ref().map_or(true, |c| t < c.distance) {
+                    if visible(local_ray.at(t)) && closest.as_ref().map_or(true, |c| t < c.distance)
+                    {
                         closest = Some(RayHit {
                             distance: t,
                             point: local_ray.at(t),
@@ -1164,9 +1246,7 @@ impl Mesh {
                 continue;
             }
             let seg_dir = seg / seg_len;
-            let t_seg = local_ray
-                .closest_t_on_axis(pa, seg_dir)
-                .clamp(0.0, seg_len);
+            let t_seg = local_ray.closest_t_on_axis(pa, seg_dir).clamp(0.0, seg_len);
             let pt_on_seg = pa + seg_dir * t_seg;
             let t_ray = (pt_on_seg - local_ray.origin).dot(local_ray.direction);
             if t_ray < 0.0 {
