@@ -64,7 +64,13 @@ impl FlyController {
         if dir == Vec3::ZERO || dt <= 0.0 {
             return false;
         }
-        let multiplier = if fast { 4.0 } else if slow { 0.25 } else { 1.0 };
+        let multiplier = if fast {
+            4.0
+        } else if slow {
+            0.25
+        } else {
+            1.0
+        };
         camera.fly_move(dir, speed * multiplier * dt);
         true
     }

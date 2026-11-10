@@ -81,8 +81,18 @@ impl Buffer {
         if !area.is_finite() || area.abs() < 1e-12 {
             return false;
         }
-        let min_x = p.iter().map(|v| v.x).fold(f32::INFINITY, f32::min).floor().max(0.0);
-        let min_y = p.iter().map(|v| v.y).fold(f32::INFINITY, f32::min).floor().max(0.0);
+        let min_x = p
+            .iter()
+            .map(|v| v.x)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.0);
+        let min_y = p
+            .iter()
+            .map(|v| v.y)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.0);
         let max_x = p
             .iter()
             .map(|v| v.x)
@@ -176,7 +186,9 @@ pub fn faces_in_rect(
     }
     let mut buffer = Buffer::new(min, max);
     let view_proj = camera.view_proj_matrix();
-    let plane = scene.clip_plane.map(|p| (Vec3::new(p[0], p[1], p[2]), p[3]));
+    let plane = scene
+        .clip_plane
+        .map(|p| (Vec3::new(p[0], p[1], p[2]), p[3]));
     let mut hits: HashMap<usize, HashSet<usize>> = HashMap::new();
     // Candidate faces whose centre projects inside the box: (object, face, screen centre).
     let mut centres = Vec::new();
@@ -209,7 +221,9 @@ pub fn faces_in_rect(
             }
             let screen: Vec<Vec3> = poly.iter().map(|&c| to_screen(c, viewport)).collect();
             // Cheap reject before rasterizing.
-            let lo = screen.iter().fold(Vec2::splat(f32::INFINITY), |m, s| m.min(s.truncate()));
+            let lo = screen
+                .iter()
+                .fold(Vec2::splat(f32::INFINITY), |m, s| m.min(s.truncate()));
             let hi = screen
                 .iter()
                 .fold(Vec2::splat(f32::NEG_INFINITY), |m, s| m.max(s.truncate()));
@@ -356,7 +370,15 @@ mod tests {
         let through = faces_in_rect(&scene, &camera, VP, Vec2::ZERO, VP, true);
         assert_eq!(through[&0].len(), 6);
 
-        let out = apply_box_selection(&mut scene, &camera, VP, Vec2::ZERO, VP, false, BoxOp::Replace);
+        let out = apply_box_selection(
+            &mut scene,
+            &camera,
+            VP,
+            Vec2::ZERO,
+            VP,
+            false,
+            BoxOp::Replace,
+        );
         assert_eq!(out.selected_faces, 1);
         assert_eq!(scene.selected_object, Some(0));
     }
@@ -366,31 +388,84 @@ mod tests {
         // A small cube hidden directly behind a big one.
         let scene = scene_with(&[(Vec3::ZERO, 3.0), (Vec3::new(0.0, 0.0, -4.0), 1.0)]);
         let camera = front_camera();
-        let hits = faces_in_rect(&scene, &camera, VP, Vec2::splat(300.0), Vec2::splat(500.0), false);
+        let hits = faces_in_rect(
+            &scene,
+            &camera,
+            VP,
+            Vec2::splat(300.0),
+            Vec2::splat(500.0),
+            false,
+        );
         assert!(hits.contains_key(&0));
         assert!(!hits.contains_key(&1));
-        let through = faces_in_rect(&scene, &camera, VP, Vec2::splat(300.0), Vec2::splat(500.0), true);
+        let through = faces_in_rect(
+            &scene,
+            &camera,
+            VP,
+            Vec2::splat(300.0),
+            Vec2::splat(500.0),
+            true,
+        );
         assert!(through.contains_key(&1));
     }
 
     #[test]
     fn separate_boxes_build_separate_regions_and_subtract_removes() {
-        let mut scene = scene_with(&[(Vec3::new(-2.5, 0.0, 0.0), 1.0), (Vec3::new(2.5, 0.0, 0.0), 1.0)]);
+        let mut scene = scene_with(&[
+            (Vec3::new(-2.5, 0.0, 0.0), 1.0),
+            (Vec3::new(2.5, 0.0, 0.0), 1.0),
+        ]);
         let camera = front_camera();
-        let left = camera.world_to_screen(Vec3::new(-2.5, 0.0, 0.5), VP).unwrap();
-        let right = camera.world_to_screen(Vec3::new(2.5, 0.0, 0.5), VP).unwrap();
+        let left = camera
+            .world_to_screen(Vec3::new(-2.5, 0.0, 0.5), VP)
+            .unwrap();
+        let right = camera
+            .world_to_screen(Vec3::new(2.5, 0.0, 0.5), VP)
+            .unwrap();
         let d = Vec2::splat(15.0);
-        let out = apply_box_selection(&mut scene, &camera, VP, left - d, left + d, false, BoxOp::Replace);
+        let out = apply_box_selection(
+            &mut scene,
+            &camera,
+            VP,
+            left - d,
+            left + d,
+            false,
+            BoxOp::Replace,
+        );
         assert_eq!((out.objects, out.regions), (1, 1));
-        let out = apply_box_selection(&mut scene, &camera, VP, right - d, right + d, false, BoxOp::Add);
+        let out = apply_box_selection(
+            &mut scene,
+            &camera,
+            VP,
+            right - d,
+            right + d,
+            false,
+            BoxOp::Add,
+        );
         assert_eq!((out.objects, out.regions), (2, 2));
         assert_eq!(scene.collect_current_target_sections(0.4).len(), 2);
-        let out = apply_box_selection(&mut scene, &camera, VP, left - d, left + d, false, BoxOp::Subtract);
+        let out = apply_box_selection(
+            &mut scene,
+            &camera,
+            VP,
+            left - d,
+            left + d,
+            false,
+            BoxOp::Subtract,
+        );
         assert_eq!((out.objects, out.regions), (1, 1));
         assert!(scene.objects[0].mesh.selected_faces.is_empty());
         assert_eq!(scene.selected_object, Some(1));
         // Replacing with an empty box clears everything.
-        let out = apply_box_selection(&mut scene, &camera, VP, Vec2::splat(1.0), Vec2::splat(3.0), false, BoxOp::Replace);
+        let out = apply_box_selection(
+            &mut scene,
+            &camera,
+            VP,
+            Vec2::splat(1.0),
+            Vec2::splat(3.0),
+            false,
+            BoxOp::Replace,
+        );
         assert_eq!(out.selected_faces, 0);
         assert!(!scene.has_any_selection());
     }

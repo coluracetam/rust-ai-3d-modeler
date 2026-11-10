@@ -73,11 +73,42 @@ pub struct Renderer3D {
     pub shading: ViewportShading,
     pub viewport: Option<[f32; 4]>,
     mesh_cache: HashMap<u64, CachedGpuMesh>,
+    /// Hover-preview outline, rebuilt only when the hovered face set or its mesh changes.
+    hover_lines: Option<(HoverKey, wgpu::Buffer, u32)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HoverKey {
+    object_id: u64,
+    mesh_version: u64,
+    face_count: usize,
+    face_hash: u64,
+    model_bits: [u32; 16],
+}
+
+impl HoverKey {
+    fn new(obj: &crate::scene::SceneObject, faces: &std::collections::HashSet<usize>) -> Self {
+        // Order-independent hash of the face set.
+        let face_hash = faces.iter().fold(0u64, |acc, &f| {
+            let mut z = (f as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            acc.wrapping_add(z ^ (z >> 31))
+        });
+        Self {
+            object_id: obj.id,
+            mesh_version: obj.mesh.version,
+            face_count: faces.len(),
+            face_hash,
+            model_bits: obj.transform.matrix().to_cols_array().map(f32::to_bits),
+        }
+    }
 }
 
 impl Renderer3D {
     pub fn invalidate_cache(&mut self) {
         self.mesh_cache.clear();
+        self.hover_lines = None;
     }
 
     pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -377,6 +408,7 @@ impl Renderer3D {
             shading: ViewportShading::StudioLit,
             viewport: None,
             mesh_cache: HashMap::new(),
+            hover_lines: None,
         }
     }
 
@@ -627,7 +659,6 @@ impl Renderer3D {
         let mut ghost_draws: Vec<(u64, wgpu::BindGroup, f32)> = Vec::new();
         let mut solid_draws: Vec<(u64, wgpu::BindGroup)> = Vec::new();
         let mut wire_draws: Vec<(u64, wgpu::BindGroup)> = Vec::new();
-        let mut depth_line_draws: Vec<PreparedDrawCall> = Vec::new();
         let mut overlay_line_draws: Vec<PreparedDrawCall> = Vec::new();
 
         for (i, obj) in scene.objects.iter().enumerate() {
@@ -731,6 +762,7 @@ impl Renderer3D {
         }
 
         // Live Hover Preview Wireframe (Smart Sub-Part / Smart Surface highlight before clicking)
+        let mut draw_hover = false;
         if let Some((hover_obj_id, hover_faces)) = hover_preview {
             if !hover_faces.is_empty() {
                 if let Some(obj) = scene
@@ -738,24 +770,23 @@ impl Renderer3D {
                     .iter()
                     .find(|o| o.id == hover_obj_id && o.visible)
                 {
-                    let preview_lines = obj.mesh.build_face_subset_lines(
-                        hover_faces,
-                        obj.transform.matrix(),
-                        [0.15, 0.94, 1.0],
-                    );
-                    if !preview_lines.is_empty() {
-                        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Hover Preview Wireframe VB"),
-                            contents: bytemuck::cast_slice(&preview_lines),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                        let bg = self.create_line_bind_group(device, Mat4::IDENTITY);
-                        depth_line_draws.push(PreparedDrawCall {
-                            vertex_buffer: vb,
-                            vertex_count: preview_lines.len() as u32,
-                            bind_group: bg,
+                    let key = HoverKey::new(obj, hover_faces);
+                    if self.hover_lines.as_ref().is_none_or(|(k, _, _)| *k != key) {
+                        let preview_lines = obj.mesh.build_face_subset_lines(
+                            hover_faces,
+                            obj.transform.matrix(),
+                            [0.15, 0.94, 1.0],
+                        );
+                        self.hover_lines = (!preview_lines.is_empty()).then(|| {
+                            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("Hover Preview Wireframe VB"),
+                                contents: bytemuck::cast_slice(&preview_lines),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            });
+                            (key, vb, preview_lines.len() as u32)
                         });
                     }
+                    draw_hover = self.hover_lines.is_some();
                 }
             }
         }
@@ -923,10 +954,7 @@ impl Renderer3D {
         }
 
         // 2. Depth-tested Lines (Preallocated Grid + Cached Mesh Wireframes + Hover Preview)
-        if (self.show_grid && self.grid_vertex_count > 0)
-            || !wire_draws.is_empty()
-            || !depth_line_draws.is_empty()
-        {
+        if (self.show_grid && self.grid_vertex_count > 0) || !wire_draws.is_empty() || draw_hover {
             rpass.set_pipeline(&self.line_depth_pipeline);
             rpass.set_bind_group(0, &self.global_bind_group, &[]);
 
@@ -946,10 +974,12 @@ impl Renderer3D {
                 }
             }
 
-            for call in &depth_line_draws {
-                rpass.set_bind_group(1, &call.bind_group, &[]);
-                rpass.set_vertex_buffer(0, call.vertex_buffer.slice(..));
-                rpass.draw(0..call.vertex_count, 0..1);
+            if draw_hover {
+                if let Some((_, vb, count)) = &self.hover_lines {
+                    rpass.set_bind_group(1, &self.identity_line_bind_group, &[]);
+                    rpass.set_vertex_buffer(0, vb.slice(..));
+                    rpass.draw(0..*count, 0..1);
+                }
             }
         }
 

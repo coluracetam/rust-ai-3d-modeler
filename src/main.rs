@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod autosave;
 mod box_select;
 pub mod camera;
 pub mod gizmo;
@@ -94,6 +95,11 @@ pub struct ModelerApp {
     fly: navigation::FlyController,
     /// Fly speed has been chosen for this session (otherwise derived from the view on entry).
     fly_speed_set: bool,
+    /// The cursor moved since the last frame; hover/brush raycasts run once per frame.
+    pointer_dirty: bool,
+    /// Raw mouse-look motion gathered since the last frame while flying.
+    fly_look_delta: Vec2,
+    saver: autosave::SceneSaver,
 }
 
 impl Default for ModelerApp {
@@ -128,6 +134,9 @@ impl ModelerApp {
             box_drag_start: None,
             fly: navigation::FlyController::default(),
             fly_speed_set: false,
+            pointer_dirty: false,
+            fly_look_delta: Vec2::ZERO,
+            saver: autosave::SceneSaver::default(),
         }
     }
 }
@@ -179,10 +188,7 @@ impl ModelerApp {
             self.ui_state.hover_preview_obj_id = None;
             self.ui_state.hover_preview_seed_face = None;
             ui::update_pending_anchor_from_selection(&mut self.scene);
-            if let Err(e) = mcp::persist_scene(&mut self.scene, &self.camera) {
-                result.response =
-                    IpcResponse::error(format!("Operation completed, but save failed: {e}"));
-            }
+            self.saver.request();
         }
         self.ui_state.activity.push(format!(
             "{} · {} · {:.2}s",
@@ -197,6 +203,7 @@ impl ModelerApp {
         if !result.response.ok {
             self.ui_state.last_error = Some(result.response.message.clone());
         }
+        self.scene.invalidate_mesh_caches();
         if let Some(gpu) = &mut self.gpu {
             gpu.renderer_3d.invalidate_cache();
             gpu.window.request_redraw();
@@ -231,13 +238,17 @@ impl ModelerApp {
         }
     }
 
+    /// Schedule a background save (see `autosave`); it never blocks input or rendering.
     fn persist(&mut self) {
-        match mcp::persist_scene(&mut self.scene, &self.camera) {
-            Ok(()) => self.ui_state.scene_dirty_for_disk = false,
-            Err(e) => {
-                self.ui_state.last_error = Some(e);
-                self.ui_state.scene_dirty_for_disk = true;
-            }
+        self.ui_state.scene_dirty_for_disk = false;
+        self.saver.request();
+    }
+
+    /// Write everything before the window closes.
+    fn flush_saves(&mut self) {
+        if let Err(e) = self.saver.flush(&mut self.scene, &self.camera) {
+            log::error!("Final save failed: {e}");
+            eprintln!("Final save failed: {e}");
         }
     }
 
@@ -293,7 +304,8 @@ impl ModelerApp {
 
             self.apply_section_selection_at_hit(&hit, additive, subtract);
             self.persist();
-        } else if self.ui_state.select_mode == SmartSelectMode::Box && !self.ui_state.measure_active {
+        } else if self.ui_state.select_mode == SmartSelectMode::Box && !self.ui_state.measure_active
+        {
             self.box_drag_start = Some(self.cursor_pos);
         } else if !self.modifiers.shift_key()
             && !self.modifiers.control_key()
@@ -461,6 +473,27 @@ impl ModelerApp {
             return;
         }
 
+        // Raycasting every event (hundreds per second) backs up input; do it once per frame.
+        self.pointer_dirty = true;
+    }
+
+    /// Per-frame pointer work: hover preview, brush painting, and fly-mode look.
+    fn process_pointer(&mut self) {
+        if self.ui_state.fly_active {
+            let look = std::mem::take(&mut self.fly_look_delta);
+            if look != Vec2::ZERO {
+                self.camera.fly_look(look.x, look.y);
+                self.pointer_dirty = true;
+            }
+            if std::mem::take(&mut self.pointer_dirty) {
+                self.update_fly_hover();
+            }
+            return;
+        }
+        self.fly_look_delta = Vec2::ZERO;
+        if !std::mem::take(&mut self.pointer_dirty) || self.box_drag_start.is_some() {
+            return;
+        }
         let vp_size = self.viewport_size();
         let ray = self.camera.screen_ray(self.viewport_cursor(), vp_size);
 
@@ -662,12 +695,24 @@ impl ModelerApp {
         } else {
             format!(
                 "[Box] {} {found} faces · selection: {} faces on {} {} in {} {} (each region becomes its own AI target)",
-                if op == box_select::BoxOp::Subtract { "Removed" } else { "Picked" },
+                if op == box_select::BoxOp::Subtract {
+                    "Removed"
+                } else {
+                    "Picked"
+                },
                 outcome.selected_faces,
                 outcome.objects,
-                if outcome.objects == 1 { "part" } else { "parts" },
+                if outcome.objects == 1 {
+                    "part"
+                } else {
+                    "parts"
+                },
                 outcome.regions,
-                if outcome.regions == 1 { "region" } else { "regions" },
+                if outcome.regions == 1 {
+                    "region"
+                } else {
+                    "regions"
+                },
             )
         };
         self.persist();
@@ -710,7 +755,8 @@ impl ModelerApp {
             }
             self.ui_state.show_shortcuts = false;
             self.ui_state.status_message =
-                "Fly mode · WASD move · mouse look · click selects at the crosshair · Esc exits".into();
+                "Fly mode · WASD move · mouse look · click selects at the crosshair · Esc exits"
+                    .into();
         } else {
             // Orbit around whatever is under the crosshair after flying.
             let ray = self
@@ -780,7 +826,7 @@ impl ModelerApp {
                     self.set_fly(false);
                 } else if pressed && code == KeyCode::KeyF && !event.repeat {
                     ui::frame_selection(&self.scene, &mut self.camera);
-                    self.update_fly_hover();
+                    self.pointer_dirty = true;
                 } else if pressed && code == KeyCode::F1 {
                     self.set_fly(false);
                     self.ui_state.show_shortcuts = true;
@@ -793,6 +839,7 @@ impl ModelerApp {
                 let pressed = *state == ElementState::Pressed;
                 match button {
                     MouseButton::Left if pressed => {
+                        self.process_pointer();
                         self.update_fly_hover();
                         self.handle_viewport_left_press();
                         // A box press in fly mode selects the face under the crosshair.
@@ -822,9 +869,12 @@ impl ModelerApp {
                 let pos = Vec2::new(position.x as f32, position.y as f32);
                 if pos.distance(center) > 80.0 {
                     if let Some(gpu) = &self.gpu {
-                        let _ = gpu.window.set_cursor_position(
-                            winit::dpi::PhysicalPosition::new(center.x as f64, center.y as f64),
-                        );
+                        let _ = gpu
+                            .window
+                            .set_cursor_position(winit::dpi::PhysicalPosition::new(
+                                center.x as f64,
+                                center.y as f64,
+                            ));
                     }
                 }
                 true
@@ -844,8 +894,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
             return;
         }
         if let DeviceEvent::MouseMotion { delta } = event {
-            self.camera.fly_look(delta.0 as f32, delta.1 as f32);
-            self.update_fly_hover();
+            self.fly_look_delta += Vec2::new(delta.0 as f32, delta.1 as f32);
             if let Some(gpu) = &self.gpu {
                 gpu.window.request_redraw();
             }
@@ -855,7 +904,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: IpcEvent) {
         if event.request.tool == "quit_gui" {
             let _ = std::fs::remove_file(IPC_SOCKET_PATH);
-            self.persist();
+            self.flush_saves();
             let _ = event.reply_tx.send(IpcResponse::success(
                 "Closed GUI window",
                 serde_json::json!({}),
@@ -978,6 +1027,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
 
         if let Some(gpu) = &mut self.gpu {
             if !ipc::is_read_only(&event.request.tool) {
+                self.scene.invalidate_mesh_caches();
                 gpu.renderer_3d.invalidate_cache();
             }
             gpu.renderer_3d.shading = shading;
@@ -1095,36 +1145,60 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        use winit::event_loop::ControlFlow;
         self.poll_operation();
         if self.ui_state.fly_toggle_requested {
             self.ui_state.fly_toggle_requested = false;
             self.set_fly(!self.ui_state.fly_active);
         }
+        if self.ui_state.scene_dirty_for_disk {
+            self.persist();
+        }
+        if let Some(error) = self
+            .saver
+            .poll(&mut self.scene, &self.camera)
+            .into_iter()
+            .last()
+        {
+            self.ui_state.last_error = Some(error);
+            if let Some(gpu) = &self.gpu {
+                gpu.window.request_redraw();
+            }
+        }
+        let save_wake = self.saver.next_wake();
+        let wait_until = |event_loop: &ActiveEventLoop, at: std::time::Instant| {
+            let at = save_wake.map_or(at, |s| s.min(at));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        };
         if self.ui_state.fly_active && self.fly.moving() {
             let (fast, slow) = (self.modifiers.shift_key(), self.modifiers.control_key());
             if self
                 .fly
                 .tick(&mut self.camera, self.ui_state.fly_speed, fast, slow)
             {
-                self.update_fly_hover();
+                self.pointer_dirty = true;
             }
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            wait_until(
+                event_loop,
                 std::time::Instant::now() + std::time::Duration::from_millis(8),
-            ));
+            );
             if let Some(gpu) = &self.gpu {
                 gpu.window.request_redraw();
             }
             return;
         }
         if self.background.is_some() {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            wait_until(
+                event_loop,
                 std::time::Instant::now() + std::time::Duration::from_millis(33),
-            ));
+            );
             if let Some(gpu) = &self.gpu {
                 gpu.window.request_redraw();
             }
+        } else if let Some(at) = save_wake {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
         } else {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -1170,7 +1244,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
         match event {
             WindowEvent::CloseRequested => {
                 let _ = std::fs::remove_file(IPC_SOCKET_PATH);
-                self.persist();
+                self.flush_saves();
                 event_loop.exit();
             }
             WindowEvent::Resized(new_size) => {
@@ -1236,6 +1310,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 } else {
                     self.last_cursor_pos = pos;
                     self.cursor_pos = pos;
+                    self.pointer_dirty = false;
                     self.hover_brush_world = None;
                     self.update_hover_preview(None);
                 }
@@ -1256,6 +1331,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.process_pointer();
                 let Some(gpu) = &mut self.gpu else {
                     return;
                 };
@@ -1343,6 +1419,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                         &mut gpu.renderer_3d.show_grid,
                     );
                     self.ui_state.status_message = response.message;
+                    self.scene.invalidate_mesh_caches();
                     gpu.renderer_3d.invalidate_cache();
                 }
                 let viewport = self.ui_state.viewport_rect;
@@ -1355,12 +1432,6 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                         viewport.width() * scale,
                         viewport.height() * scale,
                     ]);
-                }
-                if self.ui_state.scene_dirty_for_disk {
-                    match mcp::persist_scene(&mut self.scene, &self.camera) {
-                        Ok(()) => self.ui_state.scene_dirty_for_disk = false,
-                        Err(e) => self.ui_state.last_error = Some(e),
-                    }
                 }
 
                 gpu.egui_state

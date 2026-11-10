@@ -800,6 +800,13 @@ impl Scene {
         })
     }
 
+    /// Forget cached adjacency/bounds after commands that may edit geometry in place.
+    pub fn invalidate_mesh_caches(&self) {
+        for obj in &self.objects {
+            obj.mesh.invalidate_caches();
+        }
+    }
+
     /// Clears face/vertex/edge selections across all objects in the scene.
     pub fn clear_all_selections(&mut self) {
         for obj in &mut self.objects {

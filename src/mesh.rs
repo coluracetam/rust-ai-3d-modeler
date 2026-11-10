@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -27,6 +28,53 @@ pub struct RayHit {
     pub face_idx: usize,
 }
 
+type QPt = (i32, i32, i32);
+
+/// Faces per bounding box in the raycast acceleration list.
+const RAY_CHUNK: usize = 64;
+
+/// Derived lookup structures, built lazily and reused until the mesh changes.
+struct MeshDerived {
+    key: (u64, usize, usize),
+    vert_faces: OnceLock<HashMap<QPt, Vec<usize>>>,
+    edge_faces: OnceLock<HashMap<(QPt, QPt), Vec<usize>>>,
+    bounds: OnceLock<(Vec3, Vec3)>,
+    /// Bounding box of every `RAY_CHUNK` consecutive faces.
+    chunks: OnceLock<Vec<(Vec3, Vec3)>>,
+}
+
+/// Per-mesh cache. Cloning yields an empty cache, so a copy edited elsewhere never inherits
+/// stale data; call `Mesh::invalidate_caches` after editing geometry in place.
+#[derive(Default)]
+pub struct MeshCache(Mutex<Option<Arc<MeshDerived>>>);
+
+impl Clone for MeshCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for MeshCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MeshCache")
+    }
+}
+
+/// Entry distance of `ray` into an axis-aligned box, if it hits.
+pub fn ray_box_entry(ray: &Ray, min: Vec3, max: Vec3) -> Option<f32> {
+    let inv = ray.direction.recip();
+    let t0 = (min - ray.origin) * inv;
+    let t1 = (max - ray.origin) * inv;
+    let near = t0.min(t1).max_element();
+    let far = t0.max(t1).min_element();
+    // NaN (ray parallel to and on a slab) compares false and falls through to "hit".
+    if far < near.max(0.0) {
+        None
+    } else {
+        Some(near.max(0.0))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mesh {
     pub positions: Vec<Vec3>,
@@ -43,9 +91,98 @@ pub struct Mesh {
     pub selected_faces: HashSet<usize>,
     #[serde(skip)]
     pub version: u64,
+    #[serde(skip)]
+    cache: MeshCache,
 }
 
 impl Mesh {
+    fn derived(&self) -> Arc<MeshDerived> {
+        let key = (self.version, self.positions.len(), self.faces.len());
+        let mut slot = self.cache.0.lock().unwrap_or_else(|e| e.into_inner());
+        match &*slot {
+            Some(d) if d.key == key => d.clone(),
+            _ => {
+                let d = Arc::new(MeshDerived {
+                    key,
+                    vert_faces: OnceLock::new(),
+                    edge_faces: OnceLock::new(),
+                    bounds: OnceLock::new(),
+                    chunks: OnceLock::new(),
+                });
+                *slot = Some(d.clone());
+                d
+            }
+        }
+    }
+
+    /// Drop cached adjacency/bounds after editing geometry without `bump_version`.
+    pub fn invalidate_caches(&self) {
+        *self.cache.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn with_vert_faces<R>(&self, f: impl FnOnce(&HashMap<QPt, Vec<usize>>) -> R) -> R {
+        let d = self.derived();
+        f(d.vert_faces.get_or_init(|| {
+            let mut map: HashMap<QPt, Vec<usize>> = HashMap::new();
+            for (fi, face) in self.faces.iter().enumerate() {
+                for &vi in face {
+                    if let Some(&p) = self.positions.get(vi) {
+                        map.entry(Self::quantize_pos(p)).or_default().push(fi);
+                    }
+                }
+            }
+            map
+        }))
+    }
+
+    fn with_edge_faces<R>(&self, f: impl FnOnce(&HashMap<(QPt, QPt), Vec<usize>>) -> R) -> R {
+        let d = self.derived();
+        f(d.edge_faces.get_or_init(|| {
+            let mut map: HashMap<(QPt, QPt), Vec<usize>> = HashMap::new();
+            for (fi, face) in self.faces.iter().enumerate() {
+                let n = face.len();
+                if n < 3 {
+                    continue;
+                }
+                for i in 0..n {
+                    if let (Some(&pa), Some(&pb)) = (
+                        self.positions.get(face[i]),
+                        self.positions.get(face[(i + 1) % n]),
+                    ) {
+                        map.entry(Self::edge_key(pa, pb)).or_default().push(fi);
+                    }
+                }
+            }
+            map
+        }))
+    }
+
+    fn edge_key(a: Vec3, b: Vec3) -> (QPt, QPt) {
+        let (qa, qb) = (Self::quantize_pos(a), Self::quantize_pos(b));
+        if qa <= qb { (qa, qb) } else { (qb, qa) }
+    }
+
+    fn chunk_bounds(&self) -> Arc<MeshDerived> {
+        let d = self.derived();
+        d.chunks.get_or_init(|| {
+            self.faces
+                .chunks(RAY_CHUNK)
+                .map(|chunk| {
+                    let mut lo = Vec3::splat(f32::INFINITY);
+                    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                    for &vi in chunk.iter().flatten() {
+                        if let Some(&p) = self.positions.get(vi) {
+                            lo = lo.min(p);
+                            hi = hi.max(p);
+                        }
+                    }
+                    (lo, hi)
+                })
+                .collect()
+        });
+        d
+    }
+
     pub fn new(positions: Vec<Vec3>, faces: Vec<Vec<usize>>) -> Self {
         let count = positions.len();
         let mut mesh = Self {
@@ -57,6 +194,7 @@ impl Mesh {
             selected_edges: HashSet::new(),
             selected_faces: HashSet::new(),
             version: 1,
+            cache: MeshCache::default(),
         };
         mesh.recalculate_normals();
         mesh
@@ -472,13 +610,15 @@ impl Mesh {
         if self.positions.is_empty() {
             return (Vec3::ZERO, Vec3::ZERO);
         }
-        let mut min_p = Vec3::splat(f32::MAX);
-        let mut max_p = Vec3::splat(f32::MIN);
-        for &p in &self.positions {
-            min_p = min_p.min(p);
-            max_p = max_p.max(p);
-        }
-        (min_p, max_p)
+        *self.derived().bounds.get_or_init(|| {
+            let mut min_p = Vec3::splat(f32::MAX);
+            let mut max_p = Vec3::splat(f32::MIN);
+            for &p in &self.positions {
+                min_p = min_p.min(p);
+                max_p = max_p.max(p);
+            }
+            (min_p, max_p)
+        })
     }
 
     /// Selects or unselects faces within `radius` of `local_center` (for 3D section brush/pin selection).
@@ -582,35 +722,25 @@ impl Mesh {
             return result;
         }
 
-        let mut vert_to_faces: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
-        for (fi, face) in self.faces.iter().enumerate() {
-            for &vi in face {
-                if let Some(&p) = self.positions.get(vi) {
-                    vert_to_faces
-                        .entry(Self::quantize_pos(p))
-                        .or_default()
-                        .push(fi);
-                }
-            }
-        }
+        self.with_vert_faces(|vert_to_faces| {
+            let mut queue = std::collections::VecDeque::new();
+            result.insert(seed_face_idx);
+            queue.push_back(seed_face_idx);
 
-        let mut queue = std::collections::VecDeque::new();
-        result.insert(seed_face_idx);
-        queue.push_back(seed_face_idx);
-
-        while let Some(curr) = queue.pop_front() {
-            for &vi in &self.faces[curr] {
-                if let Some(&p) = self.positions.get(vi) {
-                    if let Some(neighbors) = vert_to_faces.get(&Self::quantize_pos(p)) {
-                        for &nb in neighbors {
-                            if result.insert(nb) {
-                                queue.push_back(nb);
+            while let Some(curr) = queue.pop_front() {
+                for &vi in &self.faces[curr] {
+                    if let Some(&p) = self.positions.get(vi) {
+                        if let Some(neighbors) = vert_to_faces.get(&Self::quantize_pos(p)) {
+                            for &nb in neighbors {
+                                if result.insert(nb) {
+                                    queue.push_back(nb);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+        });
 
         result
     }
@@ -637,25 +767,6 @@ impl Mesh {
             return result;
         }
 
-        type QPt = (i32, i32, i32);
-        let mut edge_to_faces: HashMap<(QPt, QPt), Vec<usize>> = HashMap::new();
-        for (fi, face) in self.faces.iter().enumerate() {
-            let n = face.len();
-            if n < 3 {
-                continue;
-            }
-            for i in 0..n {
-                let va = face[i];
-                let vb = face[(i + 1) % n];
-                if let (Some(&pa), Some(&pb)) = (self.positions.get(va), self.positions.get(vb)) {
-                    let qa = Self::quantize_pos(pa);
-                    let qb = Self::quantize_pos(pb);
-                    let key = if qa <= qb { (qa, qb) } else { (qb, qa) };
-                    edge_to_faces.entry(key).or_default().push(fi);
-                }
-            }
-        }
-
         let cos_step = crease_angle_deg.clamp(2.0, 90.0).to_radians().cos();
         let cos_seed = (crease_angle_deg * 1.75)
             .clamp(5.0, 88.0)
@@ -663,37 +774,38 @@ impl Mesh {
             .cos();
         let seed_normal = self.face_normal(seed_face_idx);
 
-        let mut queue = std::collections::VecDeque::new();
-        result.insert(seed_face_idx);
-        queue.push_back(seed_face_idx);
+        self.with_edge_faces(|edge_to_faces| {
+            let mut queue = std::collections::VecDeque::new();
+            result.insert(seed_face_idx);
+            queue.push_back(seed_face_idx);
 
-        while let Some(curr) = queue.pop_front() {
-            let curr_normal = self.face_normal(curr);
-            let face = &self.faces[curr];
-            let n = face.len();
-            for i in 0..n {
-                let va = face[i];
-                let vb = face[(i + 1) % n];
-                if let (Some(&pa), Some(&pb)) = (self.positions.get(va), self.positions.get(vb)) {
-                    let qa = Self::quantize_pos(pa);
-                    let qb = Self::quantize_pos(pb);
-                    let key = if qa <= qb { (qa, qb) } else { (qb, qa) };
-                    if let Some(neighbors) = edge_to_faces.get(&key) {
-                        for &nb in neighbors {
-                            if !result.contains(&nb) {
-                                let nb_normal = self.face_normal(nb);
-                                if curr_normal.dot(nb_normal) >= cos_step
-                                    && seed_normal.dot(nb_normal) >= cos_seed
-                                {
-                                    result.insert(nb);
-                                    queue.push_back(nb);
+            while let Some(curr) = queue.pop_front() {
+                let curr_normal = self.face_normal(curr);
+                let face = &self.faces[curr];
+                let n = face.len();
+                for i in 0..n {
+                    let va = face[i];
+                    let vb = face[(i + 1) % n];
+                    if let (Some(&pa), Some(&pb)) = (self.positions.get(va), self.positions.get(vb))
+                    {
+                        let key = Self::edge_key(pa, pb);
+                        if let Some(neighbors) = edge_to_faces.get(&key) {
+                            for &nb in neighbors {
+                                if !result.contains(&nb) {
+                                    let nb_normal = self.face_normal(nb);
+                                    if curr_normal.dot(nb_normal) >= cos_step
+                                        && seed_normal.dot(nb_normal) >= cos_seed
+                                    {
+                                        result.insert(nb);
+                                        queue.push_back(nb);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
+        });
 
         result
     }
@@ -1185,25 +1297,46 @@ impl Mesh {
         local_ray: &Ray,
         visible: impl Fn(Vec3) -> bool,
     ) -> Option<RayHit> {
+        if self.faces.is_empty() {
+            return None;
+        }
+        let (lo, hi) = self.bounds();
+        let pad = (hi - lo).abs() * 1e-4 + Vec3::splat(1e-5);
+        ray_box_entry(local_ray, lo - pad, hi + pad)?;
         let mut closest: Option<RayHit> = None;
+        let derived = self.chunk_bounds();
+        let chunks = derived.chunks.get().expect("chunk bounds built");
 
-        for (fi, face) in self.faces.iter().enumerate() {
-            if face.len() < 3 {
-                continue;
+        for (ci, &(lo, hi)) in chunks.iter().enumerate() {
+            let pad = (hi - lo).abs() * 1e-4 + Vec3::splat(1e-5);
+            match ray_box_entry(local_ray, lo - pad, hi + pad) {
+                Some(t) if closest.as_ref().is_none_or(|c| t <= c.distance) => {}
+                _ => continue,
             }
-            let v0 = self.positions[face[0]];
-            for i in 1..(face.len() - 1) {
-                let v1 = self.positions[face[i]];
-                let v2 = self.positions[face[i + 1]];
-                if let Some((t, normal)) = Self::ray_triangle_intersect(local_ray, v0, v1, v2) {
-                    if visible(local_ray.at(t)) && closest.as_ref().map_or(true, |c| t < c.distance)
-                    {
-                        closest = Some(RayHit {
-                            distance: t,
-                            point: local_ray.at(t),
-                            normal,
-                            face_idx: fi,
-                        });
+            let start = ci * RAY_CHUNK;
+            for (offset, face) in self.faces[start..(start + RAY_CHUNK).min(self.faces.len())]
+                .iter()
+                .enumerate()
+            {
+                let fi = start + offset;
+                if face.len() < 3 {
+                    continue;
+                }
+                let v0 = self.positions[face[0]];
+                for i in 1..(face.len() - 1) {
+                    let v1 = self.positions[face[i]];
+                    let v2 = self.positions[face[i + 1]];
+                    if let Some((t, normal)) = Self::ray_triangle_intersect(local_ray, v0, v1, v2) {
+                        if visible(local_ray.at(t))
+                            && closest.as_ref().map_or(true, |c| t < c.distance)
+                        {
+                            closest = Some(RayHit {
+                                distance: t,
+                                point: local_ray.at(t),
+                                normal,
+                                face_idx: fi,
+                            });
+                        }
                     }
                 }
             }
@@ -1497,5 +1630,92 @@ impl Mesh {
             });
         }
         lines
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn brute_force(mesh: &Mesh, ray: &Ray) -> Option<(usize, f32)> {
+        let mut best: Option<(usize, f32)> = None;
+        for (fi, face) in mesh.faces.iter().enumerate() {
+            for i in 1..face.len() - 1 {
+                let (a, b, c) = (
+                    mesh.positions[face[0]],
+                    mesh.positions[face[i]],
+                    mesh.positions[face[i + 1]],
+                );
+                if let Some((t, _)) = Mesh::ray_triangle_intersect(ray, a, b, c) {
+                    if best.is_none_or(|(_, bt)| t < bt) {
+                        best = Some((fi, t));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn chunked_raycast_matches_brute_force() {
+        let mesh = Mesh::sphere(1.0, 48, 64);
+        assert!(mesh.faces.len() > RAY_CHUNK * 10);
+        for i in 0..400 {
+            let a = i as f32 * 0.37;
+            let origin = Vec3::new(a.cos() * 4.0, (a * 0.7).sin() * 3.0, a.sin() * 4.0);
+            let target = Vec3::new((a * 1.3).sin() * 0.9, (a * 2.1).cos() * 0.9, 0.0);
+            let ray = Ray::new(origin, target - origin);
+            let fast = mesh.ray_intersect(&ray).map(|h| (h.face_idx, h.distance));
+            let slow = brute_force(&mesh, &ray);
+            match (fast, slow) {
+                (Some((_, t1)), Some((_, t2))) => assert!((t1 - t2).abs() < 1e-4),
+                (None, None) => {}
+                other => panic!("mismatch for ray {i}: {other:?}"),
+            }
+        }
+        let miss = Ray::new(Vec3::new(5.0, 5.0, 5.0), Vec3::X);
+        assert!(mesh.ray_intersect(&miss).is_none());
+    }
+
+    #[test]
+    fn caches_follow_geometry_edits() {
+        let mut mesh = Mesh::cube(2.0);
+        let down = Ray::new(Vec3::new(0.0, 5.0, 0.0), -Vec3::Y);
+        assert!((mesh.ray_intersect(&down).unwrap().distance - 4.0).abs() < 1e-4);
+        assert_eq!(mesh.bounds().1, Vec3::ONE);
+        assert_eq!(mesh.compute_connected_component(0).len(), 6);
+
+        // In-place edit without a version bump: explicit invalidation refreshes everything.
+        for p in &mut mesh.positions {
+            *p *= 2.0;
+        }
+        mesh.invalidate_caches();
+        assert_eq!(mesh.bounds().1, Vec3::splat(2.0));
+        assert!((mesh.ray_intersect(&down).unwrap().distance - 3.0).abs() < 1e-4);
+
+        // Topology changes change the cache key on their own.
+        let base = mesh.positions.len();
+        mesh.positions.extend(
+            Mesh::cube(1.0)
+                .positions
+                .iter()
+                .map(|p| *p + Vec3::X * 10.0),
+        );
+        mesh.faces.extend(
+            Mesh::cube(1.0)
+                .faces
+                .iter()
+                .map(|f| f.iter().map(|v| v + base).collect()),
+        );
+        assert_eq!(mesh.compute_connected_component(0).len(), 6);
+        assert_eq!(mesh.compute_connected_component(6).len(), 6);
+        assert!(mesh.bounds().1.x > 10.0);
+
+        // Clones never share a cache.
+        let clone = mesh.clone();
+        mesh.positions[0] = Vec3::splat(-50.0);
+        mesh.invalidate_caches();
+        assert!(clone.bounds().0.x > -10.0);
+        assert!(mesh.bounds().0.x <= -50.0);
     }
 }

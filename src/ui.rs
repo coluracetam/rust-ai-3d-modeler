@@ -887,6 +887,7 @@ pub fn draw_ui(
         }
     }
     if view_changed {
+        scene.invalidate_mesh_caches();
         renderer.invalidate_cache();
     }
 
