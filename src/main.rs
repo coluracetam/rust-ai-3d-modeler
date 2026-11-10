@@ -462,6 +462,14 @@ impl ModelerApp {
     }
 
     fn handle_key_press(&mut self, code: KeyCode) {
+        if code == KeyCode::F1 || (code == KeyCode::Slash && self.modifiers.shift_key()) {
+            self.ui_state.show_shortcuts = !self.ui_state.show_shortcuts;
+            return;
+        }
+        // Escape closes the open dialog/overlay (handled by the UI) instead of clearing the selection.
+        if code == KeyCode::Escape && (self.ui_state.modal_open() || self.ui_state.show_shortcuts) {
+            return;
+        }
         if self.scene.preview_revision.is_some() && code != KeyCode::KeyF {
             return;
         }
@@ -824,7 +832,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
             }
             _ => self.cursor_pos,
         };
-        let dialog_open = self.ui_state.project_dialog.is_some() || self.ui_state.show_io_modal;
+        let dialog_open = self.ui_state.modal_open();
         let viewport_accepts_pointer = viewport_input::accepts_pointer(
             &gpu.egui_ctx,
             self.ui_state.viewport_rect,

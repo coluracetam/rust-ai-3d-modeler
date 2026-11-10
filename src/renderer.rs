@@ -1153,13 +1153,14 @@ impl Renderer3D {
             state.review_tab = tab;
             let mut history = crate::history::UndoHistory::default();
             let mut ui_gizmo = GizmoState::default();
-            for frame in 0..3 {
+            // Step time generously so egui's area fade-in animations finish before capture.
+            for frame in 0..4 {
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
                         egui::vec2(w as f32, h as f32),
                     )),
-                    time: Some(frame as f64 / 60.0),
+                    time: Some(frame as f64 * 0.5),
                     ..Default::default()
                 };
                 let output = ctx.run(input, |ctx| {
