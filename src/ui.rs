@@ -113,6 +113,10 @@ pub struct UiState {
     pub fly_toggle_requested: bool,
     /// Free-flight speed in scene units per second.
     pub fly_speed: f32,
+    /// The "Start a new project" confirmation is open.
+    pub confirm_new_project: bool,
+    /// Title typed into the new-project confirmation.
+    pub new_project_name: String,
 }
 
 impl Default for UiState {
@@ -174,6 +178,8 @@ impl Default for UiState {
             fly_active: false,
             fly_toggle_requested: false,
             fly_speed: 3.0,
+            confirm_new_project: false,
+            new_project_name: String::new(),
         }
     }
 }
@@ -891,8 +897,11 @@ pub fn draw_ui(
         renderer.invalidate_cache();
     }
 
-    draw_dialogs(ctx, state);
+    draw_dialogs(ctx, scene, state);
 
+    if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) && !comparing {
+        state.confirm_new_project = true;
+    }
     if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) && !comparing {
         if scene.project_path.is_some() {
             action(state, "save_project", serde_json::json!({}));
@@ -987,6 +996,13 @@ fn draw_header(
                     }
                     ui.menu_button("Project  ▾", |ui| {
                         ui.set_min_width(220.0);
+                        if ui
+                            .add_enabled(!comparing, egui::Button::new("New project…"))
+                            .clicked()
+                        {
+                            state.confirm_new_project = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Open project…").clicked() {
                             state.project_dialog = Some("open".into());
                             ui.close_menu();
@@ -2634,9 +2650,13 @@ fn draw_viewport(
     });
 }
 
-fn draw_dialogs(ctx: &egui::Context, state: &mut UiState) {
+fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
     use serde_json::json;
     let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+    if state.confirm_new_project {
+        draw_new_project_dialog(ctx, scene, state, escape);
+    }
 
     if let Some(mode) = state.project_dialog.clone() {
         let mut open = true;
@@ -2847,6 +2867,7 @@ fn draw_dialogs(ctx: &egui::Context, state: &mut UiState) {
                     (
                         "Project",
                         &[
+                            ("Ctrl + N", "New project"),
                             ("Ctrl + S", "Save project"),
                             ("Ctrl + Z", "Undo"),
                             ("Ctrl + Shift + Z", "Redo"),
@@ -2898,4 +2919,86 @@ pub fn measurement_text(points: &[Vec3], factor: f32, unit: &str) -> Option<Stri
         }
     }
     Some(result)
+}
+
+/// What starting a new project would do to the current one, as shown in the confirmation.
+fn new_project_notice(scene: &Scene) -> (bool, String) {
+    let pending = scene.revisions.iter().any(|r| {
+        matches!(
+            r.status,
+            RevisionStatus::ReadyForReview | RevisionStatus::InProgress
+        )
+    });
+    if pending {
+        return (
+            false,
+            "Accept, revert or cancel the pending revision before starting a new project.".into(),
+        );
+    }
+    let text = match &scene.project_path {
+        Some(path) => format!(
+            "\u{201c}{}\u{201d} stays saved at {path}; changes since your last save are in its autosave. \
+             Undo (Ctrl+Z) brings it back.",
+            scene.project_name
+        ),
+        None if scene.objects.is_empty() && scene.comments.is_empty() => {
+            "The current project is empty, so nothing will be lost.".into()
+        }
+        None => format!(
+            "\u{201c}{}\u{201d} has never been saved. Save it first to keep it as a file; \
+             otherwise only Undo (Ctrl+Z) can bring it back, until you close the app.",
+            scene.project_name
+        ),
+    };
+    (true, text)
+}
+
+fn draw_new_project_dialog(ctx: &egui::Context, scene: &Scene, state: &mut UiState, escape: bool) {
+    let (allowed, notice) = new_project_notice(scene);
+    let unsaved =
+        scene.project_path.is_none() && !(scene.objects.is_empty() && scene.comments.is_empty());
+    let mut open = true;
+    egui::Window::new("New project")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(460.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label(small_muted(
+                "Starts a blank canvas: no objects, feedback, revisions, saved selections or views.",
+            ));
+            ui.add_space(6.0);
+            eyebrow(ui, "Project title");
+            let r = text_field(ui, &mut state.new_project_name, "Untitled project", f32::INFINITY);
+            if !r.has_focus() && ui.memory(|m| m.focused().is_none()) {
+                r.request_focus();
+            }
+            ui.add_space(4.0);
+            let color = if allowed && !unsaved { MUTED } else { WARN };
+            ui.label(RichText::new(notice).size(12.0).color(color));
+            ui.add_space(6.0);
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if primary(ui, "Start new project", allowed) || (enter && allowed) {
+                    action(
+                        state,
+                        "new_project",
+                        serde_json::json!({"name": state.new_project_name.trim()}),
+                    );
+                    state.new_project_name.clear();
+                    state.confirm_new_project = false;
+                }
+                if unsaved && allowed && ui.button("Save first…").clicked() {
+                    state.confirm_new_project = false;
+                    state.project_dialog = Some("save".into());
+                }
+                if ui.button("Cancel").clicked() {
+                    state.confirm_new_project = false;
+                }
+            });
+        });
+    if !open || escape {
+        state.confirm_new_project = false;
+    }
 }

@@ -79,7 +79,9 @@ impl UndoHistory {
 }
 
 fn restore(current: &mut Scene, mut restored: Scene) {
-    if restored.project_path == current.project_path {
+    if restored.project_path == current.project_path
+        && restored.project_generation == current.project_generation
+    {
         restored.comments = current.comments.clone();
         restored.next_comment_id = current.next_comment_id;
         restored.saved_selections = current.saved_selections.clone();
