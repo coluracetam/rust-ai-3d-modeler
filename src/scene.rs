@@ -337,6 +337,11 @@ pub struct Scene {
     pub highlight_changes: bool,
     #[serde(skip)]
     pub clip_plane: Option<[f32; 4]>,
+    /// Identifies which project this in-memory scene belongs to. Bumped whenever a different
+    /// project replaces the scene, so undo can tell "same project, earlier state" apart from
+    /// "a different project" even when neither has a file path yet.
+    #[serde(skip)]
+    pub project_generation: u64,
     pub objects: Vec<SceneObject>,
     pub selected_object: Option<usize>,
     pub next_id: u64,
@@ -366,6 +371,7 @@ impl Default for Scene {
             preview_revision: None,
             highlight_changes: false,
             clip_plane: None,
+            project_generation: 0,
             objects: Vec::new(),
             selected_object: None,
             next_id: 1,
@@ -383,6 +389,18 @@ impl Default for Scene {
 }
 
 impl Scene {
+    /// Replace this scene with a blank, unsaved project: no objects, comments, revisions,
+    /// saved selections or views. Returns the scene that was replaced.
+    pub fn start_new_project(&mut self, name: &str) -> Scene {
+        let mut fresh = Scene::empty();
+        let name = name.trim();
+        if !name.is_empty() {
+            fresh.project_name = name.to_string();
+        }
+        fresh.project_generation = self.project_generation + 1;
+        std::mem::replace(self, fresh)
+    }
+
     pub fn empty() -> Self {
         // Avoid constructing the default voxel object for display snapshots.
         Self {
@@ -397,6 +415,7 @@ impl Scene {
             preview_revision: None,
             highlight_changes: false,
             clip_plane: None,
+            project_generation: 0,
             objects: Vec::new(),
             selected_object: None,
             next_id: 1,

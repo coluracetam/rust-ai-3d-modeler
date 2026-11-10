@@ -252,6 +252,25 @@ pub fn is_geometry_tool(tool: &str) -> bool {
     )
 }
 
+/// Clear per-project UI state (hover, clipping, measurements, comment focus, screenshots)
+/// when a different project replaces the scene.
+fn reset_project_ui(ui_state: &mut UiState) {
+    ui_state.hover_preview_faces.clear();
+    ui_state.hover_preview_obj_id = None;
+    ui_state.hover_preview_seed_face = None;
+    ui_state.clip_enabled = false;
+    ui_state.measure_active = false;
+    ui_state.measure_points.clear();
+    ui_state.screenshot_cache.clear();
+    ui_state.focus_comment = None;
+    ui_state.scroll_to_comment = None;
+    ui_state.expanded_comments.clear();
+    ui_state.reply_to = None;
+    ui_state.reply_draft.clear();
+    ui_state.comment_draft.clear();
+    ui_state.lightbox = None;
+}
+
 pub fn is_read_only(tool: &str) -> bool {
     matches!(
         tool,
@@ -320,7 +339,10 @@ fn dispatch(
         .iter()
         .any(|r| r.status == crate::review::RevisionStatus::ReadyForReview)
         && (is_geometry_tool(&req.tool)
-            || matches!(req.tool.as_str(), "undo" | "redo" | "open_project"))
+            || matches!(
+                req.tool.as_str(),
+                "undo" | "redo" | "open_project" | "new_project"
+            ))
     {
         return IpcResponse::error(
             "Accept or revert the pending revision before changing geometry",
@@ -339,7 +361,10 @@ fn dispatch(
         .revisions
         .iter()
         .any(|r| r.status == crate::review::RevisionStatus::InProgress)
-        && matches!(req.tool.as_str(), "undo" | "redo" | "open_project")
+        && matches!(
+            req.tool.as_str(),
+            "undo" | "redo" | "open_project" | "new_project"
+        )
     {
         return IpcResponse::error("Finish or cancel the active revision first");
     }
@@ -392,18 +417,36 @@ fn dispatch(
                 Ok(mut project) => {
                     history.record("Open project", scene);
                     project.scene.project_path = Some(path.clone());
+                    project.scene.project_generation = scene.project_generation + 1;
                     *scene = project.scene;
                     *camera = project.camera;
-                    ui_state.hover_preview_faces.clear();
-                    ui_state.hover_preview_obj_id = None;
-                    ui_state.clip_enabled = false;
-                    ui_state.measure_points.clear();
-                    ui_state.screenshot_cache.clear();
+                    reset_project_ui(ui_state);
                     ui_state.status_message = format!("Opened {path}");
                     IpcResponse::success("Project opened", json!({"path":path}))
                 }
                 Err(e) => IpcResponse::error(e),
             }
+        }
+        "new_project" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            history.record("New project", scene);
+            let previous = scene.start_new_project(name);
+            let aspect = camera.aspect;
+            *camera = OrbitCamera::default();
+            camera.aspect = aspect;
+            reset_project_ui(ui_state);
+            ui_state.status_message = format!("Started {}", scene.project_name);
+            IpcResponse::success(
+                "Started a new, unsaved project. Undo restores the previous one.",
+                json!({
+                    "project_name": scene.project_name,
+                    "previous_project_name": previous.project_name,
+                    "previous_project_path": previous.project_path,
+                }),
+            )
         }
         "begin_revision" => {
             let label = args

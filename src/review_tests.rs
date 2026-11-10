@@ -377,3 +377,90 @@ fn shared_project_resolves_screenshots_relative_to_its_directory() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn new_project_starts_blank_and_undo_restores_unsaved_work() {
+    let mut e = Editor::new();
+    e.scene.project_name = "Chair study".into();
+    e.scene.add_general_comment("Keep this feedback");
+    e.scene.saved_views.push(crate::scene::SavedView {
+        name: "Hero".into(),
+        camera: OrbitCamera::default(),
+    });
+    e.camera.distance = 42.0;
+    e.camera.aspect = 1.75;
+    e.ui.clip_enabled = true;
+    e.ui.measure_points.push(Vec3::ONE);
+
+    let r = e.call("new_project", json!({"name":"  Fresh start  "}));
+    assert!(r.ok, "{}", r.message);
+    assert_eq!(e.scene.project_name, "Fresh start");
+    assert!(e.scene.project_path.is_none());
+    assert!(e.scene.objects.is_empty());
+    assert!(e.scene.comments.is_empty());
+    assert!(e.scene.revisions.is_empty());
+    assert!(e.scene.saved_views.is_empty());
+    assert_eq!(e.camera.distance, OrbitCamera::default().distance);
+    assert_eq!(e.camera.aspect, 1.75, "viewport aspect survives the reset");
+    assert!(!e.ui.clip_enabled && e.ui.measure_points.is_empty());
+    assert!(e.ui.scene_dirty_for_disk, "the blank project is persisted");
+
+    // Neither project has a file path, but undo must still bring back the whole previous project.
+    assert!(e.call("undo", json!({})).ok);
+    assert_eq!(e.scene.project_name, "Chair study");
+    assert_eq!(e.scene.objects.len(), 1);
+    assert_eq!(e.scene.comments.len(), 1);
+    assert_eq!(e.scene.saved_views.len(), 1);
+
+    assert!(e.call("redo", json!({})).ok);
+    assert_eq!(e.scene.project_name, "Fresh start");
+    assert!(e.scene.objects.is_empty() && e.scene.comments.is_empty());
+
+    // Unnamed new projects get the default title.
+    assert!(e.call("new_project", json!({})).ok);
+    assert_eq!(e.scene.project_name, "Untitled project");
+}
+
+#[test]
+fn new_project_keeps_saved_file_and_undo_reopens_it() {
+    let dir = std::env::temp_dir().join(format!("spatial-new-project-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("kept.spatial.json");
+    let mut e = Editor::new();
+    assert!(e.call("save_project", json!({"path":path})).ok);
+    let saved = std::fs::read(&path).unwrap();
+
+    assert!(e.call("new_project", json!({})).ok);
+    assert!(e.scene.project_path.is_none());
+    assert_eq!(
+        saved,
+        std::fs::read(&path).unwrap(),
+        "the saved file is untouched"
+    );
+
+    assert!(e.call("undo", json!({})).ok);
+    assert_eq!(
+        e.scene.project_path.as_deref(),
+        Some(path.to_string_lossy().as_ref())
+    );
+    assert_eq!(e.scene.objects.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn new_project_waits_for_pending_revisions() {
+    let mut e = Editor::new();
+    let id = e.scene.begin_revision("Agent work".into(), None).unwrap();
+    assert!(!e.call("new_project", json!({})).ok, "in-progress revision");
+    e.scene
+        .finish_revision(id, "Done".into(), Vec::new())
+        .unwrap();
+    assert!(
+        !e.call("new_project", json!({})).ok,
+        "revision awaiting review"
+    );
+    assert_eq!(e.scene.objects.len(), 1);
+    e.scene.review_revision(id, true).unwrap();
+    assert!(e.call("new_project", json!({})).ok);
+    assert!(e.scene.revisions.is_empty());
+}
