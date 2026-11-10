@@ -19,6 +19,25 @@ pub enum SmartSelectMode {
     WholeLayer,
     /// Click & drag spherical brush selection.
     Brush,
+    /// Drag a screen-space rectangle; every visible face inside it is selected.
+    Box,
+}
+
+impl SmartSelectMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SubPart => "Part",
+            Self::SmartSurface => "Surface",
+            Self::WholeLayer => "Layer",
+            Self::Brush => "Brush",
+            Self::Box => "Box",
+        }
+    }
+
+    /// Modes driven by dragging rather than by a hover-previewed click.
+    pub fn is_drag(self) -> bool {
+        matches!(self, Self::Brush | Self::Box)
+    }
 }
 
 /// Feedback list filters shown as chips above the comment list.
@@ -82,6 +101,18 @@ pub struct UiState {
     pub hover_preview_faces: HashSet<usize>,
     pub comment_draft: String,
     pub scene_dirty_for_disk: bool,
+    /// Mode to return to when Ctrl+C toggles the box selector off.
+    pub prev_select_mode: SmartSelectMode,
+    /// Box selection also picks faces hidden behind others.
+    pub box_through: bool,
+    /// Rectangle being dragged by the box selector, in egui points.
+    pub box_rect: Option<egui::Rect>,
+    /// Free-flight navigation is active (cursor captured, WASD moves).
+    pub fly_active: bool,
+    /// Requests the app to enter/leave fly mode (needs the window to capture the cursor).
+    pub fly_toggle_requested: bool,
+    /// Free-flight speed in scene units per second.
+    pub fly_speed: f32,
 }
 
 impl Default for UiState {
@@ -137,6 +168,12 @@ impl Default for UiState {
             hover_preview_faces: HashSet::new(),
             comment_draft: String::new(),
             scene_dirty_for_disk: false,
+            prev_select_mode: SmartSelectMode::SubPart,
+            box_through: false,
+            box_rect: None,
+            fly_active: false,
+            fly_toggle_requested: false,
+            fly_speed: 3.0,
         }
     }
 }
@@ -850,6 +887,7 @@ pub fn draw_ui(
         }
     }
     if view_changed {
+        scene.invalidate_mesh_caches();
         renderer.invalidate_cache();
     }
 
@@ -1056,6 +1094,7 @@ fn draw_selection_toolbar(
                             (SmartSelectMode::SmartSurface, "2  Surface".into(), "Surface (2) · click selects a surface bounded by sharp edges"),
                             (SmartSelectMode::WholeLayer, "3  Layer".into(), "Layer (3) · click selects the entire object"),
                             (SmartSelectMode::Brush, "4  Brush".into(), "Brush (4) · drag to paint a selection; Ctrl+drag erases"),
+                            (SmartSelectMode::Box, "5  Box".into(), "Box (5 or Ctrl+C) · drag rectangles over the places to change; Shift adds, Ctrl removes"),
                         ],
                     ) {
                         state.hover_preview_seed_face = None;
@@ -1075,6 +1114,10 @@ fn draw_selection_toolbar(
                         ui.add(egui::Slider::new(&mut state.selection_radius, 0.05..=2.5))
                             .on_hover_text("Brush radius  ·  [ and ] adjust");
                         state.sculpt.radius = state.selection_radius;
+                    } else if state.select_mode == SmartSelectMode::Box {
+                        ui.checkbox(&mut state.box_through, "Select through").on_hover_text(
+                            "Also pick faces hidden behind other geometry inside the box",
+                        );
                     }
                     ui.separator();
                     ui.checkbox(&mut state.multi_select, "Multi-select").on_hover_text(
@@ -2346,6 +2389,13 @@ fn draw_viewport(
                         );
                         ui.checkbox(&mut renderer.show_wireframe_overlay, "Edges");
                         ui.checkbox(&mut renderer.show_grid, "Grid");
+                        if ui
+                            .selectable_label(state.fly_active, "Fly")
+                            .on_hover_text("Free-fly camera  ·  `  (backtick)\nWASD move · Q/E down/up · mouse look · Shift fast · Esc exits")
+                            .clicked()
+                        {
+                            state.fly_toggle_requested = true;
+                        }
                         ui.menu_button(if camera.orthographic { "Ortho  ▾" } else { "Persp  ▾" }, |ui| {
                             ui.set_min_width(170.0);
                             if ui.button("Front").clicked() {
@@ -2502,6 +2552,22 @@ fn draw_viewport(
 
         // Measurement overlay
         let painter = ui.painter().with_clip_rect(rect);
+        if let Some(r) = state.box_rect {
+            let r = r.intersect(rect);
+            painter.rect_filled(r, 2.0, ACCENT.gamma_multiply(0.10));
+            painter.rect_stroke(r, 2.0, egui::Stroke::new(1.5_f32, ACCENT), egui::StrokeKind::Inside);
+        }
+        if state.fly_active {
+            let c = rect.center();
+            let stroke = egui::Stroke::new(1.5_f32, Color32::from_white_alpha(220));
+            let shadow = egui::Stroke::new(3.5_f32, Color32::from_black_alpha(140));
+            for s in [shadow, stroke] {
+                painter.line_segment([c - egui::vec2(9.0, 0.0), c - egui::vec2(3.0, 0.0)], s);
+                painter.line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(9.0, 0.0)], s);
+                painter.line_segment([c - egui::vec2(0.0, 9.0), c - egui::vec2(0.0, 3.0)], s);
+                painter.line_segment([c + egui::vec2(0.0, 3.0), c + egui::vec2(0.0, 9.0)], s);
+            }
+        }
         let mut screen_points = Vec::new();
         for (i, &p) in state.measure_points.iter().enumerate() {
             if let Some(p) = camera.world_to_screen(p, viewport) {
@@ -2522,7 +2588,13 @@ fn draw_viewport(
         }
 
         // Contextual hint (bottom-left)
-        let mode_hint = if comparing {
+        let mode_hint = if state.fly_active {
+            format!(
+                "Fly · WASD move · Q/E down/up · Shift fast · Ctrl slow · Scroll speed ({:.1} {}/s) · Click selects at the crosshair · Esc exits",
+                state.fly_speed,
+                scene.units
+            )
+        } else if comparing {
             "Comparison is read-only · go back to live to select".to_string()
         } else if state.measure_active {
             "Measure · click surfaces to place points".to_string()
@@ -2532,6 +2604,7 @@ fn draw_viewport(
                 SmartSelectMode::SmartSurface => "Click a surface · the crease angle sets its edges",
                 SmartSelectMode::WholeLayer => "Click an object to select all of it",
                 SmartSelectMode::Brush => "Drag to paint · Ctrl+drag erases · [ ] radius",
+                SmartSelectMode::Box => "Drag boxes over each place to change · Shift adds · Ctrl removes · each separate patch becomes its own AI target",
             }
             .to_string()
         };
@@ -2544,7 +2617,9 @@ fn draw_viewport(
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             ui.label(RichText::new(mode_hint).small().color(TEXT));
-                            ui.label(small_muted("Middle-drag or Alt+drag orbit · Right-drag pan · Scroll zoom · F frame"));
+                            if !state.fly_active {
+                                ui.label(small_muted("Middle-drag or Alt+drag orbit · Right-drag pan · Scroll zoom · F frame · ` fly"));
+                            }
                         });
                         if ui
                             .add(egui::Button::new(RichText::new("?").strong()).min_size(egui::vec2(28.0, 28.0)))
@@ -2736,7 +2811,9 @@ fn draw_dialogs(ctx: &egui::Context, state: &mut UiState) {
                     (
                         "Select",
                         &[
-                            ("1  2  3  4", "Part · Surface · Layer · Brush"),
+                            ("1  2  3  4  5", "Part · Surface · Layer · Brush · Box"),
+                            ("Ctrl + C", "Toggle the box selector"),
+                            ("Box: drag", "Select visible faces in a rectangle"),
                             ("Tab", "Cycle selection mode"),
                             ("Shift + click", "Add to selection"),
                             ("Ctrl + click", "Remove from selection"),
@@ -2752,6 +2829,19 @@ fn draw_dialogs(ctx: &egui::Context, state: &mut UiState) {
                             ("Right-drag  /  Shift + middle", "Pan"),
                             ("Scroll", "Zoom"),
                             ("F", "Frame selection"),
+                            ("`  (backtick)", "Enter / leave fly mode"),
+                        ][..],
+                    ),
+                    (
+                        "Fly mode",
+                        &[
+                            ("W A S D  /  arrows", "Move"),
+                            ("Q  /  E  or  Space", "Down / up"),
+                            ("Mouse", "Look around"),
+                            ("Shift  /  Ctrl", "Fast / slow"),
+                            ("Scroll", "Change fly speed"),
+                            ("Click", "Select at the crosshair"),
+                            ("Esc  /  `  /  right-click", "Leave fly mode"),
                         ][..],
                     ),
                     (

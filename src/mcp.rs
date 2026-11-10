@@ -402,7 +402,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "set_camera_and_viewport",
-            "description": "Control the 3D viewport camera (orbit angles, target, zoom distance, view presets, ortho/persp), viewport shading mode (lit, clay, wireframe), and interaction mode.",
+            "description": "Control the 3D viewport camera (orbit angles, target, zoom distance, first-person eye/look_at placement, view presets, ortho/persp), viewport shading mode (lit, clay, wireframe), and interaction mode.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -410,6 +410,8 @@ pub fn mcp_tool_definitions() -> Value {
                     "distance": { "type": "number", "description": "Camera orbit distance." },
                     "yaw_deg": { "type": "number", "description": "Horizontal orbit angle in degrees." },
                     "pitch_deg": { "type": "number", "description": "Vertical orbit angle in degrees (-85..85)." },
+                    "eye": { "type": "array", "items": { "type": "number" }, "description": "First-person camera position [x, y, z] (like the GUI fly mode). Applied after target/distance/yaw/pitch." },
+                    "look_at": { "type": "array", "items": { "type": "number" }, "description": "Point [x, y, z] to look at from `eye` (or from the current eye if `eye` is omitted). Without it, `eye` keeps the current view direction." },
                     "orthographic": { "type": "boolean", "description": "True for orthographic projection, false for perspective." },
                     "preset": { "type": "string", "enum": ["front", "right", "top"], "description": "Snap camera to standard view." },
                     "shading": { "type": "string", "enum": ["lit", "clay", "wireframe"], "description": "Viewport shading style." },

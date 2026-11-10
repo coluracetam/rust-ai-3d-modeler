@@ -17,7 +17,7 @@ For full architectural details, module layout, and the AI-driven spatial comment
 - `sculpt_stroke`: Apply 3D sculpting brushes (`draw`, `inflate`, `smooth`, `flatten`, `grab`, `pinch`, `crease`) at a surface `point` or array of `points`, with optional `symmetry_x`/`y`/`z` and `dyntopo` auto-tessellation.
 - `voxel_brush`: Apply volumetric SDF CSG operations (`add_sphere`, `subtract_sphere`, `add_box`, `subtract_box`, `smooth_field`, `paint_color`) and choose `smooth` (Dual Surface Nets) or `blocky` voxel meshing.
 - `voxel_remesh`: Remesh any object into uniform quad topology at a specified voxel grid resolution.
-- `set_camera_and_viewport`: Adjust camera orbit angles, target, zoom distance, view presets (`front`, `right`, `top`), projection (`orthographic`), shading (`lit`, `clay`, `wireframe`), and editor mode.
+- `set_camera_and_viewport`: Adjust camera orbit angles, target, zoom distance, first-person `eye`/`look_at` placement, view presets (`front`, `right`, `top`), projection (`orthographic`), shading (`lit`, `clay`, `wireframe`), and editor mode.
 - `capture_viewport`: Render the 3D viewport to a PNG image file (`path`, `width`, `height`, and optional camera/shading overrides) so the AI agent can visually inspect its 3D models with `read_file`.
 - `undo` / `redo`: Step backward or forward through the modeling history.
 - `import_model` / `export_model`: Import or export `.obj`, `.stl`, and `.glb` (glTF 2.0) files.

@@ -11,7 +11,7 @@ This document provides complete architectural context and operational instructio
 ### Why It Exists
 Traditional 3D modeling software requires manual vertex pushing. In `rust_modeler`:
 1. **Manual editing tools are intentionally removed from the user GUI.**
-2. **The User's role in the GUI** is to inspect the 3D model, select one or more 3D parts/surfaces using **Smart Selection tools** (`🧩 Sub-Part`, `📐 Smart Surface`, `📦 Whole Layer`, `🖌 Paint Brush`) with **Multi-Selection (`➕ Multi-Select`)**, and leave **Spatial 3D Comments** (pinned to exact 3D coordinates, surface normals, and face index sets across one or more objects) or **General Scene Comments**.
+2. **The User's role in the GUI** is to inspect the 3D model, navigate with orbit/pan/zoom or the game-style **Fly mode** (`` ` ``), select one or more 3D parts/surfaces using **Smart Selection tools** (`🧩 Sub-Part`, `📐 Smart Surface`, `📦 Whole Layer`, `🖌 Paint Brush`, `Box` (`5` / `Ctrl+C`)) with **Multi-Selection (`➕ Multi-Select`)**, and leave **Spatial 3D Comments** (pinned to exact 3D coordinates, surface normals, and face index sets across one or more objects) or **General Scene Comments**.
 3. **The AI Agent's role** is to read the user's spatial/general comments via the built-in MCP server (`get_comments` / `get_scene_info`), modify/sculpt/texture/add 3D geometry accordingly, visually verify the result using `capture_viewport`, and resolve the user's comments via `resolve_comment`.
 
 ---
@@ -92,7 +92,10 @@ The single binary `rust_modeler` supports three execution modes:
 | [`src/ipc.rs`](src/ipc.rs) | Command dispatcher (`execute_ipc_command`, `summarize_scene`, `IpcRequest`, `IpcResponse`) translating JSON tool calls into scene/mesh/voxel/material/comment/screenshot operations. |
 | [`src/mcp.rs`](src/mcp.rs) | MCP JSON-RPC 2.0 stdio server (`run_mcp_stdio_server`, `mcp_tool_definitions`), live GUI socket client (`send_to_live_gui`), and scene persistence (`load_fallback_scene`, `save_fallback_scene`). |
 | [`src/io.rs`](src/io.rs) | Import and export for Wavefront `.obj`, binary/ASCII `.stl`, and binary `.glb` (glTF 2.0). |
-| [`src/camera.rs`](src/camera.rs) | Spherical orbit camera (`OrbitCamera`, `Ray`) with perspective/orthographic projection, `screen_ray` unprojection, and `world_to_screen` projection for 3D UI pins. |
+| [`src/camera.rs`](src/camera.rs) | Spherical orbit camera (`OrbitCamera`, `Ray`) with perspective/orthographic projection, `screen_ray` unprojection, `world_to_screen` projection for 3D UI pins, and first-person helpers (`fly_look`, `fly_move`, `refocus`, `look_from`). |
+| [`src/navigation.rs`](src/navigation.rs) | Free-fly controller (`FlyController`): held-key WASD/QE movement, speed multipliers, scroll speed. `ModelerApp::set_fly` in `main.rs` captures the cursor (Locked, falling back to Confined), reads raw `DeviceEvent::MouseMotion`, and keeps egui from receiving pointer input while flying. |
+| [`src/autosave.rs`](src/autosave.rs) | Debounced background scene saving (`SceneSaver`: `request`, `poll`, `flush`). |
+| [`src/box_select.rs`](src/box_select.rs) | Box selector: rasterizes faces into a depth/face-id buffer covering only the dragged rectangle (near-plane clipped, section-plane and visibility aware), plus a centre test for sub-pixel faces. `apply_box_selection` handles replace/add/subtract; each disconnected selected patch becomes its own `CommentTargetSection`. |
 | [`src/history.rs`](src/history.rs) | Bounded snapshot undo/redo stack (`UndoHistory`). |
 | [`src/gizmo.rs`](src/gizmo.rs) | 3D axis gizmo state (`GizmoState`). |
 
@@ -106,7 +109,7 @@ The single binary `rust_modeler` supports three execution modes:
 2. **State Synchronization Between GUI and MCP**:
    - The active scene is persisted at `/tmp/rust_modeler_scene.json` (`FALLBACK_SCENE_PATH`).
    - Read-only MCP tools (`get_scene_info`, `get_comments`, `capture_viewport`) do **not** overwrite `/tmp/rust_modeler_scene.json` in `ModelerApp::user_event`.
-   - Whenever the user selects faces or adds/resolves/deletes comments in the GUI, `mcp::save_fallback_scene(&self.scene)` is called immediately so any external AI agent querying `get_comments` or `get_scene_info` always sees the latest user selections and comments.
+   - Whenever the user selects faces or adds/resolves/deletes comments in the GUI, `ModelerApp::persist` schedules a save through `autosave::SceneSaver`: changes within 400 ms share one write, which runs on a worker thread from a scene snapshot so input and rendering never wait on serialization or `fsync`. Closing the window or `quit_gui` flushes pending writes. While the GUI runs, MCP calls are answered from its in-memory scene over IPC, so agents always see the latest selections and comments.
 3. **Running Tests**:
    - Run `cargo test` (or `cargo test --offline` in sandboxed environments). All 5 test suites in `src/main.rs` cover mesh editing, voxel sculpting + dyntopo + remeshing, `.obj`/`.stl`/`.glb` round-trips, MCP tool execution (including materials, AO baking, spatial & general comments), and smart sub-part / crease-surface / multi-object selection.
 
@@ -117,6 +120,7 @@ The single binary `rust_modeler` supports three execution modes:
 - `src/review.rs`: bounded revision snapshots, lifecycle, comparison display scenes, changed-object detection, conflict checks, acceptance and geometry-only reversion. `Scene::preview_revision` is transient; never edit the snapshot displayed by a comparison.
 - `src/review_tests.rs`: project/recovery, comment remapping, topology invalidation, multi-region selection, revision grouping/conflicts, unit conversion, and clipping/picking regression tests.
 - Spatial targets store a topology hash plus face signatures. `target_faces` verifies or remaps targets; ambiguous remaps require explicit reattachment. `refreshed_target` returns current coordinates, normals, and indices without rewriting stored comments.
+- Performance: hover raycasts, brush painting and fly-mode look run once per frame in `ModelerApp::process_pointer`, never per input event. `Mesh` lazily caches weld adjacency, edge adjacency, bounds and 64-face raycast chunk boxes keyed by `(version, positions.len(), faces.len())`; clones start with an empty cache. Because not every geometry edit bumps `version`, call `Scene::invalidate_mesh_caches` wherever `Renderer3D::invalidate_cache` is called after commands. `[profile.dev]` is optimized because the GUI is normally run from `target/debug`.
 - The GUI renders only inside `UiState::viewport_rect`; input coordinates are converted from window pixels to viewport pixels using egui’s current pixels-per-point. Keep camera aspect, render viewport, and egui pin projections aligned with that rectangle.
 - `src/viewport_input.rs` routes pointer input to the empty 3D viewport. Do not gate viewport navigation on `egui_ctx.wants_pointer_input()` or `EventResponse::consumed`: the transparent `CentralPanel` makes those true over the canvas. Check the viewport rectangle, topmost layer, active UI gestures, and open menus/dialogs instead. Camera drags must start inside the viewport; panel scrolling stays with egui. Its tests reproduce actual egui panel ownership and cover mouse-wheel/trackpad zoom, overlays, menus/dialogs, fresh cursor events, and display scaling.
 - Heavy live commands run on isolated scene copies in a background worker; only successful, uncancelled results are merged into live geometry. Feedback written during the operation is retained. Cancel discards results; it does not forcibly terminate a Rust thread.
