@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rust-modeler": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--", "--mcp"]
+    }
+  }
+}

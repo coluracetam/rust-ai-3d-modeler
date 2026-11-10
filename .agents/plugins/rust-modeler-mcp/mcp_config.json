@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rust-modeler": {
+      "command": "/home/rivaxel/Documents/Repositories/3D Modelling/target/debug/rust_modeler",
+      "args": ["--mcp"]
+    }
+  }
+}

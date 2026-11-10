@@ -1,0 +1,10 @@
+{
+  "name": "rust-modeler-mcp",
+  "displayName": "Rust 3D Modeler & Voxel Studio",
+  "description": "Control the Rust 3D Modeler & Voxel Sculpt Studio via MCP: create primitives, edit polygonal meshes, sculpt with Dyntopo, apply volumetric SDF voxel brushes, and import/export OBJ, STL, and glTF 2.0.",
+  "suggestedPrompts": [
+    "Launch the 3D Modeler GUI and build a stylized castle tower out of primitives and extrusions",
+    "Create a voxel clay sphere and sculpt a creature head using symmetry and Dyntopo brushes",
+    "Inspect the current 3D scene and export the model to scene.glb"
+  ]
+}
