@@ -11,7 +11,7 @@ This document provides complete architectural context and operational instructio
 ### Why It Exists
 Traditional 3D modeling software requires manual vertex pushing. In `rust_modeler`:
 1. **Manual editing tools are intentionally removed from the user GUI.**
-2. **The User's role in the GUI** is to inspect the 3D model, select one or more 3D parts/surfaces using **Smart Selection tools** (`🧩 Sub-Part`, `📐 Smart Surface`, `📦 Whole Layer`, `🖌 Paint Brush`) with **Multi-Selection (`➕ Multi-Select`)**, and leave **Spatial 3D Comments** (pinned to exact 3D coordinates, surface normals, and face index sets across one or more objects) or **General Scene Comments**.
+2. **The User's role in the GUI** is to inspect the 3D model, navigate with orbit/pan/zoom or the game-style **Fly mode** (`` ` ``), select one or more 3D parts/surfaces using **Smart Selection tools** (`🧩 Sub-Part`, `📐 Smart Surface`, `📦 Whole Layer`, `🖌 Paint Brush`, `Box` (`5` / `Ctrl+C`)) with **Multi-Selection (`➕ Multi-Select`)**, and leave **Spatial 3D Comments** (pinned to exact 3D coordinates, surface normals, and face index sets across one or more objects) or **General Scene Comments**.
 3. **The AI Agent's role** is to read the user's spatial/general comments via the built-in MCP server (`get_comments` / `get_scene_info`), modify/sculpt/texture/add 3D geometry accordingly, visually verify the result using `capture_viewport`, and resolve the user's comments via `resolve_comment`.
 
 ---
@@ -92,7 +92,9 @@ The single binary `rust_modeler` supports three execution modes:
 | [`src/ipc.rs`](src/ipc.rs) | Command dispatcher (`execute_ipc_command`, `summarize_scene`, `IpcRequest`, `IpcResponse`) translating JSON tool calls into scene/mesh/voxel/material/comment/screenshot operations. |
 | [`src/mcp.rs`](src/mcp.rs) | MCP JSON-RPC 2.0 stdio server (`run_mcp_stdio_server`, `mcp_tool_definitions`), live GUI socket client (`send_to_live_gui`), and scene persistence (`load_fallback_scene`, `save_fallback_scene`). |
 | [`src/io.rs`](src/io.rs) | Import and export for Wavefront `.obj`, binary/ASCII `.stl`, and binary `.glb` (glTF 2.0). |
-| [`src/camera.rs`](src/camera.rs) | Spherical orbit camera (`OrbitCamera`, `Ray`) with perspective/orthographic projection, `screen_ray` unprojection, and `world_to_screen` projection for 3D UI pins. |
+| [`src/camera.rs`](src/camera.rs) | Spherical orbit camera (`OrbitCamera`, `Ray`) with perspective/orthographic projection, `screen_ray` unprojection, `world_to_screen` projection for 3D UI pins, and first-person helpers (`fly_look`, `fly_move`, `refocus`, `look_from`). |
+| [`src/navigation.rs`](src/navigation.rs) | Free-fly controller (`FlyController`): held-key WASD/QE movement, speed multipliers, scroll speed. `ModelerApp::set_fly` in `main.rs` captures the cursor (Locked, falling back to Confined), reads raw `DeviceEvent::MouseMotion`, and keeps egui from receiving pointer input while flying. |
+| [`src/box_select.rs`](src/box_select.rs) | Box selector: rasterizes faces into a depth/face-id buffer covering only the dragged rectangle (near-plane clipped, section-plane and visibility aware), plus a centre test for sub-pixel faces. `apply_box_selection` handles replace/add/subtract; each disconnected selected patch becomes its own `CommentTargetSection`. |
 | [`src/history.rs`](src/history.rs) | Bounded snapshot undo/redo stack (`UndoHistory`). |
 | [`src/gizmo.rs`](src/gizmo.rs) | 3D axis gizmo state (`GizmoState`). |
 

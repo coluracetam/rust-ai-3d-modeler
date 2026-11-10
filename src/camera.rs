@@ -77,11 +77,17 @@ impl Default for OrbitCamera {
 }
 
 impl OrbitCamera {
+    /// Unit vector from the target towards the eye for the current yaw/pitch.
+    fn offset_dir(&self) -> Vec3 {
+        Vec3::new(
+            self.pitch.cos() * self.yaw.sin(),
+            self.pitch.sin(),
+            self.pitch.cos() * self.yaw.cos(),
+        )
+    }
+
     pub fn eye(&self) -> Vec3 {
-        let x = self.distance * self.pitch.cos() * self.yaw.sin();
-        let y = self.distance * self.pitch.sin();
-        let z = self.distance * self.pitch.cos() * self.yaw.cos();
-        self.target + Vec3::new(x, y, z)
+        self.target + self.offset_dir() * self.distance
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -136,6 +142,54 @@ impl OrbitCamera {
     pub fn zoom(&mut self, scroll_delta: f32) {
         let zoom_factor = (1.0 - scroll_delta * 0.1).clamp(0.5, 2.0);
         self.distance = (self.distance * zoom_factor).clamp(0.3, 200.0);
+    }
+
+    /// First-person mouse look: the eye stays put and the view direction turns.
+    pub fn fly_look(&mut self, delta_x: f32, delta_y: f32) {
+        let eye = self.eye();
+        let sensitivity = 0.0025;
+        self.yaw -= delta_x * sensitivity;
+        let max_pitch = std::f32::consts::FRAC_PI_2 - 0.02;
+        self.pitch = (self.pitch + delta_y * sensitivity).clamp(-max_pitch, max_pitch);
+        self.target = eye - self.offset_dir() * self.distance;
+    }
+
+    /// Free-flight translation. `local` is (right, world up, forward); forward follows the view pitch.
+    pub fn fly_move(&mut self, local: Vec3, amount: f32) {
+        let delta = self.right() * local.x + Vec3::Y * local.y + self.forward() * local.z;
+        self.target += delta.normalize_or_zero() * amount;
+    }
+
+    /// Keep the eye and view direction but move the orbit pivot to `distance` ahead.
+    pub fn refocus(&mut self, distance: f32) {
+        let eye = self.eye();
+        let forward = self.forward();
+        self.distance = distance.clamp(0.3, 200.0);
+        self.target = eye + forward * self.distance;
+    }
+
+    /// Place the eye at `eye` looking towards `look_at`.
+    pub fn look_from(&mut self, eye: Vec3, look_at: Vec3) {
+        let offset = eye - look_at;
+        let len = offset.length();
+        if !len.is_finite() || len < 1e-4 {
+            return;
+        }
+        let max_pitch = std::f32::consts::FRAC_PI_2 - 0.02;
+        self.distance = len.clamp(0.3, 200.0);
+        self.pitch = (offset.y / len).clamp(-1.0, 1.0).asin().clamp(-max_pitch, max_pitch);
+        self.yaw = offset.x.atan2(offset.z);
+        self.target = eye - self.offset_dir() * self.distance;
+    }
+
+    /// Distance from the eye along the view axis for an NDC depth value.
+    pub fn linear_depth(&self, ndc_z: f32) -> f32 {
+        let (n, f) = (self.z_near, self.z_far);
+        if self.orthographic {
+            n + ndc_z * (f - n)
+        } else {
+            n * f / (f - ndc_z * (f - n)).max(1e-6)
+        }
     }
 
     pub fn set_view_front(&mut self) {

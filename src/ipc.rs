@@ -1178,6 +1178,18 @@ fn dispatch(
             if let Some(ortho) = args.get("orthographic").and_then(|v| v.as_bool()) {
                 camera.orthographic = ortho;
             }
+            if !args["eye"].is_null() {
+                let eye = parse_vec3(&args["eye"], camera.eye());
+                let look_at = if args["look_at"].is_null() {
+                    eye + camera.forward()
+                } else {
+                    parse_vec3(&args["look_at"], camera.target)
+                };
+                camera.look_from(eye, look_at);
+            } else if !args["look_at"].is_null() {
+                let look_at = parse_vec3(&args["look_at"], camera.target);
+                camera.look_from(camera.eye(), look_at);
+            }
             if let Some(preset) = args.get("preset").and_then(|v| v.as_str()) {
                 match preset.to_lowercase().as_str() {
                     "front" => camera.set_view_front(),
