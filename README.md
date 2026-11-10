@@ -5,7 +5,46 @@ An **AI-driven 3D Modeling, Voxel Sculpting & Spatial Review Studio** written in
 Instead of forcing users to manually extrude vertices or wrestle with complex 3D gizmos, **Rust AI 3D Studio** implements an **AI-Agent-Driven 3D Workflow**:
 1. **The AI Agent builds, sculpts, textures, and renders the 3D model** via MCP tools (`add_primitive`, `edit_mesh`, `sculpt_stroke`, `voxel_brush`, `voxel_remesh`, `set_material`, `capture_viewport`, `import_model`, `export_model`).
 2. **The User inspects the 3D scene in the live GUI**, hovers and clicks to select one or more **connected 3D sub-parts** (`🧩 Sub-Part`), **crease-bounded surfaces/walls** (`📐 Smart Surface`), **whole layers** (`📦 Whole Layer`), or **painted regions** (`🖌 Paint Brush`)—even across multiple object layers at once—and attaches **Spatial 3D Comments** (or **General Scene Comments**).
-3. **Any AI Agent (Claude Code, OpenAI Codex, Google Antigravity, Cursor)** queries `get_comments`, activates the user's exact 3D face selections via `select_comment_region`, applies the requested 3D modifications, visually verifies the result via `capture_viewport`, and marks the comment resolved with `resolve_comment`.
+3. **Any AI Agent (Claude Code, OpenAI Codex, Google Antigravity, Cursor)** queries `get_comments`, activates the user's exact 3D face selections via `select_comment_region`, applies the requested 3D modifications, visually verifies the result via `capture_viewport`, and submits a named revision with `finish_revision`. The user compares, accepts, or reverts the result.
+
+
+## Spatial Studio review workspace
+
+The studio now has a compact project header, dedicated selection toolbar, searchable scene outliner with Parts/Inspect/Saved tabs, and separate Comments and Revisions tabs. The 3D viewport uses the space between the panels, including correct picking and camera framing. Typography uses embedded Fira Sans Regular, Medium, and SemiBold, with larger supporting text, clearer contrast, and comfortable line spacing. Font licensing is included in `assets/fonts/OFL.txt`.
+
+- **Projects:** Project → Save/Open uses `.spatial.json` files containing geometry, comments, camera, saved selections/views, and the last eight revisions. Saves are atomic and retain a `.bak` copy. Named projects also write `.autosave` recovery files; Project → Recover autosave restores one. `Ctrl/Cmd+S` saves.
+- **Review:** Comments move through Open → In progress → Ready for review → Accepted. Replies stay with the comment. Revisions offer Before/After, changed-part highlighting, screenshot evidence, Accept, and Revert. Comparisons do not modify live geometry. Finish or cancel an in-progress revision before opening another project; review submitted work before making further geometry changes.
+- **Reliable targets:** Targets include topology fingerprints and face signatures. Unchanged faces can be remapped after index changes. Ambiguous or replaced regions are marked **Needs reattachment**; select a replacement and choose Attach current selection. Legacy spatial comments without fingerprints also require reattachment rather than guessing. Disconnected selected islands within one object remain separate targets.
+- **Inspection:** Search parts, double-click to frame, isolate every selected object, save selections and camera views, ghost unselected geometry, or inspect interiors with a movable X/Y/Z section plane. Clipped-away surfaces cannot intercept picking.
+- **Measurements:** Inspect & measure lets you pick two points for distance or three for an angle at the middle point. Display units are meters, centimeters, millimeters, or inches; world coordinates remain meters. Attach measurements and dimension constraints to feedback.
+- **Agent activity:** Expensive live operations run in a background worker. The review panel shows the current operation, elapsed time, errors, and recent activity. Cancel discards the pending result without changing live geometry; the underlying computation may finish in the background. Cancel revision restores the geometry from before the whole revision.
+- **Undo:** Named revisions group agent geometry operations into one undo step. Undo preserves newer comments in the same project. The in-memory undo stack is session-local; persisted pending revisions can also be reverted after restarting.
+
+Example project in the new review workspace:
+
+![Spatial Studio revision review](docs/images/spatial_studio_review.png)
+
+### Agent revision protocol
+
+```text
+get_comments
+select_comment_region { comment_id }
+begin_revision { label, comment_id }
+... geometry / sculpt / material operations ...
+capture_viewport { path }
+finish_revision { revision_id, summary, screenshots: [path] }
+```
+
+The user reviews the result in the Revisions tab. `accept_revision`, `revert_revision`, `cancel_revision`, `get_revisions`, `preview_revision`, `update_comment`, `reattach_comment`, `save_project`, `open_project`, and `cancel_operation` are also available through MCP and `--cmd`. The legacy `resolve_comment` tool remains available for comments without a revision. A live editor error or timeout is returned to the caller; commands are not silently replayed headlessly against an older live editor.
+
+Generate an offscreen screenshot of the actual interface without changing the open scene:
+
+```bash
+cargo run --offline -- --preview-studio /tmp/spatial-studio.png
+# Add --review-tab for revisions, or --project /path/to/project.spatial.json.
+```
+
+`capture_studio` exposes the same UI capture over MCP, with configurable dimensions and tab (`0` comments, `1` revisions).
 
 ---
 

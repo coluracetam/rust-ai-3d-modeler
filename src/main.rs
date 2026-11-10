@@ -7,26 +7,31 @@ pub mod io;
 pub mod ipc;
 pub mod mcp;
 pub mod mesh;
+pub mod project;
 pub mod renderer;
+pub mod review;
+#[cfg(test)]
+mod review_tests;
 pub mod scene;
 pub mod ui;
+mod viewport_input;
 pub mod voxel;
 
 use crate::camera::OrbitCamera;
 use crate::gizmo::GizmoState;
 use crate::history::UndoHistory;
-use crate::ipc::{execute_ipc_command, IpcRequest, IpcResponse, IPC_SOCKET_PATH};
+use crate::ipc::{IPC_SOCKET_PATH, IpcRequest, IpcResponse, execute_ipc_command};
 use crate::mesh::EditElementMode;
 use crate::renderer::{Renderer3D, ViewportShading};
 use crate::scene::Scene;
-use crate::ui::{draw_ui, update_pending_anchor_from_selection, SmartSelectMode, UiState};
+use crate::ui::{SmartSelectMode, UiState, draw_ui, update_pending_anchor_from_selection};
 use glam::{Vec2, Vec3};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -50,8 +55,22 @@ struct GpuContext {
     renderer_3d: Renderer3D,
 }
 
+struct BackgroundResult {
+    response: IpcResponse,
+    scene: Scene,
+    history: UndoHistory,
+}
+struct BackgroundOperation {
+    receiver: mpsc::Receiver<BackgroundResult>,
+    reply: mpsc::Sender<IpcResponse>,
+    tool: String,
+    started: std::time::Instant,
+    selected_id: Option<u64>,
+}
+
 pub struct ModelerApp {
     gpu: Option<GpuContext>,
+    background: Option<BackgroundOperation>,
     scene: Scene,
     camera: OrbitCamera,
     gizmo: GizmoState,
@@ -72,11 +91,21 @@ pub struct ModelerApp {
 
 impl Default for ModelerApp {
     fn default() -> Self {
-        let initial_scene = mcp::load_fallback_scene().unwrap_or_default();
+        Self::with_scene(mcp::load_fallback_scene().unwrap_or_default())
+    }
+}
+
+impl ModelerApp {
+    fn with_scene(initial_scene: Scene) -> Self {
+        let mut initial_camera = initial_scene.last_camera.clone().unwrap_or_default();
+        if initial_scene.last_camera.is_none() {
+            ui::frame_all(&initial_scene, &mut initial_camera);
+        }
         Self {
             gpu: None,
+            background: None,
             scene: initial_scene,
-            camera: OrbitCamera::default(),
+            camera: initial_camera,
             gizmo: GizmoState::default(),
             history: UndoHistory::default(),
             ui_state: UiState::default(),
@@ -94,22 +123,130 @@ impl Default for ModelerApp {
 }
 
 impl ModelerApp {
-    fn viewport_size(&self) -> Vec2 {
-        if let Some(gpu) = &self.gpu {
-            Vec2::new(
-                gpu.surface_config.width.max(1) as f32,
-                gpu.surface_config.height.max(1) as f32,
-            )
+    fn cancel_operation(&mut self) -> IpcResponse {
+        if let Some(operation) = self.background.take() {
+            let _ = operation
+                .reply
+                .send(IpcResponse::error("Operation cancelled; result discarded"));
+            self.ui_state.busy_operation = None;
+            self.ui_state.status_message = "Operation cancelled · live geometry preserved".into();
+            IpcResponse::success("Operation cancelled", serde_json::json!({}))
         } else {
-            Vec2::new(1280.0, 720.0)
+            IpcResponse::error("No operation is running")
+        }
+    }
+
+    fn poll_operation(&mut self) {
+        let result = self
+            .background
+            .as_ref()
+            .and_then(|op| op.receiver.try_recv().ok());
+        let Some(mut result) = result else {
+            return;
+        };
+        let operation = self.background.take().unwrap();
+        self.ui_state.busy_operation = None;
+        if result.response.ok && !ipc::is_read_only(&operation.tool) {
+            // Keep feedback and inspection changes made while geometry was computed.
+            let current_id = self.scene.active_object().map(|o| o.id);
+            let selected_id = if current_id == operation.selected_id {
+                result.scene.active_object().map(|o| o.id)
+            } else {
+                current_id
+            };
+            for object in &mut result.scene.objects {
+                if let Some(current) = self.scene.objects.iter().find(|o| o.id == object.id) {
+                    object.visible = current.visible;
+                    object.locked = current.locked;
+                }
+            }
+            self.scene.objects = result.scene.objects;
+            self.scene.next_id = self.scene.next_id.max(result.scene.next_id);
+            self.scene.selected_object =
+                selected_id.and_then(|id| self.scene.objects.iter().position(|o| o.id == id));
+            self.history = result.history;
+            self.ui_state.hover_preview_faces.clear();
+            self.ui_state.hover_preview_obj_id = None;
+            self.ui_state.hover_preview_seed_face = None;
+            ui::update_pending_anchor_from_selection(&mut self.scene);
+            if let Err(e) = mcp::persist_scene(&mut self.scene, &self.camera) {
+                result.response =
+                    IpcResponse::error(format!("Operation completed, but save failed: {e}"));
+            }
+        }
+        self.ui_state.activity.push(format!(
+            "{} · {} · {:.2}s",
+            operation.tool,
+            if result.response.ok { "Done" } else { "Failed" },
+            operation.started.elapsed().as_secs_f32()
+        ));
+        if self.ui_state.activity.len() > 24 {
+            self.ui_state.activity.remove(0);
+        }
+        self.ui_state.status_message = result.response.message.clone();
+        if !result.response.ok {
+            self.ui_state.last_error = Some(result.response.message.clone());
+        }
+        if let Some(gpu) = &mut self.gpu {
+            gpu.renderer_3d.invalidate_cache();
+            gpu.window.request_redraw();
+        }
+        let _ = operation.reply.send(result.response);
+    }
+
+    fn viewport_size(&self) -> Vec2 {
+        let rect = self.ui_state.viewport_rect;
+        if rect.is_positive() {
+            let scale = self
+                .gpu
+                .as_ref()
+                .map(|g| g.egui_ctx.pixels_per_point())
+                .unwrap_or(1.0);
+            return Vec2::new(rect.width() * scale, rect.height() * scale);
+        }
+        Vec2::new(1280.0, 720.0)
+    }
+
+    fn viewport_cursor(&self) -> Vec2 {
+        let scale = self
+            .gpu
+            .as_ref()
+            .map(|g| g.egui_ctx.pixels_per_point())
+            .unwrap_or(1.0);
+        let rect = self.ui_state.viewport_rect;
+        if rect.is_positive() {
+            self.cursor_pos - Vec2::new(rect.left() * scale, rect.top() * scale)
+        } else {
+            self.cursor_pos
+        }
+    }
+
+    fn persist(&mut self) {
+        match mcp::persist_scene(&mut self.scene, &self.camera) {
+            Ok(()) => self.ui_state.scene_dirty_for_disk = false,
+            Err(e) => {
+                self.ui_state.last_error = Some(e);
+                self.ui_state.scene_dirty_for_disk = true;
+            }
         }
     }
 
     fn handle_viewport_left_press(&mut self) {
+        if self.scene.preview_revision.is_some() {
+            return;
+        }
         let vp_size = self.viewport_size();
-        let ray = self.camera.screen_ray(self.cursor_pos, vp_size);
+        let ray = self.camera.screen_ray(self.viewport_cursor(), vp_size);
 
         if let Some(hit) = self.scene.raycast(&ray) {
+            if self.ui_state.measure_active {
+                if self.ui_state.measure_points.len() >= 3 {
+                    self.ui_state.measure_points.clear();
+                }
+                self.ui_state.measure_points.push(hit.world_point);
+                self.ui_state.status_message = "Measurement point placed".into();
+                return;
+            }
             let multi_active = self.ui_state.multi_select
                 || self.modifiers.shift_key()
                 || self.modifiers.control_key();
@@ -121,13 +258,9 @@ impl ModelerApp {
             self.scene.selected_object = Some(hit.object_idx);
             self.stroke_active = true;
 
-            let already_selected = self
-                .scene
-                .objects
-                .get(hit.object_idx)
-                .map_or(false, |o| {
-                    o.mesh.selected_faces.contains(&hit.local_hit.face_idx)
-                });
+            let already_selected = self.scene.objects.get(hit.object_idx).map_or(false, |o| {
+                o.mesh.selected_faces.contains(&hit.local_hit.face_idx)
+            });
 
             let subtract = if self.modifiers.control_key() {
                 true
@@ -145,14 +278,14 @@ impl ModelerApp {
             let additive = multi_active && !subtract;
 
             self.apply_section_selection_at_hit(&hit, additive, subtract);
-            mcp::save_fallback_scene(&self.scene);
+            self.persist();
         } else if !self.modifiers.shift_key()
             && !self.modifiers.control_key()
             && !self.ui_state.multi_select
         {
             self.scene.clear_all_selections();
             self.scene.selected_object = None;
-            mcp::save_fallback_scene(&self.scene);
+            self.persist();
         }
     }
 
@@ -302,7 +435,13 @@ impl ModelerApp {
         }
 
         let vp_size = self.viewport_size();
-        let ray = self.camera.screen_ray(self.cursor_pos, vp_size);
+        let ray = self.camera.screen_ray(self.viewport_cursor(), vp_size);
+
+        if self.scene.preview_revision.is_some() || self.ui_state.measure_active {
+            self.hover_brush_world = None;
+            self.update_hover_preview(None);
+            return;
+        }
 
         // 2. Continuous Section Paint Selection while dragging in Brush mode (or Shift/Ctrl drag)
         if self.left_mouse_down
@@ -323,6 +462,12 @@ impl ModelerApp {
     }
 
     fn handle_key_press(&mut self, code: KeyCode) {
+        if self.scene.preview_revision.is_some() && code != KeyCode::KeyF {
+            return;
+        }
+        if self.modifiers.control_key() || self.modifiers.super_key() {
+            return;
+        }
         match code {
             KeyCode::Digit1 => {
                 self.ui_state.select_mode = SmartSelectMode::SubPart;
@@ -350,24 +495,20 @@ impl ModelerApp {
                 self.ui_state.hover_preview_seed_face = None;
             }
             KeyCode::KeyF => {
-                if let Some((_id, wp, _lp, _wn)) = self.scene.pending_anchor {
-                    self.camera.target = wp;
-                } else if let Some(obj) = self.scene.active_object() {
-                    self.camera.target = obj.transform.translation;
-                }
+                ui::frame_selection(&self.scene, &mut self.camera);
             }
             KeyCode::KeyA => {
                 if let Some(obj) = self.scene.active_object_mut() {
                     obj.mesh.select_all(EditElementMode::Face);
                 }
                 update_pending_anchor_from_selection(&mut self.scene);
-                mcp::save_fallback_scene(&self.scene);
+                self.persist();
             }
             KeyCode::KeyC | KeyCode::Escape => {
                 self.scene.clear_all_selections();
                 self.scene.selected_object = None;
                 self.scene.active_comment_id = None;
-                mcp::save_fallback_scene(&self.scene);
+                self.persist();
             }
             KeyCode::BracketLeft => {
                 let mut shrunk = false;
@@ -378,7 +519,7 @@ impl ModelerApp {
                 }
                 if shrunk {
                     update_pending_anchor_from_selection(&mut self.scene);
-                    mcp::save_fallback_scene(&self.scene);
+                    self.persist();
                 } else if self.ui_state.select_mode == SmartSelectMode::Brush {
                     self.ui_state.selection_radius =
                         (self.ui_state.selection_radius - 0.05).max(0.05);
@@ -394,7 +535,7 @@ impl ModelerApp {
                 }
                 if grown {
                     update_pending_anchor_from_selection(&mut self.scene);
-                    mcp::save_fallback_scene(&self.scene);
+                    self.persist();
                 } else if self.ui_state.select_mode == SmartSelectMode::Brush {
                     self.ui_state.selection_radius =
                         (self.ui_state.selection_radius + 0.05).min(2.50);
@@ -410,11 +551,94 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: IpcEvent) {
         if event.request.tool == "quit_gui" {
             let _ = std::fs::remove_file(IPC_SOCKET_PATH);
-            mcp::save_fallback_scene(&self.scene);
-            let _ = event
-                .reply_tx
-                .send(IpcResponse::success("Closed GUI window", serde_json::json!({})));
+            self.persist();
+            let _ = event.reply_tx.send(IpcResponse::success(
+                "Closed GUI window",
+                serde_json::json!({}),
+            ));
             event_loop.exit();
+            return;
+        }
+        self.ui_state.last_agent_activity = Some(std::time::Instant::now());
+        if event.request.tool == "cancel_operation" {
+            let response = self.cancel_operation();
+            let _ = event.reply_tx.send(response);
+            return;
+        }
+        if self.background.is_some() && !ipc::allowed_during_operation(&event.request.tool) {
+            let _ = event.reply_tx.send(IpcResponse::error(
+                "An operation is running; wait or cancel it first",
+            ));
+            return;
+        }
+        if matches!(
+            event.request.tool.as_str(),
+            "sculpt_stroke"
+                | "voxel_brush"
+                | "voxel_remesh"
+                | "set_material"
+                | "edit_mesh"
+                | "add_primitive"
+                | "import_model"
+                | "capture_viewport"
+                | "capture_studio"
+        ) && self.background.is_none()
+        {
+            let request = event.request.clone();
+            let mut scene = self.scene.clone();
+            let mut camera = self.camera.clone();
+            let mut history = self.history.clone();
+            let mut state = self.ui_state.clone();
+            let mut shading = self
+                .gpu
+                .as_ref()
+                .map(|g| g.renderer_3d.shading)
+                .unwrap_or(ViewportShading::StudioLit);
+            let mut wire = self
+                .gpu
+                .as_ref()
+                .map(|g| g.renderer_3d.show_wireframe_overlay)
+                .unwrap_or(false);
+            let mut grid = self
+                .gpu
+                .as_ref()
+                .map(|g| g.renderer_3d.show_grid)
+                .unwrap_or(true);
+            let (tx, receiver) = mpsc::channel();
+            let started = std::time::Instant::now();
+            self.ui_state.busy_operation = Some((request.tool.replace('_', " "), started));
+            self.background = Some(BackgroundOperation {
+                receiver,
+                reply: event.reply_tx,
+                tool: request.tool.clone(),
+                started,
+                selected_id: self.scene.active_object().map(|o| o.id),
+            });
+            std::thread::spawn(move || {
+                let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute_ipc_command(
+                        &request,
+                        &mut scene,
+                        &mut camera,
+                        &mut history,
+                        &mut state,
+                        &mut shading,
+                        &mut wire,
+                        &mut grid,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    IpcResponse::error("Background operation failed; live geometry preserved")
+                });
+                let _ = tx.send(BackgroundResult {
+                    response,
+                    scene,
+                    history,
+                });
+            });
+            if let Some(gpu) = &self.gpu {
+                gpu.window.request_redraw();
+            }
             return;
         }
         let mut shading = self
@@ -444,14 +668,14 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
             &mut show_grid,
         );
 
-        if resp.ok
-            && event.request.tool != "get_scene_info"
-            && event.request.tool != "capture_viewport"
-        {
-            mcp::save_fallback_scene(&self.scene);
+        if resp.ok && !ipc::is_read_only(&event.request.tool) {
+            self.persist();
         }
 
         if let Some(gpu) = &mut self.gpu {
+            if !ipc::is_read_only(&event.request.tool) {
+                gpu.renderer_3d.invalidate_cache();
+            }
             gpu.renderer_3d.shading = shading;
             gpu.renderer_3d.show_wireframe_overlay = show_wire;
             gpu.renderer_3d.show_grid = show_grid;
@@ -467,8 +691,9 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
         }
 
         let win_attrs = Window::default_attributes()
-            .with_title("Rust 3D Modeler & Voxel Sculpt Studio")
-            .with_inner_size(PhysicalSize::new(1400, 860));
+            .with_title("Spatial Studio · AI 3D Review")
+            .with_inner_size(PhysicalSize::new(1440, 960))
+            .with_min_inner_size(PhysicalSize::new(1100, 700));
 
         let window = Arc::new(
             event_loop
@@ -538,6 +763,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
         self.camera.aspect = (width as f32) / (height as f32);
 
         let egui_ctx = egui::Context::default();
+        ui::apply_theme(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -564,6 +790,20 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
         });
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_operation();
+        if self.background.is_some() {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(33),
+            ));
+            if let Some(gpu) = &self.gpu {
+                gpu.window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        }
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -578,13 +818,25 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
         if egui_resp.repaint {
             gpu.window.request_redraw();
         }
-        let egui_wants_pointer = egui_resp.consumed || gpu.egui_ctx.wants_pointer_input();
+        let pointer_pos = match &event {
+            WindowEvent::CursorMoved { position, .. } => {
+                Vec2::new(position.x as f32, position.y as f32)
+            }
+            _ => self.cursor_pos,
+        };
+        let dialog_open = self.ui_state.project_dialog.is_some() || self.ui_state.show_io_modal;
+        let viewport_accepts_pointer = viewport_input::accepts_pointer(
+            &gpu.egui_ctx,
+            self.ui_state.viewport_rect,
+            pointer_pos,
+            dialog_open,
+        );
         let egui_wants_keyboard = gpu.egui_ctx.wants_keyboard_input();
 
         match event {
             WindowEvent::CloseRequested => {
                 let _ = std::fs::remove_file(IPC_SOCKET_PATH);
-                mcp::save_fallback_scene(&self.scene);
+                self.persist();
                 event_loop.exit();
             }
             WindowEvent::Resized(new_size) => {
@@ -611,12 +863,12 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 let pressed = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => {
-                        self.left_mouse_down = pressed;
-                        if pressed && !egui_wants_pointer && !self.modifiers.alt_key() {
+                        self.left_mouse_down = pressed && viewport_accepts_pointer;
+                        if pressed && viewport_accepts_pointer && !self.modifiers.alt_key() {
                             self.handle_viewport_left_press();
                         } else if !pressed {
                             if self.stroke_active {
-                                mcp::save_fallback_scene(&self.scene);
+                                self.persist();
                             }
                             self.gizmo.end_drag();
                             self.stroke_active = false;
@@ -624,10 +876,10 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                         }
                     }
                     MouseButton::Middle => {
-                        self.middle_mouse_down = pressed;
+                        self.middle_mouse_down = pressed && viewport_accepts_pointer;
                     }
                     MouseButton::Right => {
-                        self.right_mouse_down = pressed;
+                        self.right_mouse_down = pressed && viewport_accepts_pointer;
                     }
                     _ => {}
                 }
@@ -637,26 +889,31 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = Vec2::new(position.x as f32, position.y as f32);
-                if !egui_wants_pointer || self.gizmo.dragging || self.stroke_active {
+                let camera_drag = self.middle_mouse_down
+                    || self.right_mouse_down
+                    || (self.modifiers.alt_key() && self.left_mouse_down);
+                if viewport_accepts_pointer || self.gizmo.dragging || camera_drag {
                     self.handle_cursor_moved(pos);
                 } else {
                     self.last_cursor_pos = pos;
                     self.cursor_pos = pos;
+                    self.hover_brush_world = None;
+                    self.update_hover_preview(None);
                 }
                 if let Some(gpu) = &self.gpu {
                     gpu.window.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !egui_wants_pointer {
-                    let scroll = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y,
-                        MouseScrollDelta::PixelDelta(p) => (p.y as f32) * 0.05,
-                    };
-                    self.camera.zoom(scroll);
-                    if let Some(gpu) = &self.gpu {
-                        gpu.window.request_redraw();
-                    }
+                if viewport_input::scroll_camera(
+                    &gpu.egui_ctx,
+                    &mut self.camera,
+                    self.ui_state.viewport_rect,
+                    self.cursor_pos,
+                    delta,
+                    dialog_open,
+                ) {
+                    gpu.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -686,8 +943,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                             gpu.surface_config.width = size.width;
                             gpu.surface_config.height = size.height;
                             gpu.surface.configure(&gpu.device, &gpu.surface_config);
-                            gpu.renderer_3d
-                                .resize(&gpu.device, size.width, size.height);
+                            gpu.renderer_3d.resize(&gpu.device, size.width, size.height);
                         }
                         return;
                     }
@@ -720,9 +976,52 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                     );
                 });
 
+                for request in std::mem::take(&mut self.ui_state.actions) {
+                    if request.tool == "cancel_operation" {
+                        if let Some(operation) = self.background.take() {
+                            let _ = operation
+                                .reply
+                                .send(IpcResponse::error("Operation cancelled; result discarded"));
+                        }
+                        self.ui_state.busy_operation = None;
+                        self.ui_state.status_message =
+                            "Operation cancelled · live geometry preserved".into();
+                        continue;
+                    }
+                    if self.background.is_some() && !ipc::allowed_during_operation(&request.tool) {
+                        self.ui_state.last_error =
+                            Some("Wait for the current operation, or cancel it first".into());
+                        continue;
+                    }
+                    let response = execute_ipc_command(
+                        &request,
+                        &mut self.scene,
+                        &mut self.camera,
+                        &mut self.history,
+                        &mut self.ui_state,
+                        &mut gpu.renderer_3d.shading,
+                        &mut gpu.renderer_3d.show_wireframe_overlay,
+                        &mut gpu.renderer_3d.show_grid,
+                    );
+                    self.ui_state.status_message = response.message;
+                    gpu.renderer_3d.invalidate_cache();
+                }
+                let viewport = self.ui_state.viewport_rect;
+                let scale = full_output.pixels_per_point;
+                if viewport.is_positive() {
+                    self.camera.aspect = viewport.width() / viewport.height().max(1.0);
+                    gpu.renderer_3d.viewport = Some([
+                        viewport.left() * scale,
+                        viewport.top() * scale,
+                        viewport.width() * scale,
+                        viewport.height() * scale,
+                    ]);
+                }
                 if self.ui_state.scene_dirty_for_disk {
-                    self.ui_state.scene_dirty_for_disk = false;
-                    mcp::save_fallback_scene(&self.scene);
+                    match mcp::persist_scene(&mut self.scene, &self.camera) {
+                        Ok(()) => self.ui_state.scene_dirty_for_disk = false,
+                        Err(e) => self.ui_state.last_error = Some(e),
+                    }
                 }
 
                 gpu.egui_state
@@ -739,7 +1038,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
 
                 let screen_descriptor = egui_wgpu::ScreenDescriptor {
                     size_in_pixels: [gpu.surface_config.width, gpu.surface_config.height],
-                    pixels_per_point: gpu.window.scale_factor() as f32,
+                    pixels_per_point: full_output.pixels_per_point,
                 };
 
                 let mut encoder =
@@ -825,38 +1124,84 @@ fn spawn_ipc_listener_thread(proxy: EventLoopProxy<IpcEvent>) {
         };
 
         for stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new( match stream.try_clone() {
-                Ok(s) => s,
-                Err(_) => continue,
-            });
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_ok() && !line.trim().is_empty() {
-                if let Ok(req) = serde_json::from_str::<IpcRequest>(&line) {
-                    let (tx, rx) = mpsc::channel();
-                    if proxy
-                        .send_event(IpcEvent {
-                            request: req,
-                            reply_tx: tx,
-                        })
-                        .is_ok()
-                    {
-                        if let Ok(resp) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                            if let Ok(mut out_bytes) = serde_json::to_vec(&resp) {
-                                out_bytes.push(b'\n');
-                                let mut write_stream = stream;
-                                let _ = write_stream.write_all(&out_bytes);
-                                let _ = write_stream.flush();
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                });
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_ok() && !line.trim().is_empty() {
+                    if let Ok(req) = serde_json::from_str::<IpcRequest>(&line) {
+                        let (tx, rx) = mpsc::channel();
+                        if proxy
+                            .send_event(IpcEvent {
+                                request: req,
+                                reply_tx: tx,
+                            })
+                            .is_ok()
+                        {
+                            if let Ok(resp) = rx.recv_timeout(std::time::Duration::from_secs(120)) {
+                                if let Ok(mut out_bytes) = serde_json::to_vec(&resp) {
+                                    out_bytes.push(b'\n');
+                                    let mut write_stream = stream;
+                                    let _ = write_stream.write_all(&out_bytes);
+                                    let _ = write_stream.flush();
+                                }
                             }
                         }
                     }
                 }
-            }
+            });
         }
     });
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--preview-studio") {
+        let path = args
+            .get(pos + 1)
+            .map(String::as_str)
+            .unwrap_or("/tmp/spatial_studio.png");
+        let (scene, camera) = if let Some(source) = args
+            .iter()
+            .position(|a| a == "--project")
+            .and_then(|i| args.get(i + 1))
+        {
+            match project::load(std::path::Path::new(source)) {
+                Ok(p) => (p.scene, p.camera),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            let scene = mcp::load_fallback_scene().unwrap_or_default();
+            let mut camera = scene.last_camera.clone().unwrap_or_default();
+            if scene.last_camera.is_none() {
+                ui::frame_all(&scene, &mut camera);
+            }
+            (scene, camera)
+        };
+        let tab = usize::from(args.iter().any(|a| a == "--review-tab"));
+        if let Err(e) = renderer::render_headless(
+            &camera,
+            &scene,
+            ViewportShading::StudioLit,
+            false,
+            true,
+            1440,
+            960,
+            std::path::Path::new(path),
+            Some(tab),
+        ) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        println!("Saved studio preview to {path}");
+        return;
+    }
     if args.iter().any(|arg| arg == "--mcp") {
         mcp::run_mcp_stdio_server();
         return;
@@ -866,55 +1211,23 @@ fn main() {
         if let Some(json_str) = args.get(pos + 1) {
             match serde_json::from_str::<IpcRequest>(json_str) {
                 Ok(req) => {
-                    let pre_disk_scene = mcp::load_fallback_scene();
                     let resp = if let Some(live) = mcp::send_to_live_gui(&req) {
-                        if (!live.ok && live.message.starts_with("Unknown MCP tool"))
-                            || (req.tool == "set_material" && live.data.get("pattern").is_none())
-                        {
-                            let mut scene = pre_disk_scene
-                                .or_else(mcp::load_fallback_scene)
-                                .unwrap_or_default();
-                            let mut camera = OrbitCamera::default();
-                            let mut history = UndoHistory::default();
-                            let mut ui_state = UiState::default();
-                            let mut shading = ViewportShading::StudioLit;
-                            let mut wire = false;
-                            let mut grid = true;
-                            let r = execute_ipc_command(
-                                &req,
-                                &mut scene,
-                                &mut camera,
-                                &mut history,
-                                &mut ui_state,
-                                &mut shading,
-                                &mut wire,
-                                &mut grid,
-                            );
-                            mcp::save_fallback_scene(&scene);
-                            r
-                        } else {
-                            live
-                        }
+                        live
                     } else {
-                        let mut scene = mcp::load_fallback_scene().unwrap_or_default();
+                        let mut scene = Scene::empty();
                         let mut camera = OrbitCamera::default();
                         let mut history = UndoHistory::default();
                         let mut ui_state = UiState::default();
-                        let mut shading = ViewportShading::StudioLit;
-                        let mut wire = false;
-                        let mut grid = true;
-                        let r = execute_ipc_command(
+                        mcp::execute_headless(
                             &req,
                             &mut scene,
                             &mut camera,
                             &mut history,
                             &mut ui_state,
-                            &mut shading,
-                            &mut wire,
-                            &mut grid,
-                        );
-                        mcp::save_fallback_scene(&scene);
-                        r
+                            &mut ViewportShading::StudioLit,
+                            &mut false,
+                            &mut true,
+                        )
                     };
                     println!(
                         "{}",
@@ -947,7 +1260,7 @@ mod tests {
     use super::*;
     use crate::mesh::Mesh;
     use crate::voxel::{
-        apply_sculpt_stroke, voxel_remesh, SculptBrush, SculptSettings, VoxelBrushOp, VoxelGrid,
+        SculptBrush, SculptSettings, VoxelBrushOp, VoxelGrid, apply_sculpt_stroke, voxel_remesh,
     };
 
     #[test]
@@ -1316,8 +1629,12 @@ mod tests {
         let mut scene = Scene::default();
         let idx_a = scene.add_mesh_object("North Pillar", Mesh::cube(2.0), [0.8, 0.7, 0.6]);
         let idx_b = scene.add_mesh_object("South Arch", Mesh::cube(2.0), [0.6, 0.7, 0.8]);
-        scene.objects[idx_a].mesh.select_connected_component(0, false, false);
-        scene.objects[idx_b].mesh.select_smart_surface(0, 30.0, false, false);
+        scene.objects[idx_a]
+            .mesh
+            .select_connected_component(0, false, false);
+        scene.objects[idx_b]
+            .mesh
+            .select_smart_surface(0, 30.0, false, false);
 
         let comment = scene
             .add_comment_for_selection("Make both the North Pillar and South Arch taller", 0.45)

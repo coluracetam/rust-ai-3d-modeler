@@ -47,7 +47,7 @@ impl Ray {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OrbitCamera {
     pub target: Vec3,
     pub distance: f32,

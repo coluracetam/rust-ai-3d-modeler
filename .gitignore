@@ -1,1 +1,6 @@
 /target
+
+# Local recovery files; keep the explicit saved project in version control.
+*.spatial.json.autosave
+*.spatial.json.autosave.bak
+*.spatial.json.bak

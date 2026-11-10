@@ -32,15 +32,21 @@ Whenever the user asks you to "check comments", "address my feedback", or "updat
        - `local_bounds_min` & `local_bounds_max` (3D bounding box of the selected section in local object space)
 2. **Activate / Focus the Commented Region**:
    - Call `select_comment_region` with `{"comment_id": <id>}`. This automatically selects the target object(s) and restores `selected_faces` on every target mesh in the scene.
-3. **Perform the 3D Edits**:
+3. **Group the 3D Edits into a Reviewable Revision**:
+   - Call `begin_revision` with `{"label": "Short description", "comment_id": <id>}` and retain the returned `revision_id`.
+   - Apply the edits below. Calls within this revision form one undo step; only one in-progress or submitted revision can exist at a time.
    - For polygonal changes on the selected faces: call `edit_mesh` (`extrude`, `inset`, `subdivide`, `translate_selected`, `scale_selected`, `rotate_selected`, `delete_selected`). Note: if you omit `select_faces` in `edit_mesh`, it operates directly on the currently active `selected_faces` restored by `select_comment_region`!
    - For organic/sculpted changes around `local_anchor`: call `sculpt_stroke` (`draw`, `inflate`, `smooth`, `flatten`, `grab`, `pinch`, `crease` with `dyntopo: true`).
    - For volumetric CSG changes: call `voxel_brush` or `voxel_remesh`.
    - For new detailed parts/meshes: you can use `add_primitive` or generate a multi-part `.obj` mesh (via a quick script or procedural generator) and import it via `import_model`, then apply procedural shaders and vertex AO baking via `set_material`.
 4. **Visually Verify Your Changes**:
    - Call `capture_viewport` (e.g. `{"path": "/tmp/preview.png", "width": 1280, "height": 800}`) and view the rendered PNG image to confirm the proportions, placement, colors, and lighting look great.
-5. **Resolve the Comment**:
-   - Call `resolve_comment` with `{"comment_id": <id>, "resolved": true, "reply": "Brief explanation of what you changed"}`.
+5. **Submit for User Review**:
+   - Call `finish_revision` with `{"revision_id": <id>, "summary": "Brief explanation of what changed", "screenshots": ["/tmp/preview.png"]}`.
+   - The user can compare Before/After, highlight changed parts, and accept or revert the revision. The linked comment becomes Ready for review, then Accepted when the revision is accepted.
+   - Use `cancel_revision` to restore an unfinished revision's starting geometry. Finish/cancel the current revision before opening another project. Review submitted work before changing geometry again.
+   - If `get_comments` reports `needs_reattachment: true`, do not edit stale face indices. Ask the user to select the intended replacement region, then use `reattach_comment`.
+   - `resolve_comment` remains available for legacy workflows without revisions.
 
 ---
 
@@ -103,3 +109,16 @@ The single binary `rust_modeler` supports three execution modes:
    - Whenever the user selects faces or adds/resolves/deletes comments in the GUI, `mcp::save_fallback_scene(&self.scene)` is called immediately so any external AI agent querying `get_comments` or `get_scene_info` always sees the latest user selections and comments.
 3. **Running Tests**:
    - Run `cargo test` (or `cargo test --offline` in sandboxed environments). All 5 test suites in `src/main.rs` cover mesh editing, voxel sculpting + dyntopo + remeshing, `.obj`/`.stl`/`.glb` round-trips, MCP tool execution (including materials, AO baking, spatial & general comments), and smart sub-part / crease-surface / multi-object selection.
+
+
+## 6. Project, Revision, and UI Implementation
+
+- `src/project.rs`: versioned `.spatial.json` projects, atomic write/rename, `.bak` backups, `.autosave` paths, camera and mesh validation. `mcp::persist_scene` updates recovery data and the current camera; explicit Save keeps the named project version.
+- `src/review.rs`: bounded revision snapshots, lifecycle, comparison display scenes, changed-object detection, conflict checks, acceptance and geometry-only reversion. `Scene::preview_revision` is transient; never edit the snapshot displayed by a comparison.
+- `src/review_tests.rs`: project/recovery, comment remapping, topology invalidation, multi-region selection, revision grouping/conflicts, unit conversion, and clipping/picking regression tests.
+- Spatial targets store a topology hash plus face signatures. `target_faces` verifies or remaps targets; ambiguous remaps require explicit reattachment. `refreshed_target` returns current coordinates, normals, and indices without rewriting stored comments.
+- The GUI renders only inside `UiState::viewport_rect`; input coordinates are converted from window pixels to viewport pixels using egui’s current pixels-per-point. Keep camera aspect, render viewport, and egui pin projections aligned with that rectangle.
+- `src/viewport_input.rs` routes pointer input to the empty 3D viewport. Do not gate viewport navigation on `egui_ctx.wants_pointer_input()` or `EventResponse::consumed`: the transparent `CentralPanel` makes those true over the canvas. Check the viewport rectangle, topmost layer, active UI gestures, and open menus/dialogs instead. Camera drags must start inside the viewport; panel scrolling stays with egui. Its tests reproduce actual egui panel ownership and cover mouse-wheel/trackpad zoom, overlays, menus/dialogs, fresh cursor events, and display scaling.
+- Heavy live commands run on isolated scene copies in a background worker; only successful, uncancelled results are merged into live geometry. Feedback written during the operation is retained. Cancel discards results; it does not forcibly terminate a Rust thread.
+- IPC connections are handled independently so cancellation/read-only queries can reach the GUI during long operations. A timeout after connecting to a live GUI must return an error, never trigger headless replay. Headless commands hold a file lock across load/execute/persist.
+- GUI project/geometry actions use the same IPC dispatcher as MCP. Keep tool schemas in `mcp_tool_definitions` synchronized with the dispatcher. Read-only tools, including `get_comments`, `get_revisions`, `capture_viewport`, and `capture_studio`, must not rewrite persisted state.
