@@ -1,6 +1,18 @@
 /target
 
-# Local recovery files; keep the explicit saved project in version control.
+# User-created modeling projects, generated geometry, and exports.
+/projects/
+/assets/generated/
+*.spatial.json
+*.obj
+*.stl
+*.glb
+*.gltf
+
+# Local recovery files.
 *.spatial.json.autosave
 *.spatial.json.autosave.bak
 *.spatial.json.bak
+
+# One-off helper for the local tree-editing session.
+/scripts/generate_review_oak.py

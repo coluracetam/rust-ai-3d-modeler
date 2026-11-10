@@ -122,3 +122,8 @@ The single binary `rust_modeler` supports three execution modes:
 - Heavy live commands run on isolated scene copies in a background worker; only successful, uncancelled results are merged into live geometry. Feedback written during the operation is retained. Cancel discards results; it does not forcibly terminate a Rust thread.
 - IPC connections are handled independently so cancellation/read-only queries can reach the GUI during long operations. A timeout after connecting to a live GUI must return an error, never trigger headless replay. Headless commands hold a file lock across load/execute/persist.
 - GUI project/geometry actions use the same IPC dispatcher as MCP. Keep tool schemas in `mcp_tool_definitions` synchronized with the dispatcher. Read-only tools, including `get_comments`, `get_revisions`, `capture_viewport`, and `capture_studio`, must not rewrite persisted state.
+
+
+## 7. Repository Boundaries
+
+This repository contains the modeling application, its runtime resources, documentation, and deliberate test fixtures. User-created models, saved projects, exports, per-comment geometry generators, and generated review captures are local project data and must not be committed to application PRs. Keep project files and generated model outputs local; `.gitignore` excludes them. When preparing a PR, inspect untracked files and include only application changes and intentional application resources.
