@@ -581,3 +581,15 @@ fn modeling_tools_through_the_dispatcher() {
     assert!(r.ok, "{}", r.message);
     assert!(e.call("undo", json!({})).ok);
 }
+
+#[test]
+fn clear_selection_tool_clears_everything() {
+    let mut e = Editor::new();
+    e.scene.selected_object = Some(0);
+    assert!(e.scene.has_any_selection());
+    let r = e.call("clear_selection", json!({}));
+    assert!(r.ok, "{}", r.message);
+    assert_eq!(r.data["cleared_faces"], 1);
+    assert!(!e.scene.has_any_selection());
+    assert!(e.scene.objects[0].mesh.selected_faces.is_empty());
+}

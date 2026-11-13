@@ -1070,6 +1070,21 @@ fn dispatch(
             )
         }
 
+        "clear_selection" => {
+            let faces: usize = scene.objects.iter().map(|o| o.mesh.selected_faces.len()).sum();
+            let had_object = scene.selected_object.is_some();
+            scene.clear_all_selections();
+            scene.selected_object = None;
+            scene.active_comment_id = None;
+            ui_state.hover_preview_faces.clear();
+            ui_state.hover_preview_obj_id = None;
+            ui_state.status_message = "Selection cleared".into();
+            IpcResponse::success(
+                "Cleared the selection",
+                json!({"cleared_faces": faces, "had_selected_object": had_object}),
+            )
+        }
+
         "select_object" => {
             let Some(idx) = resolve_object_index(scene, args) else {
                 return IpcResponse::error("Object not found");

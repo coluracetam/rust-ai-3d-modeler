@@ -104,7 +104,7 @@ Included out-of-the-box in [`assets/scenes/clockwork_astral_cathedral_scene.json
   - Primitives: `cube`, `sphere`, `cylinder`, `plane`, `torus`, `voxel_sphere`.
   - Operations (`edit_mesh`): `extrude`, `inset`, `bevel` (chamfer the border of the selected region), `subdivide` (Catmull-Clark style quad/tri subdivision), `translate_selected`, `scale_selected`, `rotate_selected`, `delete_selected`, `select_by_normal`, `select_all`, `clear_selection`.
 - **Higher-level modeling (`src/modeling.rs`)**:
-  - `boolean`: BSP-tree CSG union / subtract / intersect between two parts (windows, holes, grooves, joins).
+  - `boolean`: BSP-tree CSG union / subtract / intersect between two parts (windows, holes, grooves, joins). Only the overlap region is clipped, and non-overlapping parts are joined directly, so results stay light.
   - `mirror_object`: reflect a part across a local axis, merged into the same mesh or as a new part.
   - `array_object`: linear, radial or spiral repeats (offset + rotation + scale per step), as separate parts or one mesh.
   - `add_lathe`: revolve a `[radius, height]` profile into vases, columns, bowls, finials.
@@ -160,6 +160,7 @@ Includes a pre-packaged Antigravity plugin in [`.agents/plugins/rust-modeler-mcp
 | `wait_for_feedback` | Block until the user sends comments (or requests changes), then return the open comments and `feedback_batch` | `since_batch?: int`, `timeout_seconds?: float` |
 | `get_comments` | List sent spatial & general comments, including `targets` (multi-part selections), 3D anchors, face indices and `attachments` (reference image paths) | `include_resolved?: bool`, `include_drafts?: bool` |
 | `send_comments` | Send all draft comments as one batch (the GUI's Send to agent) | *(none)* |
+| `clear_selection` | Clear face selections, the selected part and the focused comment (do this before review screenshots) | *(none)* |
 | `request_changes` | Revert a ready revision and reopen its comment with the user's notes | `revision_id: int`, `notes?: string` |
 | `select_comment_region` | Highlight all `targets` (`selected_faces`) of a `comment_id` and focus the camera | `comment_id: int`, `focus_camera?: bool` |
 | `resolve_comment` | Mark a `comment_id` resolved and attach an `agent_reply` explaining the changes made | `comment_id: int`, `resolved?: bool`, `reply?: string` |

@@ -549,22 +549,6 @@ impl Node {
         n
     }
 
-    fn invert(&mut self) {
-        for p in &mut self.polys {
-            p.flip();
-        }
-        if let Some(pl) = &mut self.plane {
-            pl.flip();
-        }
-        if let Some(f) = &mut self.front {
-            f.invert();
-        }
-        if let Some(b) = &mut self.back {
-            b.invert();
-        }
-        std::mem::swap(&mut self.front, &mut self.back);
-    }
-
     fn clip_polys(&self, polys: Vec<Poly>) -> Vec<Poly> {
         let Some(plane) = &self.plane else {
             return polys;
@@ -586,26 +570,6 @@ impl Node {
         };
         front.extend(back);
         front
-    }
-
-    fn clip_to(&mut self, other: &Node) {
-        self.polys = other.clip_polys(std::mem::take(&mut self.polys));
-        if let Some(f) = &mut self.front {
-            f.clip_to(other);
-        }
-        if let Some(b) = &mut self.back {
-            b.clip_to(other);
-        }
-    }
-
-    fn all_polys(&self, out: &mut Vec<Poly>) {
-        out.extend(self.polys.iter().cloned());
-        if let Some(f) = &self.front {
-            f.all_polys(out);
-        }
-        if let Some(b) = &self.back {
-            b.all_polys(out);
-        }
     }
 
     fn build(&mut self, polys: Vec<Poly>) {
@@ -675,52 +639,97 @@ fn to_polys(mesh: &Mesh, m: Mat4, fallback: [f32; 3]) -> Vec<Poly> {
     out
 }
 
+fn poly_bounds(p: &Poly) -> (Vec3, Vec3) {
+    p.verts
+        .iter()
+        .fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), v| {
+            (lo.min(v.pos), hi.max(v.pos))
+        })
+}
+
+fn polys_bounds(polys: &[Poly]) -> (Vec3, Vec3) {
+    polys
+        .iter()
+        .map(poly_bounds)
+        .fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), (a, b)| {
+            (lo.min(a), hi.max(b))
+        })
+}
+
+fn flipped(mut polys: Vec<Poly>) -> Vec<Poly> {
+    for p in &mut polys {
+        p.flip();
+    }
+    polys
+}
+
+/// Polygons whose bounds touch `(lo, hi)`, and the rest (which lie outside that box).
+fn split_by_box(polys: Vec<Poly>, (lo, hi): (Vec3, Vec3)) -> (Vec<Poly>, Vec<Poly>) {
+    let (lo, hi) = (lo - Vec3::splat(1e-4), hi + Vec3::splat(1e-4));
+    polys.into_iter().partition(|p| {
+        let (a, b) = poly_bounds(p);
+        a.cmple(hi).all() && b.cmpge(lo).all()
+    })
+}
+
+/// BSP boolean (after csg.js), restricted to the overlap region.
+///
+/// Trees are built from every polygon so inside/outside tests stay exact, but only polygons
+/// inside the other solid's bounding box are clipped; everything else is certainly outside the
+/// other solid and is kept or dropped whole. The result is gathered directly instead of being
+/// merged into one tree, which would split it further. Both keep the face count close to the
+/// inputs instead of dicing whole meshes along every plane of the other part.
 fn csg(a: Vec<Poly>, b: Vec<Poly>, op: BooleanOp) -> Vec<Poly> {
-    let mut a = Node::new(a);
-    let mut b = Node::new(b);
+    let a_box = polys_bounds(&a);
+    let b_box = polys_bounds(&b);
+    let (a_all, b_all) = (a.clone(), b.clone());
+    let a_tree = Node::new(a.clone());
+    let b_tree = Node::new(b.clone());
+    let (a_near, a_far) = split_by_box(a, b_box);
+    let (b_near, b_far) = split_by_box(b, a_box);
+    let mut out = Vec::new();
     match op {
         BooleanOp::Union => {
-            a.clip_to(&b);
-            b.clip_to(&a);
-            b.invert();
-            b.clip_to(&a);
-            b.invert();
-            let mut bp = Vec::new();
-            b.all_polys(&mut bp);
-            a.build(bp);
+            out.extend(b_tree.clip_polys(a_near));
+            out.extend(a_far);
+            // Parts of B outside A, minus faces coplanar with A's surface (no duplicates).
+            let b1 = a_tree.clip_polys(b_near);
+            out.extend(flipped(a_tree.clip_polys(flipped(b1))));
+            out.extend(b_far);
         }
         BooleanOp::Subtract => {
-            a.invert();
-            a.clip_to(&b);
-            b.clip_to(&a);
-            b.invert();
-            b.clip_to(&a);
-            b.invert();
-            let mut bp = Vec::new();
-            b.all_polys(&mut bp);
-            a.build(bp);
-            a.invert();
+            let a_inv = Node::new(flipped(a_all));
+            out.extend(flipped(b_tree.clip_polys(flipped(a_near))));
+            out.extend(a_far);
+            let b1 = a_inv.clip_polys(b_near);
+            let b2 = flipped(a_inv.clip_polys(flipped(b1)));
+            out.extend(flipped(b2));
         }
         BooleanOp::Intersect => {
-            a.invert();
-            b.clip_to(&a);
-            b.invert();
-            a.clip_to(&b);
-            b.clip_to(&a);
-            let mut bp = Vec::new();
-            b.all_polys(&mut bp);
-            a.build(bp);
-            a.invert();
+            let a_inv = Node::new(flipped(a_all));
+            let b_inv = Node::new(flipped(b_all));
+            let b1 = a_inv.clip_polys(b_near);
+            let a1 = b_inv.clip_polys(flipped(a_near));
+            let b2 = a_inv.clip_polys(flipped(b1));
+            out.extend(flipped(a1));
+            out.extend(flipped(b2));
         }
     }
-    let mut out = Vec::new();
-    a.all_polys(&mut out);
     out
+}
+
+fn world_bounds(mesh: &Mesh, m: Mat4) -> Option<(Vec3, Vec3)> {
+    let mut it = mesh.positions.iter().map(|p| m.transform_point3(*p));
+    let first = it.next()?;
+    Some(it.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p))))
 }
 
 /// Combine `target` (with world matrix `target_m`) and `tool` (with `tool_m`). The result is in
 /// the target's local space. Vertices are shared only between coplanar fragments, so hard
 /// edges stay crisp.
+///
+/// When the parts' bounding boxes do not overlap no splitting is needed: a union simply joins
+/// the meshes with their original faces, and a subtraction leaves the target unchanged.
 pub fn boolean(
     target: &Mesh,
     target_m: Mat4,
@@ -729,6 +738,34 @@ pub fn boolean(
     op: BooleanOp,
     tool_color: [f32; 3],
 ) -> Result<Mesh, String> {
+    if let (Some((a_lo, a_hi)), Some((b_lo, b_hi))) =
+        (world_bounds(target, target_m), world_bounds(tool, tool_m))
+    {
+        let gap = 1e-4;
+        let disjoint = (a_hi + gap).cmplt(b_lo).any() || (b_hi + gap).cmplt(a_lo).any();
+        if disjoint {
+            return match op {
+                BooleanOp::Union => {
+                    let mut joined = target.clone();
+                    let mut placed = transformed(tool, target_m.inverse() * tool_m);
+                    if tool.colors.len() < tool.positions.len() {
+                        placed.colors = vec![tool_color; placed.positions.len()];
+                    }
+                    joined.selected_faces.clear();
+                    append(&mut joined, &placed);
+                    Ok(joined)
+                }
+                BooleanOp::Subtract => {
+                    let mut kept = target.clone();
+                    kept.selected_faces.clear();
+                    Ok(kept)
+                }
+                BooleanOp::Intersect => {
+                    Err("The parts do not overlap, so their intersection is empty".into())
+                }
+            };
+        }
+    }
     let a = to_polys(target, target_m, [0.8, 0.8, 0.8]);
     let b = to_polys(tool, tool_m, tool_color);
     if a.is_empty() || b.is_empty() {
@@ -803,6 +840,48 @@ mod tests {
         let moved = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
         let sub2 = boolean(&a, moved, &b, moved * shift, BooleanOp::Subtract, [1.0; 3]).unwrap();
         assert!(approx(signed_volume(&sub2), 4.0, 1e-3));
+    }
+
+    #[test]
+    fn curved_boolean_volumes_are_consistent() {
+        let a = Mesh::sphere(1.0, 16, 24);
+        let b = Mesh::cube(1.2);
+        let m = Mat4::from_translation(Vec3::new(0.7, 0.2, 0.1));
+        let va = signed_volume(&a);
+        let vb = signed_volume(&b);
+        let u = signed_volume(&boolean(&a, Mat4::IDENTITY, &b, m, BooleanOp::Union, [1.0; 3]).unwrap());
+        let i = signed_volume(&boolean(&a, Mat4::IDENTITY, &b, m, BooleanOp::Intersect, [1.0; 3]).unwrap());
+        let s = signed_volume(&boolean(&a, Mat4::IDENTITY, &b, m, BooleanOp::Subtract, [1.0; 3]).unwrap());
+        assert!(i > 0.1 && i < vb, "{i}");
+        assert!(approx(u + i, va + vb, 2e-3), "{u} + {i} vs {}", va + vb);
+        assert!(approx(s, va - i, 2e-3), "{s} vs {}", va - i);
+    }
+
+    #[test]
+    fn overlap_only_clipping_limits_fragments() {
+        // A finely tessellated column cut at the top: faces far from the cutter stay whole.
+        let col = lathe(&[Vec2::new(0.0, 0.0), Vec2::new(0.2, 0.0), Vec2::new(0.2, 2.0), Vec2::new(0.0, 2.0)], 24, 360.0, true, [1.0; 3]).unwrap();
+        let cutter = Mat4::from_rotation_translation(Quat::from_rotation_z(0.4), Vec3::new(0.0, 2.1, 0.0));
+        let cut = boolean(&col, Mat4::IDENTITY, &Mesh::cube(0.6), cutter, BooleanOp::Subtract, [1.0; 3]).unwrap();
+        assert!(signed_volume(&cut) < signed_volume(&col));
+        assert!(cut.faces.len() < col.faces.len() * 6, "{} faces from {}", cut.faces.len(), col.faces.len());
+    }
+
+    #[test]
+    fn disjoint_booleans_keep_original_faces() {
+        let a = Mesh::cube(1.0);
+        let far = Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0));
+        let joined = boolean(&a, Mat4::IDENTITY, &a, far, BooleanOp::Union, [1.0; 3]).unwrap();
+        assert_eq!(joined.faces.len(), a.faces.len() * 2, "no CSG splitting");
+        assert!(approx(signed_volume(&joined), 2.0, 1e-4));
+        assert!(joined.positions.iter().any(|p| (p.x - 3.5).abs() < 1e-4));
+        // A target with its own transform receives the tool in its local space.
+        let moved = Mat4::from_translation(Vec3::new(0.0, 5.0, 0.0));
+        let joined = boolean(&a, moved, &a, far, BooleanOp::Union, [1.0; 3]).unwrap();
+        assert!(joined.positions.iter().any(|p| (p.y + 5.5).abs() < 1e-4));
+        let kept = boolean(&a, Mat4::IDENTITY, &a, far, BooleanOp::Subtract, [1.0; 3]).unwrap();
+        assert_eq!(kept.faces.len(), a.faces.len());
+        assert!(boolean(&a, Mat4::IDENTITY, &a, far, BooleanOp::Intersect, [1.0; 3]).is_err());
     }
 
     #[test]
