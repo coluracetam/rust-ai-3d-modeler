@@ -388,7 +388,9 @@ pub struct VoxelGrid {
     pub dims: [usize; 3],
     pub voxel_size: f32,
     /// Signed distance / density values (`< 0.0` is inside/solid, `> 0.0` is outside/empty).
+    #[serde(with = "crate::codec::f32s")]
     pub sdf: Vec<f32>,
+    #[serde(with = "crate::codec::rgbs")]
     pub colors: Vec<[f32; 3]>,
     pub meshing_mode: VoxelMeshingMode,
 }

@@ -307,6 +307,12 @@ pub struct SpatialComment {
     pub comment: String,
     pub resolved: bool,
     pub agent_reply: Option<String>,
+    /// Still being written by the user; hidden from agents until sent.
+    #[serde(default)]
+    pub draft: bool,
+    /// Reference images (absolute paths) the user attached for the agent.
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 fn default_next_comment_id() -> u64 {
@@ -331,6 +337,9 @@ pub struct Scene {
     pub saved_selections: Vec<SavedSelection>,
     #[serde(default)]
     pub saved_views: Vec<SavedView>,
+    /// Incremented each time the user sends comments to the agent (`wait_for_feedback`).
+    #[serde(default)]
+    pub feedback_batch: u64,
     #[serde(skip)]
     pub preview_revision: Option<(u64, bool)>,
     #[serde(skip)]
@@ -368,6 +377,7 @@ impl Default for Scene {
             next_revision_id: 1,
             saved_selections: Vec::new(),
             saved_views: Vec::new(),
+            feedback_batch: 0,
             preview_revision: None,
             highlight_changes: false,
             clip_plane: None,
@@ -412,6 +422,7 @@ impl Scene {
             next_revision_id: 1,
             saved_selections: Vec::new(),
             saved_views: Vec::new(),
+            feedback_batch: 0,
             preview_revision: None,
             highlight_changes: false,
             clip_plane: None,
@@ -509,7 +520,29 @@ impl Scene {
                 c.status = CommentStatus::Accepted;
             }
         }
+        // Migrates full-scene revision snapshots from older projects.
+        self.prune_revision_geometry();
         Ok(())
+    }
+
+    /// Unsent comments the user is still writing.
+    pub fn draft_count(&self) -> usize {
+        self.comments.iter().filter(|c| c.draft && !c.resolved).count()
+    }
+
+    /// Release all draft comments to the agent as one batch. Returns how many were sent.
+    pub fn send_drafts(&mut self) -> usize {
+        let mut sent = 0;
+        for c in &mut self.comments {
+            if c.draft {
+                c.draft = false;
+                sent += 1;
+            }
+        }
+        if sent > 0 {
+            self.feedback_batch += 1;
+        }
+        sent
     }
 
     pub fn set_comment_status(&mut self, id: u64, status: CommentStatus) -> Result<(), String> {
@@ -1007,6 +1040,8 @@ impl Scene {
             comment: comment_text.into(),
             resolved: false,
             agent_reply: None,
+            draft: false,
+            attachments: Vec::new(),
         };
 
         self.comments.push(item.clone());
@@ -1037,6 +1072,8 @@ impl Scene {
             comment: comment_text.into(),
             resolved: false,
             agent_reply: None,
+            draft: false,
+            attachments: Vec::new(),
         };
 
         self.comments.push(item.clone());

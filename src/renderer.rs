@@ -46,6 +46,31 @@ struct CachedGpuMesh {
     key: MeshCacheKey,
     tri_buffer: Option<(wgpu::Buffer, u32)>,
     wire_buffer: Option<(wgpu::Buffer, u32)>,
+    outline_buffer: Option<(wgpu::Buffer, u32)>,
+}
+
+/// Cache key: object id plus which comparison side it is drawn for.
+type DrawKey = (u64, u8);
+
+struct ObjectDraws {
+    solid: Vec<(DrawKey, wgpu::BindGroup)>,
+    ghost: Vec<(DrawKey, wgpu::BindGroup, f32)>,
+    /// `true` draws the full wireframe; the selection outline is drawn either way.
+    wire: Vec<(DrawKey, wgpu::BindGroup, bool)>,
+    min: Vec3,
+    max: Vec3,
+}
+
+impl Default for ObjectDraws {
+    fn default() -> Self {
+        Self {
+            solid: Vec::new(),
+            ghost: Vec::new(),
+            wire: Vec::new(),
+            min: Vec3::splat(f32::MAX),
+            max: Vec3::splat(f32::MIN),
+        }
+    }
 }
 
 pub struct PreparedDrawCall {
@@ -59,6 +84,11 @@ pub struct Renderer3D {
     pub ghost_pipeline: wgpu::RenderPipeline,
     pub line_depth_pipeline: wgpu::RenderPipeline,
     pub line_overlay_pipeline: wgpu::RenderPipeline,
+    background_pipeline: wgpu::RenderPipeline,
+    shadow_pipeline: wgpu::RenderPipeline,
+    shadow_vertex_buffer: wgpu::Buffer,
+    /// Split position (0..1 of the viewport width) for before/after wipe comparisons.
+    pub compare_split: Option<f32>,
     pub global_buffer: wgpu::Buffer,
     pub global_bind_group: wgpu::BindGroup,
     pub object_bind_group_layout: wgpu::BindGroupLayout,
@@ -72,7 +102,7 @@ pub struct Renderer3D {
     pub show_wireframe_overlay: bool,
     pub shading: ViewportShading,
     pub viewport: Option<[f32; 4]>,
-    mesh_cache: HashMap<u64, CachedGpuMesh>,
+    mesh_cache: HashMap<DrawKey, CachedGpuMesh>,
     /// Hover-preview outline, rebuilt only when the hovered face set or its mesh changes.
     hover_lines: Option<(HoverKey, wgpu::Buffer, u32)>,
 }
@@ -378,6 +408,89 @@ impl Renderer3D {
                 cache: None,
             });
 
+        let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Backdrop Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_backdrop"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_backdrop"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Self::DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Contact Shadow Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &vertex_buffers,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_shadow"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Self::DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let quad: Vec<GpuVertex> = [
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+        ]
+        .iter()
+        .map(|[x, z]| GpuVertex {
+            position: [*x, 0.0, *z],
+            normal: [0.0, 1.0, 0.0],
+            color: [0.0, 0.0, 0.0],
+        })
+        .collect();
+        let shadow_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Contact Shadow Quad"),
+            contents: bytemuck::cast_slice(&quad),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         let w = width.max(1);
         let h = height.max(1);
         let depth_texture_view = Self::create_depth_view(device, w, h);
@@ -394,6 +507,10 @@ impl Renderer3D {
             ghost_pipeline,
             line_depth_pipeline,
             line_overlay_pipeline,
+            background_pipeline,
+            shadow_pipeline,
+            shadow_vertex_buffer,
+            compare_split: None,
             global_buffer,
             global_bind_group,
             object_bind_group_layout,
@@ -498,13 +615,14 @@ impl Renderer3D {
         emission_color: [f32; 3],
         emission_strength: f32,
         opacity: f32,
+        glow: f32,
     ) -> wgpu::BindGroup {
         let normal_mat = model.inverse().transpose();
         let u = ObjectUniforms {
             model: model.to_cols_array_2d(),
             normal_mat: normal_mat.to_cols_array_2d(),
             params: [roughness, metallic, shading_mode, pattern_id],
-            inspection: [opacity, 0.0, 0.0, 0.0],
+            inspection: [opacity, glow, 0.0, 0.0],
             tex_params: [
                 secondary_color[0],
                 secondary_color[1],
@@ -546,7 +664,227 @@ impl Renderer3D {
             [0.0, 0.0, 0.0],
             0.0,
             1.0,
+            0.0,
         )
+    }
+
+    /// Upload/refresh cached GPU buffers and build per-object draw lists for `scene`.
+    fn prepare_objects(
+        &mut self,
+        device: &wgpu::Device,
+        scene: &Scene,
+        variant: u8,
+        eye: Vec3,
+    ) -> ObjectDraws {
+        let is_edit_mode = matches!(scene.mode, InteractionMode::EditMesh(_));
+        let any_selection = scene.has_any_selection();
+        let mut draws = ObjectDraws::default();
+        let default_mode_val = match self.shading {
+            ViewportShading::StudioLit => {
+                if matches!(scene.mode, InteractionMode::Sculpt) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ViewportShading::SculptClay => 1.0,
+            ViewportShading::WireframeOnly => 2.0,
+        };
+        for (i, obj) in scene.objects.iter().enumerate() {
+            if !obj.visible {
+                continue;
+            }
+            let is_selected = scene.selected_object == Some(i);
+            let has_face_sel =
+                !obj.mesh.selected_faces.is_empty() || (is_selected && is_edit_mode);
+            let key = MeshCacheKey {
+                mesh_version: obj.mesh.version,
+                color_bits: [
+                    obj.color[0].to_bits(),
+                    obj.color[1].to_bits(),
+                    obj.color[2].to_bits(),
+                ],
+                flat_shading: obj.flat_shading,
+                is_selected,
+                is_edit_mode: has_face_sel,
+            };
+            let cache_key = (obj.id, variant);
+            if self
+                .mesh_cache
+                .get(&cache_key)
+                .is_none_or(|cached| cached.key != key)
+            {
+                let make = |label: &str, verts: &[GpuVertex]| {
+                    (!verts.is_empty()).then(|| {
+                        (
+                            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some(label),
+                                contents: bytemuck::cast_slice(verts),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            }),
+                            verts.len() as u32,
+                        )
+                    })
+                };
+                let tris = obj.mesh.build_gpu_triangles(obj.color, obj.flat_shading);
+                let wire_col = if is_selected {
+                    [0.40, 0.89, 0.76]
+                } else {
+                    [0.32, 0.35, 0.40]
+                };
+                let lines = obj
+                    .mesh
+                    .build_wireframe_lines(Mat4::IDENTITY, wire_col, has_face_sel);
+                let outline = if obj.mesh.selected_faces.is_empty() {
+                    Vec::new()
+                } else {
+                    obj.mesh.build_selection_outline([0.55, 1.0, 0.88])
+                };
+                self.mesh_cache.insert(
+                    cache_key,
+                    CachedGpuMesh {
+                        key,
+                        tri_buffer: make("Cached Mesh Tri VB", &tris),
+                        wire_buffer: make("Cached Mesh Wire VB", &lines),
+                        outline_buffer: make("Cached Selection Outline VB", &outline),
+                    },
+                );
+            }
+
+            let model = obj.transform.matrix();
+            let ghost = self.ghost_unselected && any_selection && !is_selected && !has_face_sel;
+            if self.shading != ViewportShading::WireframeOnly {
+                // Whole-part selections glow; face selections are tinted and outlined.
+                let glow = if is_selected && obj.mesh.selected_faces.is_empty() {
+                    1.0
+                } else {
+                    0.0
+                };
+                let bg = self.create_object_bind_group(
+                    device,
+                    model,
+                    obj.roughness,
+                    obj.metallic,
+                    default_mode_val,
+                    obj.pattern.shader_id(),
+                    obj.secondary_color,
+                    obj.texture_scale,
+                    obj.emission_color,
+                    obj.emission_strength,
+                    if ghost { 0.16 } else { 1.0 },
+                    glow,
+                );
+                if ghost {
+                    draws.ghost.push((
+                        cache_key,
+                        bg,
+                        (obj.transform.translation - eye).length_squared(),
+                    ));
+                } else {
+                    draws.solid.push((cache_key, bg));
+                }
+            }
+            let want_wire =
+                self.shading == ViewportShading::WireframeOnly || self.show_wireframe_overlay;
+            if want_wire || !obj.mesh.selected_faces.is_empty() {
+                draws.wire.push((
+                    cache_key,
+                    self.create_line_bind_group(device, model),
+                    want_wire,
+                ));
+            }
+            let (min, max) = obj.mesh.bounds();
+            for c in [
+                Vec3::new(min.x, min.y, min.z),
+                Vec3::new(max.x, min.y, min.z),
+                Vec3::new(min.x, max.y, min.z),
+                Vec3::new(min.x, min.y, max.z),
+                Vec3::new(max.x, max.y, min.z),
+                Vec3::new(max.x, min.y, max.z),
+                Vec3::new(min.x, max.y, max.z),
+                Vec3::new(max.x, max.y, max.z),
+            ] {
+                let p = model.transform_point3(c);
+                draws.min = draws.min.min(p);
+                draws.max = draws.max.max(p);
+            }
+        }
+        draws.ghost.sort_by(|a, b| b.2.total_cmp(&a.2));
+        draws
+    }
+
+    fn draw_objects<'a>(&'a self, rpass: &mut wgpu::RenderPass<'a>, draws: &'a ObjectDraws) {
+        if !draws.solid.is_empty() {
+            rpass.set_pipeline(&self.triangle_pipeline);
+            rpass.set_bind_group(0, &self.global_bind_group, &[]);
+            for (key, bg) in &draws.solid {
+                if let Some((vb, count)) = self.mesh_cache.get(key).and_then(|m| m.tri_buffer.as_ref()) {
+                    rpass.set_bind_group(1, bg, &[]);
+                    rpass.set_vertex_buffer(0, vb.slice(..));
+                    rpass.draw(0..*count, 0..1);
+                }
+            }
+        }
+        if !draws.ghost.is_empty() {
+            rpass.set_pipeline(&self.ghost_pipeline);
+            rpass.set_bind_group(0, &self.global_bind_group, &[]);
+            for (key, bg, _) in &draws.ghost {
+                if let Some((vb, count)) = self.mesh_cache.get(key).and_then(|m| m.tri_buffer.as_ref()) {
+                    rpass.set_bind_group(1, bg, &[]);
+                    rpass.set_vertex_buffer(0, vb.slice(..));
+                    rpass.draw(0..*count, 0..1);
+                }
+            }
+        }
+        if !draws.wire.is_empty() {
+            rpass.set_pipeline(&self.line_depth_pipeline);
+            rpass.set_bind_group(0, &self.global_bind_group, &[]);
+            for (key, bg, full) in &draws.wire {
+                let Some(cached) = self.mesh_cache.get(key) else {
+                    continue;
+                };
+                rpass.set_bind_group(1, bg, &[]);
+                if *full {
+                    if let Some((vb, count)) = &cached.wire_buffer {
+                        rpass.set_vertex_buffer(0, vb.slice(..));
+                        rpass.draw(0..*count, 0..1);
+                    }
+                }
+                if let Some((vb, count)) = &cached.outline_buffer {
+                    rpass.set_vertex_buffer(0, vb.slice(..));
+                    rpass.draw(0..*count, 0..1);
+                }
+            }
+        }
+    }
+
+    /// Soft contact shadow under the scene's footprint.
+    fn shadow_bind_group(&self, device: &wgpu::Device, min: Vec3, max: Vec3) -> Option<wgpu::BindGroup> {
+        if !(min.x <= max.x) || !min.is_finite() || !max.is_finite() {
+            return None;
+        }
+        let center = (min + max) * 0.5;
+        let half = ((max - min) * 0.5).max(Vec3::splat(0.05));
+        let radius = half.x.max(half.z) * 1.15;
+        let model = Mat4::from_scale_rotation_translation(
+            Vec3::new(radius, 1.0, radius),
+            glam::Quat::IDENTITY,
+            Vec3::new(center.x, min.y - 0.002, center.z),
+        );
+        Some(self.create_object_bind_group(
+            device,
+            model,
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            [0.0; 3],
+            1.0,
+            [0.0; 3],
+            0.0,
+            1.0,
+            0.0,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -562,8 +900,6 @@ impl Renderer3D {
         brush_cursor: Option<(Vec3, Vec3, f32)>,
         hover_preview: Option<(u64, &std::collections::HashSet<usize>)>,
     ) {
-        let display = scene.display_scene();
-        let scene = display.as_ref();
         let eye = camera.eye();
         let global_u = GlobalUniforms {
             view_proj: camera.view_proj_matrix().to_cols_array_2d(),
@@ -572,192 +908,88 @@ impl Renderer3D {
         };
         queue.write_buffer(&self.global_buffer, 0, bytemuck::cast_slice(&[global_u]));
 
-        // Update per-object GPU mesh caches only if dirty
-        let is_edit_mode = matches!(scene.mode, InteractionMode::EditMesh(_));
-        for (i, obj) in scene.objects.iter().enumerate() {
-            if !obj.visible {
-                continue;
-            }
-            let is_selected = scene.selected_object == Some(i);
-            let has_face_sel = !obj.mesh.selected_faces.is_empty() || (is_selected && is_edit_mode);
-            let key = MeshCacheKey {
-                mesh_version: obj.mesh.version,
-                color_bits: [
-                    obj.color[0].to_bits(),
-                    obj.color[1].to_bits(),
-                    obj.color[2].to_bits(),
-                ],
-                flat_shading: obj.flat_shading,
-                is_selected,
-                is_edit_mode: has_face_sel,
-            };
-
-            let needs_rebuild = self
-                .mesh_cache
-                .get(&obj.id)
-                .map_or(true, |cached| cached.key != key);
-
-            if needs_rebuild {
-                let tris = obj.mesh.build_gpu_triangles(obj.color, obj.flat_shading);
-                let tri_buffer = if !tris.is_empty() {
-                    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Cached Mesh Tri VB"),
-                        contents: bytemuck::cast_slice(&tris),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    Some((vb, tris.len() as u32))
-                } else {
-                    None
-                };
-
-                let base_wire_col = if has_face_sel {
-                    [0.18, 0.22, 0.28]
-                } else if is_selected {
-                    [0.95, 0.62, 0.18]
-                } else {
-                    [0.32, 0.35, 0.40]
-                };
-                // Build wireframe in local space (Mat4::IDENTITY) so object transform is applied on GPU
-                let lines =
-                    obj.mesh
-                        .build_wireframe_lines(Mat4::IDENTITY, base_wire_col, has_face_sel);
-                let wire_buffer = if !lines.is_empty() {
-                    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Cached Mesh Wire VB"),
-                        contents: bytemuck::cast_slice(&lines),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    Some((vb, lines.len() as u32))
-                } else {
-                    None
-                };
-
-                self.mesh_cache.insert(
-                    obj.id,
-                    CachedGpuMesh {
-                        key,
-                        tri_buffer,
-                        wire_buffer,
-                    },
-                );
+        // Split comparison: "before" on the left of the divider, "after" on the right.
+        let split = scene
+            .preview_revision
+            .and(self.compare_split)
+            .map(|s| s.clamp(0.0, 1.0));
+        let mut passes: Vec<(ObjectDraws, Option<[u32; 4]>)> = Vec::new();
+        let [vx, vy, vw, vh] = self.viewport.unwrap_or([
+            0.0,
+            0.0,
+            self.depth_size.0 as f32,
+            self.depth_size.1 as f32,
+        ]);
+        let scissor = |from: f32, to: f32, size: (u32, u32)| -> [u32; 4] {
+            let x0 = (vx + vw * from).round().clamp(0.0, size.0 as f32) as u32;
+            let x1 = (vx + vw * to).round().clamp(0.0, size.0 as f32) as u32;
+            let y0 = vy.round().clamp(0.0, size.1 as f32) as u32;
+            let y1 = (vy + vh).round().clamp(0.0, size.1 as f32) as u32;
+            [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
+        };
+        let display = scene.display_scene();
+        if let (Some(s), Some((rid, _))) = (split, scene.preview_revision) {
+            let before = scene.revision_view(rid, true);
+            let after = scene.revision_view(rid, false);
+            if let (Some(before), Some(after)) = (before, after) {
+                let left = self.prepare_objects(device, &before, 1, eye);
+                passes.push((left, Some(scissor(0.0, s, self.depth_size))));
+                let right = self.prepare_objects(device, &after, 0, eye);
+                passes.push((right, Some(scissor(s, 1.0, self.depth_size))));
             }
         }
+        if passes.is_empty() {
+            let draws = self.prepare_objects(device, display.as_ref(), 0, eye);
+            passes.push((draws, None));
+        }
+        let scene = display.as_ref();
+        let mut bounds_min = Vec3::splat(f32::MAX);
+        let mut bounds_max = Vec3::splat(f32::MIN);
+        for (d, _) in &passes {
+            bounds_min = bounds_min.min(d.min);
+            bounds_max = bounds_max.max(d.max);
+        }
+        let shadow = self.show_grid.then(|| self.shadow_bind_group(device, bounds_min, bounds_max)).flatten();
 
-        // Collect per-object uniform bind groups
-        let default_mode_val = match self.shading {
-            ViewportShading::StudioLit => {
-                if matches!(scene.mode, InteractionMode::Sculpt) {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            ViewportShading::SculptClay => 1.0,
-            ViewportShading::WireframeOnly => 2.0,
-        };
-
-        let mut ghost_draws: Vec<(u64, wgpu::BindGroup, f32)> = Vec::new();
-        let mut solid_draws: Vec<(u64, wgpu::BindGroup)> = Vec::new();
-        let mut wire_draws: Vec<(u64, wgpu::BindGroup)> = Vec::new();
         let mut overlay_line_draws: Vec<PreparedDrawCall> = Vec::new();
-
+        let is_edit_mode = matches!(scene.mode, InteractionMode::EditMesh(_));
         for (i, obj) in scene.objects.iter().enumerate() {
-            if !obj.visible {
+            if !obj.visible
+                || scene.selected_object != Some(i)
+                || !matches!(scene.mode, InteractionMode::EditMesh(EditElementMode::Vertex))
+            {
                 continue;
             }
-            let is_selected = scene.selected_object == Some(i);
-            let has_face_sel = !obj.mesh.selected_faces.is_empty() || (is_selected && is_edit_mode);
+            let _ = is_edit_mode;
             let model = obj.transform.matrix();
-
-            if self.shading != ViewportShading::WireframeOnly {
-                let bg = self.create_object_bind_group(
-                    device,
-                    model,
-                    obj.roughness,
-                    obj.metallic,
-                    default_mode_val,
-                    obj.pattern.shader_id(),
-                    obj.secondary_color,
-                    obj.texture_scale,
-                    obj.emission_color,
-                    obj.emission_strength,
-                    if self.ghost_unselected
-                        && scene.has_any_selection()
-                        && !is_selected
-                        && !has_face_sel
-                    {
-                        0.16
-                    } else {
-                        1.0
-                    },
-                );
-                if self.ghost_unselected
-                    && scene.has_any_selection()
-                    && !is_selected
-                    && !has_face_sel
-                {
-                    ghost_draws.push((
-                        obj.id,
-                        bg,
-                        (obj.transform.translation - eye).length_squared(),
-                    ));
-                } else {
-                    solid_draws.push((obj.id, bg));
-                }
-            }
-
-            let want_wire = self.shading == ViewportShading::WireframeOnly
-                || self.show_wireframe_overlay
-                || has_face_sel;
-
-            if want_wire {
-                let bg = self.create_line_bind_group(device, model);
-                wire_draws.push((obj.id, bg));
-            }
-
-            if is_selected
-                && matches!(
-                    scene.mode,
-                    InteractionMode::EditMesh(EditElementMode::Vertex)
-                )
-            {
-                let mut v_lines = Vec::new();
-                let r = 0.035;
-                for (vi, &p) in obj.mesh.positions.iter().enumerate() {
-                    let wp = model.transform_point3(p);
-                    let sel = obj.mesh.selected_vertices.contains(&vi);
-                    let col = if sel {
-                        [1.0, 0.72, 0.1]
-                    } else {
-                        [0.45, 0.52, 0.62]
-                    };
-                    let s = if sel { r * 1.4 } else { r * 0.75 };
-                    for axis in [Vec3::X * s, Vec3::Y * s, Vec3::Z * s] {
+            let mut v_lines = Vec::new();
+            let r = 0.035;
+            for (vi, &p) in obj.mesh.positions.iter().enumerate() {
+                let wp = model.transform_point3(p);
+                let sel = obj.mesh.selected_vertices.contains(&vi);
+                let col = if sel { [1.0, 0.72, 0.1] } else { [0.45, 0.52, 0.62] };
+                let s = if sel { r * 1.4 } else { r * 0.75 };
+                for axis in [Vec3::X * s, Vec3::Y * s, Vec3::Z * s] {
+                    for q in [wp - axis, wp + axis] {
                         v_lines.push(GpuVertex {
-                            position: (wp - axis).to_array(),
-                            normal: [0.0, 1.0, 0.0],
-                            color: col,
-                        });
-                        v_lines.push(GpuVertex {
-                            position: (wp + axis).to_array(),
+                            position: q.to_array(),
                             normal: [0.0, 1.0, 0.0],
                             color: col,
                         });
                     }
                 }
-                if !v_lines.is_empty() {
-                    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Vertex Cross VB"),
-                        contents: bytemuck::cast_slice(&v_lines),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    let bg = self.create_line_bind_group(device, Mat4::IDENTITY);
-                    overlay_line_draws.push(PreparedDrawCall {
-                        vertex_buffer: vb,
-                        vertex_count: v_lines.len() as u32,
-                        bind_group: bg,
-                    });
-                }
+            }
+            if !v_lines.is_empty() {
+                let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex Cross VB"),
+                    contents: bytemuck::cast_slice(&v_lines),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                overlay_line_draws.push(PreparedDrawCall {
+                    vertex_buffer: vb,
+                    vertex_count: v_lines.len() as u32,
+                    bind_group: self.create_line_bind_group(device, Mat4::IDENTITY),
+                });
             }
         }
 
@@ -801,21 +1033,18 @@ impl Renderer3D {
             let is_active = scene.active_comment_id == Some(c.id);
             let col = if is_active {
                 [0.18, 0.95, 1.0]
+            } else if c.draft {
+                [0.62, 0.68, 0.78]
             } else {
-                [1.0, 0.52, 0.18]
+                [1.0, 0.62, 0.30]
             };
             let r = c.selection_radius.clamp(0.15, 2.5);
             if !c.targets.is_empty() {
                 for t in &c.targets {
+                    let refreshed = scene.refreshed_target(t);
                     pin_lines.extend(Self::build_comment_pin_lines(
-                        scene
-                            .refreshed_target(t)
-                            .map(|t| t.world_anchor)
-                            .unwrap_or(t.world_anchor),
-                        scene
-                            .refreshed_target(t)
-                            .map(|t| t.surface_normal)
-                            .unwrap_or(t.surface_normal),
+                        refreshed.as_ref().map(|t| t.world_anchor).unwrap_or(t.world_anchor),
+                        refreshed.as_ref().map(|t| t.surface_normal).unwrap_or(t.surface_normal),
                         r,
                         col,
                     ));
@@ -829,51 +1058,16 @@ impl Renderer3D {
                 ));
             }
         }
-
-        // Draw green 3D selection pins for all currently selected sections across the scene
-        let mut drew_section_pin = false;
-        for obj in &scene.objects {
-            if !obj.visible || obj.mesh.selected_faces.is_empty() {
-                continue;
-            }
-            if let Some((lc, ln, _min_b, _max_b)) = obj.mesh.selected_faces_bounds_and_normal() {
-                let model = obj.transform.matrix();
-                let wp = model.transform_point3(lc);
-                let wn = model
-                    .inverse()
-                    .transpose()
-                    .transform_vector3(ln)
-                    .normalize_or_zero();
-                pin_lines.extend(Self::build_comment_pin_lines(
-                    wp,
-                    wn,
-                    0.35,
-                    [0.25, 1.0, 0.65],
-                ));
-                drew_section_pin = true;
-            }
-        }
-        if !drew_section_pin {
-            if let Some((_obj_id, wp, _lp, wn)) = scene.pending_anchor {
-                pin_lines.extend(Self::build_comment_pin_lines(
-                    wp,
-                    wn,
-                    0.35,
-                    [0.25, 1.0, 0.65],
-                ));
-            }
-        }
         if !pin_lines.is_empty() {
             let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Comment Pins VB"),
                 contents: bytemuck::cast_slice(&pin_lines),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-            let bg = self.create_line_bind_group(device, Mat4::IDENTITY);
             overlay_line_draws.push(PreparedDrawCall {
                 vertex_buffer: vb,
                 vertex_count: pin_lines.len() as u32,
-                bind_group: bg,
+                bind_group: self.create_line_bind_group(device, Mat4::IDENTITY),
             });
         }
         let _ = gizmo;
@@ -887,16 +1081,14 @@ impl Renderer3D {
                     contents: bytemuck::cast_slice(&ring_lines),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                let bg = self.create_line_bind_group(device, Mat4::IDENTITY);
                 overlay_line_draws.push(PreparedDrawCall {
                     vertex_buffer: vb,
                     vertex_count: ring_lines.len() as u32,
-                    bind_group: bg,
+                    bind_group: self.create_line_bind_group(device, Mat4::IDENTITY),
                 });
             }
         }
 
-        // Execute Render Pass
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("3D Viewport Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -904,9 +1096,9 @@ impl Renderer3D {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.025,
-                        g: 0.035,
-                        b: 0.052,
+                        r: 0.020,
+                        g: 0.026,
+                        b: 0.038,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -927,63 +1119,51 @@ impl Renderer3D {
         if let Some([x, y, w, h]) = self.viewport {
             rpass.set_viewport(x, y, w.max(1.0), h.max(1.0), 0.0, 1.0);
         }
-        // 1. Solid Meshes (using cached GPU vertex buffers)
-        if !solid_draws.is_empty() {
-            rpass.set_pipeline(&self.triangle_pipeline);
-            rpass.set_bind_group(0, &self.global_bind_group, &[]);
-            for (obj_id, bg) in &solid_draws {
-                if let Some(cached) = self.mesh_cache.get(obj_id) {
-                    if let Some((vb, count)) = &cached.tri_buffer {
-                        rpass.set_bind_group(1, bg, &[]);
-                        rpass.set_vertex_buffer(0, vb.slice(..));
-                        rpass.draw(0..*count, 0..1);
-                    }
-                }
-            }
-        }
-
-        ghost_draws.sort_by(|a, b| b.2.total_cmp(&a.2));
-        rpass.set_pipeline(&self.ghost_pipeline);
+        // 0. Studio backdrop gradient.
+        rpass.set_pipeline(&self.background_pipeline);
         rpass.set_bind_group(0, &self.global_bind_group, &[]);
-        for (id, bg, _) in &ghost_draws {
-            if let Some((vb, count)) = self.mesh_cache.get(id).and_then(|m| m.tri_buffer.as_ref()) {
-                rpass.set_bind_group(1, bg, &[]);
-                rpass.set_vertex_buffer(0, vb.slice(..));
-                rpass.draw(0..*count, 0..1);
+        rpass.set_bind_group(1, &self.identity_line_bind_group, &[]);
+        rpass.draw(0..3, 0..1);
+
+        // 1. Objects (one pass per comparison side).
+        for (draws, rect) in &passes {
+            if let Some([x, y, w, h]) = rect {
+                if *w == 0 || *h == 0 {
+                    continue;
+                }
+                rpass.set_scissor_rect(*x, *y, *w, *h);
             }
+            self.draw_objects(&mut rpass, draws);
+        }
+        if passes.iter().any(|(_, r)| r.is_some()) {
+            rpass.set_scissor_rect(0, 0, self.depth_size.0, self.depth_size.1);
         }
 
-        // 2. Depth-tested Lines (Preallocated Grid + Cached Mesh Wireframes + Hover Preview)
-        if (self.show_grid && self.grid_vertex_count > 0) || !wire_draws.is_empty() || draw_hover {
+        // 2. Contact shadow, grid and hover preview.
+        if let Some(bg) = &shadow {
+            rpass.set_pipeline(&self.shadow_pipeline);
+            rpass.set_bind_group(0, &self.global_bind_group, &[]);
+            rpass.set_bind_group(1, bg, &[]);
+            rpass.set_vertex_buffer(0, self.shadow_vertex_buffer.slice(..));
+            rpass.draw(0..6, 0..1);
+        }
+        if (self.show_grid && self.grid_vertex_count > 0) || draw_hover {
             rpass.set_pipeline(&self.line_depth_pipeline);
             rpass.set_bind_group(0, &self.global_bind_group, &[]);
-
+            rpass.set_bind_group(1, &self.identity_line_bind_group, &[]);
             if self.show_grid && self.grid_vertex_count > 0 {
-                rpass.set_bind_group(1, &self.identity_line_bind_group, &[]);
                 rpass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
                 rpass.draw(0..self.grid_vertex_count, 0..1);
             }
-
-            for (obj_id, bg) in &wire_draws {
-                if let Some(cached) = self.mesh_cache.get(obj_id) {
-                    if let Some((vb, count)) = &cached.wire_buffer {
-                        rpass.set_bind_group(1, bg, &[]);
-                        rpass.set_vertex_buffer(0, vb.slice(..));
-                        rpass.draw(0..*count, 0..1);
-                    }
-                }
-            }
-
             if draw_hover {
                 if let Some((_, vb, count)) = &self.hover_lines {
-                    rpass.set_bind_group(1, &self.identity_line_bind_group, &[]);
                     rpass.set_vertex_buffer(0, vb.slice(..));
                     rpass.draw(0..*count, 0..1);
                 }
             }
         }
 
-        // 3. Overlay Lines (Gizmo & Brush Cursor)
+        // 3. Overlay lines (pins, brush cursor).
         if !overlay_line_draws.is_empty() {
             rpass.set_pipeline(&self.line_overlay_pipeline);
             rpass.set_bind_group(0, &self.global_bind_group, &[]);
@@ -1153,6 +1333,7 @@ impl Renderer3D {
         offscreen_renderer.ghost_unselected = self.ghost_unselected;
         offscreen_renderer.show_wireframe_overlay = self.show_wireframe_overlay;
         offscreen_renderer.show_grid = self.show_grid;
+        offscreen_renderer.compare_split = self.compare_split;
 
         let color_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Offscreen Screenshot Texture"),
@@ -1181,6 +1362,7 @@ impl Renderer3D {
             crate::ui::apply_theme(&ctx);
             let mut state = crate::ui::UiState::default();
             state.review_tab = tab;
+            state.compare_split = self.compare_split;
             let mut history = crate::history::UndoHistory::default();
             let mut ui_gizmo = GizmoState::default();
             // Step time generously so egui's area fade-in animations finish before capture.
@@ -1339,6 +1521,7 @@ pub fn render_scene_headless_to_png(
         height,
         path,
         None,
+        None,
     )
 }
 
@@ -1353,6 +1536,7 @@ pub fn render_headless(
     height: u32,
     path: &std::path::Path,
     studio: Option<usize>,
+    compare_split: Option<f32>,
 ) -> Result<(), String> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -1385,6 +1569,7 @@ pub fn render_headless(
     renderer.shading = shading;
     renderer.show_wireframe_overlay = show_wireframe;
     renderer.show_grid = show_grid;
+    renderer.compare_split = compare_split;
 
     let gizmo = GizmoState::default();
     renderer.render_to_png_file(

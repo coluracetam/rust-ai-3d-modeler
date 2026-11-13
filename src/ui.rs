@@ -52,6 +52,8 @@ pub struct UiState {
     pub actions: Vec<crate::ipc::IpcRequest>,
     pub last_error: Option<String>,
     pub last_agent_activity: Option<std::time::Instant>,
+    /// Last time an agent polled `wait_for_feedback`.
+    pub agent_listening: Option<std::time::Instant>,
     pub activity: Vec<String>,
     pub project_dialog: Option<String>,
     pub project_file: String,
@@ -117,6 +119,23 @@ pub struct UiState {
     pub confirm_new_project: bool,
     /// Title typed into the new-project confirmation.
     pub new_project_name: String,
+    /// Command palette (Ctrl+K).
+    pub palette_open: bool,
+    pub palette_query: String,
+    pub palette_index: usize,
+    /// New comments go to the agent immediately instead of waiting as drafts.
+    pub auto_send: bool,
+    /// Reference images attached to the comment being written.
+    pub draft_attachments: Vec<String>,
+    /// Revision whose "Request changes" note is being written.
+    pub request_changes_for: Option<u64>,
+    pub request_notes: String,
+    /// Before/after wipe position while comparing (None = single side).
+    pub compare_split: Option<f32>,
+    /// Focus the comment composer on the next frame.
+    pub focus_composer: bool,
+    /// Path being typed to attach an image (None = field hidden).
+    pub attach_path: Option<String>,
 }
 
 impl Default for UiState {
@@ -126,6 +145,7 @@ impl Default for UiState {
             actions: Vec::new(),
             last_error: None,
             last_agent_activity: None,
+            agent_listening: None,
             activity: Vec::new(),
             project_dialog: None,
             project_file: "project.spatial.json".into(),
@@ -180,6 +200,16 @@ impl Default for UiState {
             fly_speed: 3.0,
             confirm_new_project: false,
             new_project_name: String::new(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            auto_send: false,
+            draft_attachments: Vec::new(),
+            request_changes_for: None,
+            request_notes: String::new(),
+            compare_split: None,
+            focus_composer: false,
+            attach_path: None,
         }
     }
 }
@@ -187,7 +217,10 @@ impl Default for UiState {
 impl UiState {
     /// True while a modal surface (dialog or lightbox) owns Escape and pointer input.
     pub fn modal_open(&self) -> bool {
-        self.project_dialog.is_some() || self.show_io_modal || self.lightbox.is_some()
+        self.project_dialog.is_some()
+            || self.show_io_modal
+            || self.lightbox.is_some()
+            || self.palette_open
     }
 }
 
@@ -217,21 +250,25 @@ pub fn update_pending_anchor_from_selection(scene: &mut Scene) {
 // ---------------------------------------------------------------------------
 
 pub const ACCENT: Color32 = Color32::from_rgb(103, 226, 195);
-const MUTED: Color32 = Color32::from_rgb(169, 183, 202);
-const SUBTLE: Color32 = Color32::from_rgb(122, 138, 158);
-const TEXT: Color32 = Color32::from_rgb(233, 239, 247);
-const CARD: Color32 = Color32::from_rgb(28, 38, 52);
-const BORDER: Color32 = Color32::from_rgb(41, 56, 74);
-const PANEL: Color32 = Color32::from_rgb(18, 26, 38);
-const HEADER: Color32 = Color32::from_rgb(14, 22, 33);
-const FIELD: Color32 = Color32::from_rgb(12, 19, 29);
-const OVERLAY: Color32 = Color32::from_rgba_premultiplied(14, 22, 32, 238);
-const ON_ACCENT: Color32 = Color32::from_rgb(10, 29, 29);
-const SELECTED_ROW: Color32 = Color32::from_rgb(30, 61, 62);
+const MUTED: Color32 = Color32::from_rgb(158, 169, 186);
+const SUBTLE: Color32 = Color32::from_rgb(110, 122, 140);
+const TEXT: Color32 = Color32::from_rgb(232, 237, 244);
+const CARD: Color32 = Color32::from_rgb(26, 32, 43);
+const CARD_HI: Color32 = Color32::from_rgb(33, 41, 54);
+const BORDER: Color32 = Color32::from_rgb(39, 48, 62);
+const PANEL: Color32 = Color32::from_rgb(18, 23, 32);
+const HEADER: Color32 = Color32::from_rgb(13, 17, 24);
+const FIELD: Color32 = Color32::from_rgb(11, 15, 22);
+const OVERLAY: Color32 = Color32::from_rgba_premultiplied(15, 19, 27, 236);
+const ON_ACCENT: Color32 = Color32::from_rgb(8, 30, 27);
+const SELECTED_ROW: Color32 = Color32::from_rgb(27, 52, 52);
+const HOVER_ROW: Color32 = Color32::from_rgb(26, 33, 45);
 const WARN: Color32 = Color32::from_rgb(245, 187, 113);
 const INFO: Color32 = Color32::from_rgb(130, 176, 255);
 const DANGER: Color32 = Color32::from_rgb(255, 160, 150);
 const DANGER_BG: Color32 = Color32::from_rgb(64, 35, 41);
+
+use egui_phosphor::regular as icon;
 
 fn comment_status_color(status: CommentStatus) -> Color32 {
     match status {
@@ -284,6 +321,7 @@ fn small_muted(text: impl Into<String>) -> RichText {
 
 pub fn apply_theme(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     let fallbacks = fonts.families[&egui::FontFamily::Proportional].clone();
     for (name, bytes) in [
         (
@@ -317,44 +355,58 @@ pub fn apply_theme(ctx: &egui::Context) {
     let mut style = egui::Style::default();
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = PANEL;
-    style.visuals.window_fill = Color32::from_rgb(23, 33, 47);
+    style.visuals.window_fill = CARD;
     style.visuals.extreme_bg_color = FIELD;
     style.visuals.faint_bg_color = CARD;
     style.visuals.override_text_color = Some(TEXT);
     style.visuals.hyperlink_color = ACCENT;
-    style.visuals.selection.bg_fill = Color32::from_rgb(37, 83, 79);
+    style.visuals.selection.bg_fill = Color32::from_rgb(34, 82, 76);
     style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
-    let radius = egui::CornerRadius::same(6);
+    style.visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 10],
+        blur: 32,
+        spread: 0,
+        color: Color32::from_black_alpha(120),
+    };
+    style.visuals.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: Color32::from_black_alpha(110),
+    };
+    let radius = egui::CornerRadius::same(7);
     let widgets = &mut style.visuals.widgets;
     widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
     widgets.noninteractive.corner_radius = radius;
-    widgets.inactive.bg_fill = CARD;
-    widgets.inactive.weak_bg_fill = CARD;
-    widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(44, 58, 76));
+    widgets.inactive.bg_fill = CARD_HI;
+    widgets.inactive.weak_bg_fill = CARD_HI;
+    widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(44, 54, 70));
     widgets.inactive.corner_radius = radius;
-    widgets.hovered.bg_fill = Color32::from_rgb(42, 64, 77);
-    widgets.hovered.weak_bg_fill = Color32::from_rgb(36, 52, 66);
-    widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    widgets.hovered.bg_fill = Color32::from_rgb(41, 52, 68);
+    widgets.hovered.weak_bg_fill = Color32::from_rgb(38, 48, 63);
+    widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(70, 86, 108));
     widgets.hovered.corner_radius = radius;
-    widgets.active.bg_fill = Color32::from_rgb(35, 83, 78);
-    widgets.active.weak_bg_fill = Color32::from_rgb(35, 83, 78);
+    widgets.active.bg_fill = Color32::from_rgb(34, 82, 76);
+    widgets.active.weak_bg_fill = Color32::from_rgb(34, 82, 76);
+    widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
     widgets.active.corner_radius = radius;
     widgets.open.corner_radius = radius;
-    style.visuals.window_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(47, 65, 82));
+    style.visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
     style.visuals.window_corner_radius = egui::CornerRadius::same(12);
-    style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(9);
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
     style.spacing.interact_size.y = 30.0;
     style.spacing.window_margin = egui::Margin::same(18);
-    style.spacing.menu_margin = egui::Margin::same(8);
+    style.spacing.menu_margin = egui::Margin::same(6);
+    style.spacing.slider_rail_height = 4.0;
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        FontId::new(21.0, egui::FontFamily::Name("Studio Semibold".into())),
+        FontId::new(19.0, egui::FontFamily::Name("Studio Semibold".into())),
     );
     style
         .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(15.0));
+        .insert(egui::TextStyle::Body, FontId::proportional(14.5));
     style
         .text_styles
         .insert(egui::TextStyle::Button, FontId::proportional(14.0));
@@ -391,6 +443,138 @@ fn overlay_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .corner_radius(8)
         .inner_margin(egui::Margin::symmetric(10, 8))
+}
+
+/// Square icon button for toolbars. `selected` draws it as the active tool.
+fn icon_button(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    tip: &str,
+    selected: bool,
+    enabled: bool,
+) -> egui::Response {
+    let size = egui::vec2(34.0, 34.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let hovered = enabled && resp.hovered();
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, 8, ACCENT.gamma_multiply(0.16));
+        p.rect_stroke(
+            rect,
+            8,
+            egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)),
+            egui::StrokeKind::Inside,
+        );
+    } else if hovered {
+        p.rect_filled(rect, 8, Color32::from_rgb(40, 50, 66));
+    }
+    let color = if !enabled {
+        Color32::from_rgb(72, 82, 98)
+    } else if selected {
+        ACCENT
+    } else if hovered {
+        TEXT
+    } else {
+        MUTED
+    };
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(18.0),
+        color,
+    );
+    if tip.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(tip)
+    }
+}
+
+/// Icon followed by text, for buttons and menu entries.
+fn icon_text(glyph: &str, text: &str) -> String {
+    format!("{glyph}  {text}")
+}
+
+/// iOS-style switch with a clickable label.
+fn toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let switch = egui::vec2(30.0, 17.0);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(14.0),
+        TEXT,
+    );
+    let gap = if label.is_empty() { 0.0 } else { 9.0 };
+    let size = egui::vec2(
+        switch.x + gap + galley.size().x,
+        switch.y.max(galley.size().y).max(22.0),
+    );
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let sw = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.center().y - switch.y * 0.5),
+        switch,
+    );
+    let off_bg = Color32::from_rgb(46, 56, 72);
+    let on_bg = Color32::from_rgb(84, 186, 160);
+    let mix = |a: u8, b: u8| egui::lerp(a as f32..=b as f32, t) as u8;
+    let bg = Color32::from_rgb(
+        mix(off_bg.r(), on_bg.r()),
+        mix(off_bg.g(), on_bg.g()),
+        mix(off_bg.b(), on_bg.b()),
+    );
+    let p = ui.painter();
+    p.rect_filled(sw, 8.5, bg);
+    let r = switch.y * 0.5 - 2.5;
+    let cx = egui::lerp(sw.left() + r + 2.5..=sw.right() - r - 2.5, t);
+    p.circle_filled(
+        egui::pos2(cx, sw.center().y),
+        r,
+        if *on { ON_ACCENT } else { MUTED },
+    );
+    if resp.hovered() {
+        p.rect_stroke(
+            sw,
+            8.5,
+            egui::Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
+            egui::StrokeKind::Outside,
+        );
+    }
+    if !label.is_empty() {
+        p.galley(
+            egui::pos2(sw.right() + gap, rect.center().y - galley.size().y * 0.5),
+            galley,
+            TEXT,
+        );
+    }
+    resp
+}
+
+/// Thin vertical divider for toolbars.
+fn vdivider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 22.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [rect.center_top(), rect.center_bottom()],
+        egui::Stroke::new(1.0_f32, BORDER),
+    );
+}
+
+/// Horizontal divider for vertical toolbars.
+fn hdivider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 9.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [rect.left_center() + egui::vec2(6.0, 0.0), rect.right_center() - egui::vec2(6.0, 0.0)],
+        egui::Stroke::new(1.0_f32, BORDER),
+    );
 }
 
 fn action(state: &mut UiState, tool: &str, args: serde_json::Value) {
@@ -663,6 +847,7 @@ fn part_row(
     open_comments: usize,
     visible: bool,
     selected: bool,
+    swatch: [f32; 3],
 ) -> RowResponse {
     let height = 32.0;
     let (rect, row) = ui.allocate_exact_size(
@@ -694,7 +879,7 @@ fn part_row(
     let bg = if selected {
         SELECTED_ROW
     } else if row.hovered() {
-        Color32::from_rgb(25, 36, 51)
+        HOVER_ROW
     } else {
         Color32::TRANSPARENT
     };
@@ -714,23 +899,26 @@ fn part_row(
     let eye_color = if eye.hovered() {
         TEXT
     } else if visible {
-        MUTED
+        SUBTLE
     } else {
-        Color32::from_rgb(84, 98, 116)
+        Color32::from_rgb(72, 82, 98)
     };
-    painter.add(egui::Shape::ellipse_stroke(
+    painter.text(
         c,
-        egui::vec2(7.0, 4.2),
-        egui::Stroke::new(1.3_f32, eye_color),
-    ));
-    if visible {
-        painter.circle_filled(c, 2.1, eye_color);
-    } else {
-        painter.line_segment(
-            [c + egui::vec2(-7.0, 5.0), c + egui::vec2(7.0, -5.0)],
-            egui::Stroke::new(1.3_f32, eye_color),
-        );
+        egui::Align2::CENTER_CENTER,
+        if visible { icon::EYE } else { icon::EYE_SLASH },
+        FontId::proportional(15.0),
+        eye_color,
+    );
+    // Material colour swatch.
+    let sw = egui::Rect::from_center_size(egui::pos2(rect.left() + 41.0, rect.center().y), egui::vec2(10.0, 10.0));
+    let to8 = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+    let mut col = Color32::from_rgb(to8(swatch[0]), to8(swatch[1]), to8(swatch[2]));
+    if !visible {
+        col = col.gamma_multiply(0.35);
     }
+    painter.rect_filled(sw, 3, col);
+    painter.rect_stroke(sw, 3, egui::Stroke::new(1.0_f32, Color32::from_black_alpha(90)), egui::StrokeKind::Inside);
 
     let mut right = rect.right() - 8.0;
     if open_comments > 0 {
@@ -753,7 +941,7 @@ fn part_row(
     );
     right -= count_w + 10.0;
 
-    let name_left = rect.left() + 36.0;
+    let name_left = rect.left() + 54.0;
     let mut job = egui::text::LayoutJob::single_section(
         name.to_owned(),
         egui::TextFormat {
@@ -781,6 +969,28 @@ fn part_row(
         double_clicked: row.double_clicked(),
         toggle_visibility: eye.clicked(),
     }
+}
+
+/// Representative display colour: base tint times the average vertex colour.
+fn swatch_color(obj: &crate::scene::SceneObject) -> [f32; 3] {
+    let colors = &obj.mesh.colors;
+    if colors.is_empty() {
+        return obj.color;
+    }
+    let step = (colors.len() / 64).max(1);
+    let mut sum = [0.0f32; 3];
+    let mut n = 0.0;
+    for c in colors.iter().step_by(step) {
+        for k in 0..3 {
+            sum[k] += c[k];
+        }
+        n += 1.0;
+    }
+    [
+        obj.color[0] * sum[0] / n,
+        obj.color[1] * sum[1] / n,
+        obj.color[2] * sum[2] / n,
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +1081,6 @@ pub fn draw_ui(
     let mut view_changed = false;
 
     draw_header(ctx, scene, history, state, comparing, in_progress);
-    draw_selection_toolbar(ctx, scene, state, comparing);
     draw_status_bar(ctx, scene, state);
     draw_scene_panel(ctx, scene, camera, renderer, state, comparing);
     draw_review_panel(ctx, scene, state, comparing, &mut view_changed);
@@ -897,8 +1106,36 @@ pub fn draw_ui(
         renderer.invalidate_cache();
     }
 
-    draw_dialogs(ctx, scene, state);
+    // Image files dropped on the window become comment attachments.
+    let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+        i.raw
+            .dropped_files
+            .iter()
+            .filter_map(|f| f.path.clone())
+            .collect()
+    });
+    for path in dropped {
+        let is_image = path
+            .extension()
+            .map(|e| matches!(e.to_string_lossy().to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"))
+            .unwrap_or(false);
+        if is_image {
+            state.draft_attachments.push(path.to_string_lossy().into_owned());
+            state.review_tab = 0;
+            state.status_message = "Image attached to your next comment".into();
+        } else {
+            state.last_error = Some(format!("Only images can be attached: {}", path.display()));
+        }
+    }
 
+    draw_dialogs(ctx, scene, state);
+    draw_command_palette(ctx, scene, camera, renderer, history, state, comparing, in_progress);
+
+    if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+        state.palette_open = !state.palette_open;
+        state.palette_query.clear();
+        state.palette_index = 0;
+    }
     if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) && !comparing {
         state.confirm_new_project = true;
     }
@@ -939,241 +1176,161 @@ fn draw_header(
         .frame(
             egui::Frame::new()
                 .fill(HEADER)
-                .inner_margin(egui::Margin::symmetric(18, 10)),
+                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(28, 35, 46)))
+                .inner_margin(egui::Margin::symmetric(14, 8)),
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let (icon, _) =
-                    ui.allocate_exact_size(egui::vec2(28.0, 32.0), egui::Sense::hover());
-                let center = icon.center();
-                ui.painter().rect_stroke(
-                    egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0)),
-                    3,
-                    egui::Stroke::new(1.5_f32, ACCENT),
-                    egui::StrokeKind::Inside,
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_center_size(center, egui::vec2(7.0, 7.0)),
-                    2,
-                    ACCENT,
-                );
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(semibold("Spatial Studio", 19.0));
-                    ui.label(small_muted("AI modeling · human direction"));
-                });
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.set_max_width(320.0);
-                    ui.add(egui::Label::new(semibold(&scene.project_name, 15.0)).truncate())
-                        .on_hover_text(
-                            scene
-                                .project_path
-                                .clone()
-                                .unwrap_or_else(|| "Not saved yet".into()),
-                        );
-                    let (dot, text) = if scene.project_path.is_some() {
-                        (ACCENT, "Saved project · autosave on")
-                    } else {
-                        (WARN, "Unsaved · save to keep your work")
+                // Brand mark: a cube outline with a lit core.
+                let (mark, _) = ui.allocate_exact_size(egui::vec2(26.0, 30.0), egui::Sense::hover());
+                let c = mark.center();
+                let p = ui.painter();
+                p.rect_filled(egui::Rect::from_center_size(c, egui::vec2(22.0, 22.0)), 6, ACCENT.gamma_multiply(0.14));
+                p.text(c, egui::Align2::CENTER_CENTER, icon::CUBE_FOCUS, FontId::proportional(17.0), ACCENT);
+                ui.label(semibold("Spatial Studio", 15.0));
+                vdivider(ui);
+
+                // Project menu: title, save state and file actions.
+                let (dot, status) = if scene.project_path.is_some() {
+                    (ACCENT, "Saved · autosave on")
+                } else {
+                    (WARN, "Not saved yet")
+                };
+                let title = format!("{}  {}", scene.project_name, icon::CARET_DOWN);
+                let menu = ui.menu_button(semibold(title, 14.0), |ui| {
+                    ui.set_min_width(250.0);
+                    let item = |ui: &mut egui::Ui, glyph: &str, text: &str, keys: &str, enabled: bool| {
+                        ui.add_enabled(enabled, egui::Button::new(icon_text(glyph, text)).shortcut_text(keys))
+                            .clicked()
                     };
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        ui.label(RichText::new("●").size(9.0).color(dot));
-                        ui.label(small_muted(text));
-                    });
+                    if item(ui, icon::FILE_PLUS, "New project…", "Ctrl+N", !comparing) {
+                        state.confirm_new_project = true;
+                        ui.close_menu();
+                    }
+                    if item(ui, icon::FOLDER_OPEN, "Open project…", "", true) {
+                        state.project_dialog = Some("open".into());
+                        ui.close_menu();
+                    }
+                    if item(ui, icon::FLOPPY_DISK, "Save project as…", "", true) {
+                        state.project_dialog = Some("save".into());
+                        ui.close_menu();
+                    }
+                    if item(ui, icon::CLOCK_COUNTER_CLOCKWISE, "Recover autosave…", "", true) {
+                        state.project_dialog = Some("recover".into());
+                        ui.close_menu();
+                    }
+                    if item(ui, icon::EXPORT, "Export model…", "", true) {
+                        state.show_io_modal = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    eyebrow(ui, "Project title");
+                    if text_field(ui, &mut scene.project_name, "Untitled project", f32::INFINITY).changed() {
+                        state.scene_dirty_for_disk = true;
+                    }
+                    eyebrow(ui, "Display units");
+                    let current = scene.units.clone();
+                    let mut unit: &str = &current;
+                    if segmented(
+                        ui,
+                        &mut unit,
+                        &[
+                            ("m", "m".into(), "Meters"),
+                            ("cm", "cm".into(), "Centimeters"),
+                            ("mm", "mm".into(), "Millimeters"),
+                            ("in", "in".into(), "Inches"),
+                        ],
+                    ) {
+                        scene.units = unit.to_string();
+                        state.scene_dirty_for_disk = true;
+                    }
+                    ui.label(small_muted("World coordinates are stored in meters."));
                 });
+                menu.response.on_hover_text(
+                    scene.project_path.clone().unwrap_or_else(|| "Not saved yet".into()),
+                );
+                ui.label(RichText::new("●").size(8.0).color(dot));
+                ui.label(small_muted(status));
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if primary(ui, "Save project", !comparing) {
+                    if ui
+                        .add_enabled(
+                            !comparing,
+                            egui::Button::new(
+                                RichText::new(icon_text(icon::FLOPPY_DISK, "Save"))
+                                    .font(medium_font(14.0))
+                                    .color(ON_ACCENT),
+                            )
+                            .fill(ACCENT),
+                        )
+                        .on_hover_text("Save project  ·  Ctrl+S")
+                        .clicked()
+                    {
                         if scene.project_path.is_some() {
                             action(state, "save_project", json!({}));
                         } else {
                             state.project_dialog = Some("save".into());
                         }
                     }
-                    ui.menu_button("Project  ▾", |ui| {
-                        ui.set_min_width(220.0);
-                        if ui
-                            .add_enabled(!comparing, egui::Button::new("New project…"))
-                            .clicked()
-                        {
-                            state.confirm_new_project = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("Open project…").clicked() {
-                            state.project_dialog = Some("open".into());
-                            ui.close_menu();
-                        }
-                        if ui.button("Save project as…").clicked() {
-                            state.project_dialog = Some("save".into());
-                            ui.close_menu();
-                        }
-                        if ui.button("Recover autosave…").clicked() {
-                            state.project_dialog = Some("recover".into());
-                            ui.close_menu();
-                        }
-                        if ui.button("Export model…").clicked() {
-                            state.show_io_modal = true;
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        eyebrow(ui, "Project title");
-                        if text_field(
-                            ui,
-                            &mut scene.project_name,
-                            "Untitled project",
-                            f32::INFINITY,
-                        )
-                        .changed()
-                        {
-                            state.scene_dirty_for_disk = true;
-                        }
-                        eyebrow(ui, "Display units");
-                        let current = scene.units.clone();
-                        let mut unit: &str = &current;
-                        if segmented(
-                            ui,
-                            &mut unit,
-                            &[
-                                ("m", "m".into(), "Meters"),
-                                ("cm", "cm".into(), "Centimeters"),
-                                ("mm", "mm".into(), "Millimeters"),
-                                ("in", "in".into(), "Inches"),
-                            ],
-                        ) {
-                            scene.units = unit.to_string();
-                            state.scene_dirty_for_disk = true;
-                        }
-                        ui.label(small_muted("World coordinates are stored in meters."));
-                    });
-                    ui.add_space(6.0);
-                    let blocked = if comparing {
-                        "Return to the live scene first"
-                    } else {
-                        "Unavailable while a revision is open or an operation runs"
-                    };
-                    if tool_button(
+                    ui.add_space(4.0);
+                    let blocked = !comparing && !in_progress;
+                    if icon_button(
                         ui,
-                        "Redo",
-                        history.can_redo() && !comparing && !in_progress,
-                        "Redo  ·  Ctrl+Shift+Z",
-                        if history.can_redo() {
-                            blocked
-                        } else {
-                            "Nothing to redo"
-                        },
-                    ) {
+                        icon::ARROW_CLOCKWISE,
+                        if history.can_redo() { "Redo  ·  Ctrl+Shift+Z" } else { "Nothing to redo" },
+                        false,
+                        history.can_redo() && blocked,
+                    )
+                    .clicked()
+                    {
                         action(state, "redo", json!({}));
                     }
-                    if tool_button(
+                    if icon_button(
                         ui,
-                        "Undo",
-                        history.can_undo() && !comparing && !in_progress,
-                        "Undo  ·  Ctrl+Z",
-                        if history.can_undo() {
-                            blocked
-                        } else {
-                            "Nothing to undo"
-                        },
-                    ) {
+                        icon::ARROW_COUNTER_CLOCKWISE,
+                        if history.can_undo() { "Undo  ·  Ctrl+Z" } else { "Nothing to undo" },
+                        false,
+                        history.can_undo() && blocked,
+                    )
+                    .clicked()
+                    {
                         action(state, "undo", json!({}));
                     }
-                });
-            });
-        });
-}
-
-fn draw_selection_toolbar(
-    ctx: &egui::Context,
-    scene: &mut Scene,
-    state: &mut UiState,
-    comparing: bool,
-) {
-    egui::TopBottomPanel::top("selection_toolbar")
-        .frame(
-            egui::Frame::new()
-                .fill(Color32::from_rgb(21, 31, 44))
-                .inner_margin(egui::Margin::symmetric(16, 7)),
-        )
-        .show(ctx, |ui| {
-            ui.add_enabled_ui(!comparing, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    eyebrow(ui, "Select");
-                    if segmented(
-                        ui,
-                        &mut state.select_mode,
-                        &[
-                            (SmartSelectMode::SubPart, "1  Part".into(), "Part (1) · click selects one connected piece"),
-                            (SmartSelectMode::SmartSurface, "2  Surface".into(), "Surface (2) · click selects a surface bounded by sharp edges"),
-                            (SmartSelectMode::WholeLayer, "3  Layer".into(), "Layer (3) · click selects the entire object"),
-                            (SmartSelectMode::Brush, "4  Brush".into(), "Brush (4) · drag to paint a selection; Ctrl+drag erases"),
-                            (SmartSelectMode::Box, "5  Box".into(), "Box (5 or Ctrl+C) · drag rectangles over the places to change; Shift adds, Ctrl removes"),
-                        ],
-                    ) {
-                        state.hover_preview_seed_face = None;
-                        state.measure_active = false;
-                    }
-                    if state.select_mode == SmartSelectMode::SmartSurface {
-                        ui.label(small_muted("Crease"));
-                        if ui
-                            .add(egui::Slider::new(&mut state.crease_angle_deg, 5.0..=85.0).suffix("°"))
-                            .on_hover_text("Edges sharper than this angle stop the surface fill")
-                            .changed()
-                        {
-                            state.hover_preview_seed_face = None;
-                        }
-                    } else if state.select_mode == SmartSelectMode::Brush {
-                        ui.label(small_muted("Radius"));
-                        ui.add(egui::Slider::new(&mut state.selection_radius, 0.05..=2.5))
-                            .on_hover_text("Brush radius  ·  [ and ] adjust");
-                        state.sculpt.radius = state.selection_radius;
-                    } else if state.select_mode == SmartSelectMode::Box {
-                        ui.checkbox(&mut state.box_through, "Select through").on_hover_text(
-                            "Also pick faces hidden behind other geometry inside the box",
+                    ui.add_space(8.0);
+                    // Command palette trigger, centred in the remaining space.
+                    let w = ui.available_width().min(340.0);
+                    let pad = ((ui.available_width() - w) * 0.5).max(0.0);
+                    ui.add_space(pad);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 32.0), egui::Sense::click());
+                    let hovered = resp.hovered();
+                    let p = ui.painter();
+                    p.rect(
+                        rect,
+                        8,
+                        FIELD,
+                        egui::Stroke::new(1.0_f32, if hovered { Color32::from_rgb(64, 78, 98) } else { BORDER }),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        rect.left_center() + egui::vec2(12.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        icon_text(icon::MAGNIFYING_GLASS, "Search commands…"),
+                        FontId::proportional(13.5),
+                        SUBTLE,
+                    );
+                    if rect.width() > 230.0 {
+                        p.text(
+                            rect.right_center() - egui::vec2(12.0, 0.0),
+                            egui::Align2::RIGHT_CENTER,
+                            "Ctrl K",
+                            medium_font(12.0),
+                            SUBTLE,
                         );
                     }
-                    ui.separator();
-                    ui.checkbox(&mut state.multi_select, "Multi-select").on_hover_text(
-                        "Add each click to the selection; click a selected region to remove it.\nWithout it: Shift+click adds, Ctrl+click removes.",
-                    );
-                    ui.separator();
-                    let has_faces = scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty());
-                    let has_any = scene.has_any_selection();
-                    if tool_button(ui, "Grow", has_faces, "Grow the selection by one ring  ·  ]", "Select faces first") {
-                        for o in &mut scene.objects {
-                            if !o.mesh.selected_faces.is_empty() {
-                                o.mesh.grow_selection();
-                            }
-                        }
-                        update_pending_anchor_from_selection(scene);
-                        state.scene_dirty_for_disk = true;
-                    }
-                    if tool_button(ui, "Shrink", has_faces, "Shrink the selection by one ring  ·  [", "Select faces first") {
-                        for o in &mut scene.objects {
-                            if !o.mesh.selected_faces.is_empty() {
-                                o.mesh.shrink_selection();
-                            }
-                        }
-                        update_pending_anchor_from_selection(scene);
-                        state.scene_dirty_for_disk = true;
-                    }
-                    if tool_button(ui, "Clear", has_any, "Clear the selection  ·  Esc", "Nothing selected") {
-                        scene.clear_all_selections();
-                        scene.selected_object = None;
-                        state.scene_dirty_for_disk = true;
-                    }
-                    ui.add_space(6.0);
-                    match selection_summary(scene) {
-                        Some(summary) => {
-                            ui.label(RichText::new("●").size(9.0).color(ACCENT));
-                            truncated(ui, RichText::new(&summary).small().color(TEXT), &summary);
-                        }
-                        None => {
-                            ui.label(small_muted("Nothing selected"));
-                        }
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        state.palette_open = true;
+                        state.palette_query.clear();
+                        state.palette_index = 0;
                     }
                 });
             });
@@ -1192,16 +1349,17 @@ fn draw_status_bar(ctx: &egui::Context, scene: &Scene, state: &UiState) {
                 let recent = state
                     .last_agent_activity
                     .is_some_and(|t| t.elapsed().as_secs() < 30);
-                let agent_text = match state.last_agent_activity {
-                    Some(t) if recent => format!("Agent active · {}", ago(t.elapsed())),
-                    Some(t) => format!("Agent idle · last seen {}", ago(t.elapsed())),
-                    None => "Waiting for an agent".into(),
+                let listening = state
+                    .agent_listening
+                    .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+                let drafts = scene.draft_count();
+                let (agent_text, color) = match state.last_agent_activity {
+                    Some(t) if recent => (format!("Agent working · {}", ago(t.elapsed())), ACCENT),
+                    _ if listening => ("Agent listening for feedback".to_string(), INFO),
+                    Some(t) => (format!("Agent idle · last seen {}", ago(t.elapsed())), SUBTLE),
+                    None => ("No agent connected".into(), SUBTLE),
                 };
-                ui.label(
-                    RichText::new("●")
-                        .size(9.0)
-                        .color(if recent { ACCENT } else { SUBTLE }),
-                );
+                ui.label(RichText::new(icon::ROBOT).size(13.0).color(color));
                 ui.label(small_muted(agent_text)).on_hover_ui(|ui| {
                     ui.set_max_width(420.0);
                     eyebrow(ui, "Recent agent activity");
@@ -1211,7 +1369,13 @@ fn draw_status_bar(ctx: &egui::Context, scene: &Scene, state: &UiState) {
                     for line in state.activity.iter().rev().take(10) {
                         ui.label(small_muted(line));
                     }
+                    ui.separator();
+                    ui.label(small_muted("Agents call wait_for_feedback to pick up comments as soon as you send them."));
                 });
+                if drafts > 0 {
+                    ui.separator();
+                    ui.label(RichText::new(format!("{} {} not sent", icon::PAPER_PLANE_TILT, plural(drafts, "comment", "comments"))).small().color(WARN));
+                }
                 if let Some((name, started)) = &state.busy_operation {
                     ui.separator();
                     ui.spinner();
@@ -1266,13 +1430,13 @@ fn draw_scene_panel(
                 ui,
                 &mut state.scene_tab,
                 &[
-                    (0, "Parts".into(), "Browse, show and hide parts"),
+                    (0, icon_text(icon::TREE_STRUCTURE, "Parts"), "Browse, show and hide parts"),
                     (
                         1,
-                        "Inspect".into(),
+                        icon_text(icon::SLIDERS, "Inspect"),
                         "Section plane, ghosting and measurement",
                     ),
-                    (2, "Saved".into(), "Saved selections and camera views"),
+                    (2, icon_text(icon::BOOKMARK_SIMPLE, "Saved"), "Saved selections and camera views"),
                 ],
             );
             ui.add_space(4.0);
@@ -1419,46 +1583,28 @@ fn scene_parts_tab(
     state: &mut UiState,
     comparing: bool,
 ) {
-    search_field(ui, &mut state.outliner_search, "Search parts…");
     let has_selection = scene.has_any_selection();
     let any_hidden = scene.objects.iter().any(|o| !o.visible);
     ui.horizontal(|ui| {
-        if tool_button(
-            ui,
-            "Show all",
-            any_hidden,
-            "Make every part visible",
-            "Every part is visible",
-        ) {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let w = (ui.available_width() - 3.0 * 36.0).max(60.0);
+        ui.allocate_ui(egui::vec2(w, 32.0), |ui| {
+            search_field(ui, &mut state.outliner_search, "Search parts…");
+        });
+        if icon_button(ui, icon::EYE, if any_hidden { "Show every part" } else { "Every part is visible" }, false, any_hidden).clicked() {
             for o in &mut scene.objects {
                 o.visible = true;
             }
             state.scene_dirty_for_disk = true;
         }
-        if tool_button(
-            ui,
-            "Isolate",
-            has_selection,
-            "Hide everything except the selection",
-            "Select a part first",
-        ) {
+        if icon_button(ui, icon::CUBE_FOCUS, if has_selection { "Isolate · hide everything except the selection" } else { "Select a part to isolate it" }, false, has_selection).clicked() {
             let selected = scene.selected_object;
             for (i, o) in scene.objects.iter_mut().enumerate() {
                 o.visible = selected == Some(i) || !o.mesh.selected_faces.is_empty();
             }
             state.scene_dirty_for_disk = true;
         }
-        if tool_button(
-            ui,
-            if has_selection {
-                "Frame selection"
-            } else {
-                "Frame all"
-            },
-            true,
-            "Fit the camera  ·  F",
-            "",
-        ) {
+        if icon_button(ui, icon::FRAME_CORNERS, if has_selection { "Frame selection  ·  F" } else { "Frame everything  ·  F" }, false, true).clicked() {
             frame_selection(scene, camera);
         }
     });
@@ -1504,6 +1650,7 @@ fn scene_parts_tab(
                             open,
                             obj.visible,
                             selected,
+                            swatch_color(obj),
                         )
                     })
                     .inner;
@@ -1554,11 +1701,11 @@ fn scene_inspect_tab(
         .id_salt("inspect_scroll")
         .show(ui, |ui| {
             eyebrow(ui, "Display");
-            ui.checkbox(&mut renderer.ghost_unselected, "Ghost unselected parts")
+            toggle(ui, &mut renderer.ghost_unselected, "Ghost unselected parts")
                 .on_hover_text("Fade everything except the selection");
             ui.add_space(8.0);
             eyebrow(ui, "Section plane");
-            ui.checkbox(&mut state.clip_enabled, "Cut the model with a plane");
+            toggle(ui, &mut state.clip_enabled, "Cut the model with a plane");
             if state.clip_enabled {
                 ui.horizontal(|ui| {
                     segmented(
@@ -1570,7 +1717,7 @@ fn scene_inspect_tab(
                             (2, "Z".into(), "Cut along Z"),
                         ],
                     );
-                    ui.checkbox(&mut state.clip_flip, "Flip");
+                    toggle(ui, &mut state.clip_flip, "Flip");
                 });
                 ui.add(
                     egui::DragValue::new(&mut state.clip_offset)
@@ -1590,7 +1737,7 @@ fn scene_inspect_tab(
             };
             ui.add_space(8.0);
             eyebrow(ui, "Measure");
-            ui.checkbox(&mut state.measure_active, "Pick measurement points");
+            toggle(ui, &mut state.measure_active, "Pick measurement points");
             ui.label(small_muted(
                 "Two points give a distance; a third gives the angle at the middle point.",
             ));
@@ -1712,6 +1859,32 @@ fn draw_review_panel(
                     });
                 ui.add_space(4.0);
             }
+            let drafts = scene.draft_count();
+            if drafts > 0 && !comparing {
+                card()
+                    .fill(Color32::from_rgb(40, 36, 30))
+                    .stroke(egui::Stroke::new(1.0_f32, WARN.gamma_multiply(0.45)))
+                    .inner_margin(12)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icon::PAPER_PLANE_TILT).size(18.0).color(WARN));
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(semibold(format!("{} ready to send", plural(drafts, "comment", "comments")), 14.0));
+                                ui.label(small_muted("The agent picks them up as one batch."));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if primary(ui, "Send to agent", true) {
+                                    scene.send_drafts();
+                                    state.scene_dirty_for_disk = true;
+                                    state.status_message = format!("Sent {} to the agent", plural(drafts, "comment", "comments"));
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(4.0);
+            }
             if state.review_tab == 0 {
                 comments_tab(ui, scene, state, comparing);
             } else {
@@ -1826,6 +1999,9 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
+        if std::mem::take(&mut state.focus_composer) {
+            draft.request_focus();
+        }
         let submit_key = draft.has_focus()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
         egui::CollapsingHeader::new(RichText::new("Dimensions & constraints").small().color(MUTED))
@@ -1838,12 +2014,88 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
                     f32::INFINITY,
                 );
             });
+        // Reference images for the agent.
+        let mut remove_attachment = None;
+        if !state.draft_attachments.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (i, path) in state.draft_attachments.clone().iter().enumerate() {
+                    let resp = match load_screenshot(ui.ctx(), state, path) {
+                        Ok(t) => ui.add(
+                            egui::Image::new((t.id(), t.size_vec2()))
+                                .max_height(54.0)
+                                .max_width(86.0)
+                                .corner_radius(6)
+                                .sense(egui::Sense::click()),
+                        ),
+                        Err(_) => ui.add(egui::Button::new(RichText::new(icon::IMAGE).size(20.0)).min_size(egui::vec2(54.0, 54.0))),
+                    };
+                    let file = std::path::Path::new(path).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    if resp.on_hover_text(format!("{file}\nClick to remove")).clicked() {
+                        remove_attachment = Some(i);
+                    }
+                }
+            });
+        }
+        if let Some(i) = remove_attachment {
+            state.draft_attachments.remove(i);
+        }
+        if let Some(path) = state.attach_path.as_mut() {
+            let mut add = false;
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 60.0;
+                let r = text_field(ui, path, "/path/to/reference.png", w);
+                add = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                add |= ui.button("Add").clicked();
+            });
+            if add {
+                let p = path.trim().to_string();
+                if !p.is_empty() {
+                    match crate::project::absolute_path(&p) {
+                        Ok(abs) if std::path::Path::new(&abs).is_file() => {
+                            state.draft_attachments.push(abs);
+                            state.attach_path = None;
+                        }
+                        _ => state.last_error = Some(format!("No image at {p}")),
+                    }
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if ui
+                .add(egui::Button::new(RichText::new(icon::CAMERA).size(15.0)).frame(false).min_size(egui::vec2(28.0, 26.0)))
+                .on_hover_text("Attach a snapshot of the current view")
+                .clicked()
+            {
+                let dir = attachments_dir(scene);
+                let _ = std::fs::create_dir_all(&dir);
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let path = dir.join(format!("snapshot-{stamp}.png")).to_string_lossy().into_owned();
+                action(state, "capture_viewport", serde_json::json!({"path": path, "width": 1280, "height": 800}));
+                state.draft_attachments.push(path);
+            }
+            if ui
+                .add(egui::Button::new(RichText::new(icon::PAPERCLIP).size(15.0)).frame(false).min_size(egui::vec2(28.0, 26.0)))
+                .on_hover_text("Attach a reference image by path (or drop image files on the window)")
+                .clicked()
+            {
+                state.attach_path = if state.attach_path.is_some() { None } else { Some(String::new()) };
+            }
+            ui.add_space(6.0);
+            toggle(ui, &mut state.auto_send, "Send immediately").on_hover_text(
+                "On: each comment goes to the agent right away.\nOff: comments wait as drafts until you press Send to agent.",
+            );
+        });
         let enabled = !state.comment_draft.trim().is_empty() && !comparing;
         let mut post: Option<bool> = None; // Some(scene_wide)
         ui.horizontal(|ui| {
+            let verb = if state.auto_send { "Send" } else { "Add" };
             if primary(
                 ui,
-                if sections.is_empty() { "Post scene feedback" } else { "Comment on selection" },
+                &if sections.is_empty() { format!("{verb} scene comment") } else { format!("{verb} comment") },
                 enabled,
             ) || (submit_key && enabled)
             {
@@ -1866,11 +2118,19 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
             if !state.constraint_draft.trim().is_empty() {
                 text.push_str(&format!("\nConstraints: {}", state.constraint_draft.trim()));
             }
-            if scene_wide {
-                scene.add_general_comment(text);
+            let id = if scene_wide {
+                Some(scene.add_general_comment(text).id)
             } else {
-                scene.add_comment_for_selection(text, state.selection_radius);
+                scene.add_comment_for_selection(text, state.selection_radius).map(|c| c.id)
+            };
+            if let Some(c) = id.and_then(|id| scene.comments.iter_mut().find(|c| c.id == id)) {
+                c.draft = true;
+                c.attachments = std::mem::take(&mut state.draft_attachments);
             }
+            if state.auto_send {
+                scene.send_drafts();
+            }
+            state.attach_path = None;
             state.comment_draft.clear();
             state.constraint_draft.clear();
             state.comment_filter = FILTER_ACTIVE;
@@ -1886,6 +2146,7 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
     let review = count(&|c| !c.resolved && c.status == CommentStatus::ReadyForReview);
     let accepted = count(&|c| effective_status(c) == CommentStatus::Accepted);
     let all = scene.comments.len();
+    if all > 0 {
     ui.horizontal(|ui| {
         segmented(
             ui,
@@ -1910,6 +2171,7 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
             ],
         );
     });
+    }
     if all > 3 {
         search_field(ui, &mut state.comment_search, "Search feedback…");
     }
@@ -1922,6 +2184,7 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
     let mut cancel_reply = false;
     let mut post_reply = None;
     let mut open_revision = false;
+    let mut lightbox = None;
     let scroll_target = state.scroll_to_comment.take();
     egui::ScrollArea::vertical()
         .id_salt("feedback_scroll")
@@ -1974,14 +2237,35 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
                                 ui.label(semibold(format!("#{:02}", c.id), 13.0).color(MUTED));
                                 ui.label(small_muted(if c.is_general { "Scene" } else { "Region" }));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    pill(ui, status.label(), comment_status_color(status));
+                                    if c.draft {
+                                        pill(ui, "Draft · not sent", WARN);
+                                    } else {
+                                        pill(ui, status.label(), comment_status_color(status));
+                                    }
                                 });
                             });
                             let rows = if expanded { None } else { Some(5) };
                             let mut elided = clamped_text(ui, &c.comment, 15.0, 22.0, TEXT, rows);
                             if !c.is_general {
                                 let (short, full) = comment_targets(c);
-                                truncated(ui, RichText::new(format!("◎  {short}")).small().color(SUBTLE), &full);
+                                truncated(ui, RichText::new(format!("{}  {short}", icon::CROSSHAIR)).small().color(SUBTLE), &full);
+                            }
+                            if !c.attachments.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    for path in &c.attachments {
+                                        if let Ok(t) = load_screenshot(ui.ctx(), state, path) {
+                                            if ui
+                                                .add(egui::Image::new((t.id(), t.size_vec2())).max_height(48.0).max_width(76.0).corner_radius(5).sense(egui::Sense::click()))
+                                                .on_hover_cursor(egui::CursorIcon::ZoomIn)
+                                                .clicked()
+                                            {
+                                                lightbox = Some(path.clone());
+                                            }
+                                        } else {
+                                            ui.label(RichText::new(icon::IMAGE).color(SUBTLE)).on_hover_text(path);
+                                        }
+                                    }
+                                });
                             }
                             if needs_reattach {
                                 egui::Frame::new()
@@ -2141,6 +2425,9 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
     if open_revision {
         state.review_tab = 1;
     }
+    if lightbox.is_some() {
+        state.lightbox = lightbox;
+    }
     if let Some(id) = toggle_expand {
         if !state.expanded_comments.remove(&id) {
             state.expanded_comments.insert(id);
@@ -2178,16 +2465,14 @@ fn revisions_tab(
 ) {
     use serde_json::json;
     ui.horizontal(|ui| {
-        if ui
-            .checkbox(&mut scene.highlight_changes, "Highlight changed parts")
-            .changed()
-        {
+        if toggle(ui, &mut scene.highlight_changes, "Highlight changed parts").changed() {
             *view_changed = true;
         }
         if comparing {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if primary(ui, "Back to live", true) {
                     scene.preview_revision = None;
+                    state.compare_split = None;
                     *view_changed = true;
                 }
             });
@@ -2259,44 +2544,91 @@ fn revisions_tab(
                                 .on_hover_text(if names.is_empty() { "No parts changed".into() } else { names.join("\n") });
                         }
                         ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.label(small_muted("Compare"));
-                            let mut choice = match previewing {
-                                Some((_, true)) => 1,
-                                Some((_, false)) => 2,
-                                None => 0,
-                            };
-                            if segmented(
-                                ui,
-                                &mut choice,
-                                &[
-                                    (0, "Live".into(), "The current scene"),
-                                    (1, "Before".into(), "Geometry before this revision"),
-                                    (2, "After".into(), "Geometry after this revision"),
-                                ],
-                            ) {
-                                match choice {
-                                    0 => scene.preview_revision = None,
-                                    n => action(state, "preview_revision", json!({"revision_id": rid, "before": n == 1})),
-                                }
-                                *view_changed = true;
-                            }
-                        });
-                        if r.status == RevisionStatus::ReadyForReview {
+                        if r.geometry_pruned {
+                            ui.label(small_muted("History only · older geometry is dropped to keep the project small"));
+                        } else {
                             ui.horizontal(|ui| {
-                                if primary(ui, "Accept revision", true) {
-                                    action(state, "accept_revision", json!({"revision_id": rid}));
-                                    *view_changed = true;
-                                }
-                                if ui
-                                    .button("Revert")
-                                    .on_hover_text("Restore the geometry from before this revision")
-                                    .clicked()
-                                {
-                                    action(state, "revert_revision", json!({"revision_id": rid}));
+                                ui.label(small_muted("Compare"));
+                                let mut choice = match previewing {
+                                    Some(_) if state.compare_split.is_some() => 3,
+                                    Some((_, true)) => 1,
+                                    Some((_, false)) => 2,
+                                    None => 0,
+                                };
+                                if segmented(
+                                    ui,
+                                    &mut choice,
+                                    &[
+                                        (0, "Live".into(), "The current scene"),
+                                        (1, "Before".into(), "Geometry before this revision"),
+                                        (3, icon::SQUARE_HALF.into(), "Split view · drag the divider between before and after"),
+                                        (2, "After".into(), "Geometry after this revision"),
+                                    ],
+                                ) {
+                                    state.compare_split = (choice == 3).then_some(0.5);
+                                    match choice {
+                                        0 => scene.preview_revision = None,
+                                        n => action(state, "preview_revision", json!({"revision_id": rid, "before": n == 1})),
+                                    }
                                     *view_changed = true;
                                 }
                             });
+                        }
+                        if let Some(notes) = &r.change_request {
+                            egui::Frame::new()
+                                .fill(WARN.gamma_multiply(0.08))
+                                .corner_radius(6)
+                                .inner_margin(8)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    eyebrow(ui, "You asked for changes");
+                                    ui.label(RichText::new(notes).size(13.5).color(TEXT));
+                                });
+                        }
+                        if r.status == RevisionStatus::ReadyForReview {
+                            if state.request_changes_for == Some(rid) {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut state.request_notes)
+                                        .hint_text(hint("What should be different? The agent gets this as a reply."))
+                                        .margin(egui::vec2(8.0, 6.0))
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.horizontal(|ui| {
+                                    if primary(ui, "Revert & send notes", !state.request_notes.trim().is_empty()) {
+                                        action(state, "request_changes", json!({"revision_id": rid, "notes": state.request_notes.trim()}));
+                                        state.request_changes_for = None;
+                                        state.request_notes.clear();
+                                        *view_changed = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        state.request_changes_for = None;
+                                    }
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    if primary(ui, &icon_text(icon::CHECK, "Accept"), true) {
+                                        action(state, "accept_revision", json!({"revision_id": rid}));
+                                        *view_changed = true;
+                                    }
+                                    if ui
+                                        .button(icon_text(icon::CHAT_TEXT, "Request changes"))
+                                        .on_hover_text("Revert this revision and tell the agent what to change")
+                                        .clicked()
+                                    {
+                                        state.request_changes_for = Some(rid);
+                                        state.request_notes.clear();
+                                    }
+                                    if ui
+                                        .button(icon::ARROW_U_UP_LEFT)
+                                        .on_hover_text("Revert without notes")
+                                        .clicked()
+                                    {
+                                        action(state, "revert_revision", json!({"revision_id": rid}));
+                                        *view_changed = true;
+                                    }
+                                });
+                            }
                         } else if r.status == RevisionStatus::InProgress
                             && ui
                                 .button("Cancel revision")
@@ -2352,11 +2684,28 @@ fn revisions_tab(
     }
 }
 
+fn attachments_dir(scene: &Scene) -> std::path::PathBuf {
+    match &scene.project_path {
+        Some(p) => {
+            let p = std::path::Path::new(p);
+            let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+            let stem = stem.trim_end_matches(".spatial").to_string();
+            p.parent().unwrap_or(std::path::Path::new(".")).join(format!("{stem}.attachments"))
+        }
+        None => std::path::PathBuf::from("/tmp/rust_modeler_attachments"),
+    }
+}
+
 fn load_screenshot(
     ctx: &egui::Context,
     state: &mut UiState,
     path: &str,
 ) -> Result<egui::TextureHandle, String> {
+    // A snapshot may still be rendering; retry until the file exists.
+    if matches!(state.screenshot_cache.get(path), Some(Err(_))) && !std::path::Path::new(path).exists() {
+        state.screenshot_cache.remove(path);
+        return Err("Not rendered yet".into());
+    }
     state
         .screenshot_cache
         .entry(path.to_owned())
@@ -2384,65 +2733,19 @@ fn draw_viewport(
     view_changed: &mut bool,
 ) {
     use serde_json::json;
+    if scene.preview_revision.is_none() {
+        state.compare_split = None;
+    }
+    renderer.compare_split = state.compare_split;
     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
         state.viewport_rect = ui.max_rect();
         let rect = ui.max_rect();
 
-        // View controls (top-left)
-        egui::Area::new("viewport_controls".into())
-            .fixed_pos(rect.left_top() + egui::vec2(14.0, 14.0))
-            .show(ctx, |ui| {
-                overlay_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        segmented(
-                            ui,
-                            &mut renderer.shading,
-                            &[
-                                (ViewportShading::StudioLit, "Lit".into(), "Materials and studio lighting"),
-                                (ViewportShading::SculptClay, "Clay".into(), "Neutral clay to judge form"),
-                                (ViewportShading::WireframeOnly, "Wire".into(), "Wireframe only"),
-                            ],
-                        );
-                        ui.checkbox(&mut renderer.show_wireframe_overlay, "Edges");
-                        ui.checkbox(&mut renderer.show_grid, "Grid");
-                        if ui
-                            .selectable_label(state.fly_active, "Fly")
-                            .on_hover_text("Free-fly camera  ·  `  (backtick)\nWASD move · Q/E down/up · mouse look · Shift fast · Esc exits")
-                            .clicked()
-                        {
-                            state.fly_toggle_requested = true;
-                        }
-                        ui.menu_button(if camera.orthographic { "Ortho  ▾" } else { "Persp  ▾" }, |ui| {
-                            ui.set_min_width(170.0);
-                            if ui.button("Front").clicked() {
-                                camera.set_view_front();
-                                ui.close_menu();
-                            }
-                            if ui.button("Right").clicked() {
-                                camera.set_view_right();
-                                ui.close_menu();
-                            }
-                            if ui.button("Top").clicked() {
-                                camera.set_view_top();
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            ui.checkbox(&mut camera.orthographic, "Orthographic");
-                            ui.separator();
-                            if ui.button("Frame selection   F").clicked() {
-                                frame_selection(scene, camera);
-                                ui.close_menu();
-                            }
-                            if ui.button("Frame all").clicked() {
-                                frame_all(scene, camera);
-                                ui.close_menu();
-                            }
-                        })
-                        .response
-                        .on_hover_text("Camera views and projection");
-                    });
-                });
-            });
+        viewport_tool_strip(ctx, rect, scene, camera, state, comparing);
+        viewport_context_bar(ctx, rect, state, comparing);
+        viewport_view_controls(ctx, rect, scene, camera, renderer, state);
+        viewport_axis_gizmo(ctx, rect, camera);
+        viewport_selection_chip(ctx, rect, scene, state, comparing);
 
         // Comparison banner (top-centre)
         let mut top = rect.top() + 14.0;
@@ -2471,23 +2774,66 @@ fn draw_viewport(
                                     truncated(ui, semibold(&label, 14.0), &label);
                                 });
                                 ui.add_space(8.0);
-                                let mut choice = before;
+                                let mut choice = match (state.compare_split.is_some(), before) {
+                                    (true, _) => 1,
+                                    (false, true) => 0,
+                                    (false, false) => 2,
+                                };
                                 if segmented(
                                     ui,
                                     &mut choice,
-                                    &[(true, "Before".into(), ""), (false, "After".into(), "")],
+                                    &[
+                                        (0, "Before".into(), "Geometry before the revision"),
+                                        (1, icon_text(icon::SQUARE_HALF, "Split"), "Drag the divider to wipe between before and after"),
+                                        (2, "After".into(), "Geometry after the revision"),
+                                    ],
                                 ) {
-                                    action(state, "preview_revision", json!({"revision_id": rid, "before": choice}));
+                                    state.compare_split = (choice == 1).then_some(0.5);
+                                    if choice != 1 {
+                                        action(state, "preview_revision", json!({"revision_id": rid, "before": choice == 0}));
+                                    }
                                     *view_changed = true;
                                 }
                                 if primary(ui, "Back to live", true) {
                                     scene.preview_revision = None;
+                                    state.compare_split = None;
                                     *view_changed = true;
                                 }
                             });
                         });
                 });
             top = resp.response.rect.bottom() + 8.0;
+            if let Some(split) = state.compare_split {
+                // Wipe divider: drag to reveal before (left) and after (right).
+                let x = rect.left() + rect.width() * split;
+                let handle = egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(28.0, rect.height()));
+                let drag = ui.interact(handle, egui::Id::new("compare_split"), egui::Sense::drag());
+                if drag.dragged() {
+                    if let Some(p) = drag.interact_pointer_pos() {
+                        state.compare_split = Some(((p.x - rect.left()) / rect.width()).clamp(0.02, 0.98));
+                    }
+                }
+                let painter = ui.painter().with_clip_rect(rect);
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(2.0_f32, Color32::from_white_alpha(220)),
+                );
+                let knob = egui::pos2(x, rect.center().y);
+                painter.circle(knob, 15.0, OVERLAY, egui::Stroke::new(1.5_f32, Color32::WHITE));
+                painter.text(knob, egui::Align2::CENTER_CENTER, icon::ARROWS_OUT_LINE_HORIZONTAL, FontId::proportional(15.0), TEXT);
+                for (text, pos, align) in [
+                    ("BEFORE", egui::pos2(x - 12.0, rect.bottom() - 60.0), egui::Align2::RIGHT_BOTTOM),
+                    ("AFTER", egui::pos2(x + 12.0, rect.bottom() - 60.0), egui::Align2::LEFT_BOTTOM),
+                ] {
+                    let g = painter.layout_no_wrap(text.into(), medium_font(11.5), TEXT);
+                    let r = align.anchor_size(pos, g.size()).expand2(egui::vec2(8.0, 4.0));
+                    painter.rect_filled(r, 6, OVERLAY);
+                    painter.galley(r.min + egui::vec2(8.0, 4.0), g, TEXT);
+                }
+                if drag.hovered() || drag.dragged() {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+            }
         } else {
             top += 50.0;
         }
@@ -2624,30 +2970,669 @@ fn draw_viewport(
             }
             .to_string()
         };
+        let chip_visible = !comparing && !state.fly_active && scene.has_any_selection();
+        if !chip_visible || state.measure_active || state.select_mode.is_drag() {
         egui::Area::new("viewport_hint".into())
             .pivot(egui::Align2::LEFT_BOTTOM)
-            .fixed_pos(egui::pos2(rect.left() + 14.0, rect.bottom() - 14.0))
+            .fixed_pos(egui::pos2(rect.left() + 66.0, rect.bottom() - 12.0))
             .show(ctx, |ui| {
-                overlay_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(RichText::new(mode_hint).small().color(TEXT));
-                            if !state.fly_active {
-                                ui.label(small_muted("Middle-drag or Alt+drag orbit · Right-drag pan · Scroll zoom · F frame · ` fly"));
-                            }
+                ui.set_max_width((rect.width() - 220.0).max(200.0));
+                egui::Frame::new()
+                    .fill(OVERLAY)
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(RichText::new(icon::INFO).size(13.0).color(SUBTLE));
+                            ui.add(egui::Label::new(RichText::new(mode_hint).small().color(MUTED)).truncate())
+                                .on_hover_text("Middle-drag or Alt+drag orbit · Right-drag pan · Scroll zoom · F frame · ` fly");
                         });
-                        if ui
-                            .add(egui::Button::new(RichText::new("?").strong()).min_size(egui::vec2(28.0, 28.0)))
-                            .on_hover_text("Keyboard shortcuts  ·  F1")
+                    });
+            });
+        }
+    });
+}
+
+fn mode_icon(mode: SmartSelectMode) -> &'static str {
+    match mode {
+        SmartSelectMode::SubPart => icon::CUBE,
+        SmartSelectMode::SmartSurface => icon::POLYGON,
+        SmartSelectMode::WholeLayer => icon::STACK,
+        SmartSelectMode::Brush => icon::PAINT_BRUSH,
+        SmartSelectMode::Box => icon::SELECTION,
+    }
+}
+
+/// Vertical tool strip on the viewport's left edge.
+fn viewport_tool_strip(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    scene: &Scene,
+    camera: &mut OrbitCamera,
+    state: &mut UiState,
+    comparing: bool,
+) {
+    egui::Area::new("viewport_tools".into())
+        .fixed_pos(rect.left_top() + egui::vec2(12.0, 12.0))
+        .show(ctx, |ui| {
+            overlay_frame()
+                .inner_margin(egui::Margin::same(4))
+                .corner_radius(11)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.vertical(|ui| {
+                        for (key, mode, what) in [
+                            ("1", SmartSelectMode::SubPart, "Click selects one connected piece"),
+                            ("2", SmartSelectMode::SmartSurface, "Click selects a surface bounded by sharp edges"),
+                            ("3", SmartSelectMode::WholeLayer, "Click selects the entire object"),
+                            ("4", SmartSelectMode::Brush, "Drag to paint a selection; Ctrl+drag erases"),
+                            ("5", SmartSelectMode::Box, "Drag rectangles over the places to change; Shift adds, Ctrl removes  ·  Ctrl+C"),
+                        ] {
+                            let selected = state.select_mode == mode && !state.measure_active;
+                            if icon_button(
+                                ui,
+                                mode_icon(mode),
+                                &format!("{} select  ·  {key}\n{what}", mode.label()),
+                                selected,
+                                !comparing,
+                            )
                             .clicked()
+                            {
+                                if mode == SmartSelectMode::Box && state.select_mode != SmartSelectMode::Box {
+                                    state.prev_select_mode = state.select_mode;
+                                }
+                                state.select_mode = mode;
+                                state.hover_preview_seed_face = None;
+                                state.measure_active = false;
+                            }
+                        }
+                        hdivider(ui);
+                        if icon_button(ui, icon::RULER, "Measure distances and angles", state.measure_active, !comparing).clicked() {
+                            state.measure_active = !state.measure_active;
+                        }
+                        if icon_button(
+                            ui,
+                            icon::AIRPLANE_TILT,
+                            "Fly  ·  ` (backtick)\nWASD move · Q/E down/up · mouse look · Esc exits",
+                            state.fly_active,
+                            true,
+                        )
+                        .clicked()
                         {
+                            state.fly_toggle_requested = true;
+                        }
+                        hdivider(ui);
+                        let has_sel = scene.has_any_selection();
+                        if icon_button(
+                            ui,
+                            icon::FRAME_CORNERS,
+                            if has_sel { "Frame selection  ·  F" } else { "Frame everything  ·  F" },
+                            false,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            frame_selection(scene, camera);
+                        }
+                        if icon_button(ui, icon::KEYBOARD, "Keyboard shortcuts  ·  F1", state.show_shortcuts, true).clicked() {
                             state.show_shortcuts = !state.show_shortcuts;
                         }
                     });
                 });
-            });
+        });
+}
+
+/// Options for the active selection tool, top-left of the viewport.
+fn viewport_context_bar(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    state: &mut UiState,
+    comparing: bool,
+) {
+    if comparing || state.fly_active {
+        return;
+    }
+    egui::Area::new("viewport_context".into())
+        .fixed_pos(rect.left_top() + egui::vec2(66.0, 12.0))
+        .show(ctx, |ui| {
+            overlay_frame()
+                .inner_margin(egui::Margin::symmetric(10, 5))
+                .corner_radius(11)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let (glyph, label) = if state.measure_active {
+                            (icon::RULER, "Measure")
+                        } else {
+                            (mode_icon(state.select_mode), state.select_mode.label())
+                        };
+                        ui.label(RichText::new(glyph).size(15.0).color(ACCENT));
+                        ui.label(semibold(label, 13.5));
+                        if !state.measure_active {
+                            match state.select_mode {
+                                SmartSelectMode::SmartSurface => {
+                                    vdivider(ui);
+                                    ui.label(small_muted("Crease"));
+                                    ui.spacing_mut().slider_width = 90.0;
+                                    if ui
+                                        .add(egui::Slider::new(&mut state.crease_angle_deg, 5.0..=85.0).suffix("°"))
+                                        .on_hover_text("Edges sharper than this angle stop the surface fill")
+                                        .changed()
+                                    {
+                                        state.hover_preview_seed_face = None;
+                                    }
+                                }
+                                SmartSelectMode::Brush => {
+                                    vdivider(ui);
+                                    ui.label(small_muted("Radius"));
+                                    ui.spacing_mut().slider_width = 90.0;
+                                    ui.add(egui::Slider::new(&mut state.selection_radius, 0.05..=2.5))
+                                        .on_hover_text("Brush radius  ·  [ and ] adjust");
+                                    state.sculpt.radius = state.selection_radius;
+                                }
+                                SmartSelectMode::Box => {
+                                    vdivider(ui);
+                                    toggle(ui, &mut state.box_through, "Through")
+                                        .on_hover_text("Also pick faces hidden behind other geometry inside the box");
+                                }
+                                _ => {}
+                            }
+                            vdivider(ui);
+                            toggle(ui, &mut state.multi_select, "Add")
+                                .on_hover_text("Multi-select: each click adds to the selection; click a selected region to remove it.\nOff: Shift+click adds, Ctrl+click removes.");
+                        }
+                    });
+                });
+        });
+}
+
+/// Floating selection summary with grow / shrink / clear, bottom-centre of the viewport.
+fn viewport_selection_chip(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    scene: &mut Scene,
+    state: &mut UiState,
+    comparing: bool,
+) {
+    if comparing || state.fly_active || !scene.has_any_selection() {
+        return;
+    }
+    let Some(summary) = selection_summary(scene) else {
+        return;
+    };
+    egui::Area::new("viewport_selection".into())
+        .pivot(egui::Align2::CENTER_BOTTOM)
+        .fixed_pos(egui::pos2(rect.center().x, rect.bottom() - 14.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(OVERLAY)
+                .stroke(egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.45)))
+                .corner_radius(20)
+                .inner_margin(egui::Margin { left: 14, right: 6, top: 4, bottom: 4 })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(RichText::new(icon::SELECTION_ALL).size(14.0).color(ACCENT));
+                        ui.add_space(2.0);
+                        let short: String = if summary.chars().count() > 56 {
+                            summary.chars().take(55).collect::<String>() + "…"
+                        } else {
+                            summary.clone()
+                        };
+                        ui.label(RichText::new(short).size(13.0).color(TEXT)).on_hover_text(&summary);
+                        ui.add_space(6.0);
+                        let has_faces = scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty());
+                        let small = |ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool| {
+                            ui.add_enabled(
+                                enabled,
+                                egui::Button::new(RichText::new(glyph).size(16.0))
+                                    .frame(false)
+                                    .min_size(egui::vec2(28.0, 28.0)),
+                            )
+                            .on_hover_text(tip)
+                            .on_disabled_hover_text("Select faces (Part, Surface, Brush or Box) to grow or shrink")
+                            .clicked()
+                        };
+                        if small(ui, icon::PLUS_CIRCLE, "Grow selection by one ring  ·  ]", has_faces) {
+                            for o in &mut scene.objects {
+                                if !o.mesh.selected_faces.is_empty() {
+                                    o.mesh.grow_selection();
+                                }
+                            }
+                            update_pending_anchor_from_selection(scene);
+                            state.scene_dirty_for_disk = true;
+                        }
+                        if small(ui, icon::MINUS_CIRCLE, "Shrink selection by one ring  ·  [", has_faces) {
+                            for o in &mut scene.objects {
+                                if !o.mesh.selected_faces.is_empty() {
+                                    o.mesh.shrink_selection();
+                                }
+                            }
+                            update_pending_anchor_from_selection(scene);
+                            state.scene_dirty_for_disk = true;
+                        }
+                        if small(ui, icon::CHAT_CIRCLE_TEXT, "Write a comment about this selection", true) {
+                            state.review_tab = 0;
+                            state.focus_composer = true;
+                        }
+                        if small(ui, icon::X_CIRCLE, "Clear selection  ·  Esc", true) {
+                            scene.clear_all_selections();
+                            scene.selected_object = None;
+                            state.scene_dirty_for_disk = true;
+                        }
+                    });
+                });
+        });
+}
+
+/// Shading, overlays and camera menu, top-right of the viewport.
+fn viewport_view_controls(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    scene: &mut Scene,
+    camera: &mut OrbitCamera,
+    renderer: &mut Renderer3D,
+    state: &mut UiState,
+) {
+    egui::Area::new("viewport_view".into())
+        .pivot(egui::Align2::RIGHT_TOP)
+        .fixed_pos(rect.right_top() + egui::vec2(-12.0, 12.0))
+        .show(ctx, |ui| {
+            overlay_frame()
+                .inner_margin(egui::Margin::same(4))
+                .corner_radius(11)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (mode, glyph, tip) in [
+                            (ViewportShading::StudioLit, icon::SUN, "Lit · materials and studio lighting"),
+                            (ViewportShading::SculptClay, icon::SPHERE, "Clay · neutral material to judge form"),
+                            (ViewportShading::WireframeOnly, icon::CUBE_TRANSPARENT, "Wireframe only"),
+                        ] {
+                            if icon_button(ui, glyph, tip, renderer.shading == mode, true).clicked() {
+                                renderer.shading = mode;
+                            }
+                        }
+                        vdivider(ui);
+                        if icon_button(ui, icon::POLYGON, "Show edges", renderer.show_wireframe_overlay, true).clicked() {
+                            renderer.show_wireframe_overlay = !renderer.show_wireframe_overlay;
+                        }
+                        if icon_button(ui, icon::GRID_FOUR, "Ground grid and contact shadow", renderer.show_grid, true).clicked() {
+                            renderer.show_grid = !renderer.show_grid;
+                        }
+                        if icon_button(ui, icon::GHOST, "Ghost everything except the selection", renderer.ghost_unselected, true).clicked() {
+                            renderer.ghost_unselected = !renderer.ghost_unselected;
+                        }
+                        if icon_button(ui, icon::KNIFE, "Section plane · cut the model to see inside", state.clip_enabled, true).clicked() {
+                            state.clip_enabled = !state.clip_enabled;
+                            if state.clip_enabled {
+                                state.scene_tab = 1;
+                            }
+                        }
+                        vdivider(ui);
+                        ui.menu_button(
+                            RichText::new(format!(
+                                "{}  {}",
+                                if camera.orthographic { "Ortho" } else { "Persp" },
+                                icon::CARET_DOWN
+                            ))
+                            .size(13.0),
+                            |ui| {
+                                ui.set_min_width(190.0);
+                                for (name, f) in [
+                                    ("Front", OrbitCamera::set_view_front as fn(&mut OrbitCamera)),
+                                    ("Right", OrbitCamera::set_view_right),
+                                    ("Top", OrbitCamera::set_view_top),
+                                ] {
+                                    if ui.button(name).clicked() {
+                                        f(camera);
+                                        ui.close_menu();
+                                    }
+                                }
+                                ui.separator();
+                                toggle(ui, &mut camera.orthographic, "Orthographic");
+                                ui.separator();
+                                if ui.add(egui::Button::new("Frame selection").shortcut_text("F")).clicked() {
+                                    frame_selection(scene, camera);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Frame all").clicked() {
+                                    frame_all(scene, camera);
+                                    ui.close_menu();
+                                }
+                            },
+                        )
+                        .response
+                        .on_hover_text("Camera views and projection");
+                    });
+                });
+        });
+}
+
+/// Orientation gizmo; click an axis to look along it.
+fn viewport_axis_gizmo(ctx: &egui::Context, rect: egui::Rect, camera: &mut OrbitCamera) {
+    let radius = 34.0;
+    let center = rect.right_bottom() + egui::vec2(-radius - 22.0, -radius - 22.0);
+    let area = egui::Rect::from_center_size(center, egui::vec2(radius * 2.0 + 24.0, radius * 2.0 + 24.0));
+    egui::Area::new("axis_gizmo".into())
+        .fixed_pos(area.min)
+        .show(ctx, |ui| {
+            let (r, bg) = ui.allocate_exact_size(area.size(), egui::Sense::hover());
+            let p = ui.painter();
+            if bg.hovered() {
+                p.circle_filled(center, radius + 12.0, OVERLAY);
+            }
+            let view = camera.view_matrix();
+            let mut axes: Vec<(Vec3, Color32, &str, f32, f32, f32)> = Vec::new();
+            for (dir, color, label, yaw, pitch) in [
+                (Vec3::X, Color32::from_rgb(236, 92, 104), "X", std::f32::consts::FRAC_PI_2, 0.0),
+                (Vec3::Y, Color32::from_rgb(132, 214, 96), "Y", 0.0, std::f32::consts::FRAC_PI_2 - 0.021),
+                (Vec3::Z, Color32::from_rgb(92, 150, 240), "Z", 0.0, 0.0),
+                (-Vec3::X, Color32::from_rgb(236, 92, 104), "", -std::f32::consts::FRAC_PI_2, 0.0),
+                (-Vec3::Y, Color32::from_rgb(132, 214, 96), "", 0.0, -(std::f32::consts::FRAC_PI_2 - 0.021)),
+                (-Vec3::Z, Color32::from_rgb(92, 150, 240), "", std::f32::consts::PI, 0.0),
+            ] {
+                let v = view.transform_vector3(dir);
+                axes.push((v, color, label, yaw, pitch, v.z));
+            }
+            // Far axes first so near ones draw on top.
+            axes.sort_by(|a, b| a.5.total_cmp(&b.5));
+            let mut clicked = None;
+            for (i, (v, color, label, yaw, pitch, _)) in axes.iter().enumerate() {
+                let tip = center + egui::vec2(v.x, -v.y) * radius;
+                let positive = !label.is_empty();
+                if positive {
+                    p.line_segment([center, tip], egui::Stroke::new(2.0_f32, *color));
+                }
+                let knob = if positive { 9.0 } else { 6.5 };
+                let resp = ui.interact(
+                    egui::Rect::from_center_size(tip, egui::vec2(knob * 2.0, knob * 2.0)),
+                    ui.id().with(("axis", i)),
+                    egui::Sense::click(),
+                );
+                let fill = if positive { *color } else { color.gamma_multiply(0.35) };
+                p.circle(tip, knob, fill, egui::Stroke::new(if resp.hovered() { 1.5_f32 } else { 0.0 }, Color32::WHITE));
+                if positive {
+                    p.text(tip, egui::Align2::CENTER_CENTER, *label, medium_font(11.0), Color32::from_rgb(16, 18, 24));
+                }
+                if resp.clicked() {
+                    clicked = Some((*yaw, *pitch));
+                }
+                resp.on_hover_text("Look along this axis");
+            }
+            if let Some((yaw, pitch)) = clicked {
+                camera.yaw = yaw;
+                camera.pitch = pitch;
+            }
+            let _ = r;
+        });
+}
+
+#[derive(Clone, Copy)]
+enum Cmd {
+    Mode(SmartSelectMode),
+    Measure,
+    Fly,
+    FrameSelection,
+    FrameAll,
+    ViewFront,
+    ViewRight,
+    ViewTop,
+    Ortho,
+    Shading(ViewportShading),
+    Edges,
+    Grid,
+    Ghost,
+    Section,
+    Undo,
+    Redo,
+    Save,
+    SaveAs,
+    Open,
+    New,
+    Recover,
+    Export,
+    SendDrafts,
+    AutoSend,
+    Comment,
+    CommentsTab,
+    RevisionsTab,
+    BackToLive,
+    ClearSelection,
+    Shortcuts,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_command_palette(
+    ctx: &egui::Context,
+    scene: &mut Scene,
+    camera: &mut OrbitCamera,
+    renderer: &mut Renderer3D,
+    history: &UndoHistory,
+    state: &mut UiState,
+    comparing: bool,
+    in_progress: bool,
+) {
+    use serde_json::json;
+    if !state.palette_open {
+        return;
+    }
+    let drafts = scene.draft_count();
+    let editable = !comparing && !in_progress;
+    let mut commands: Vec<(&str, String, &str, bool, Cmd)> = vec![
+        (icon::CUBE, "Select: Part".into(), "1", !comparing, Cmd::Mode(SmartSelectMode::SubPart)),
+        (icon::POLYGON, "Select: Surface".into(), "2", !comparing, Cmd::Mode(SmartSelectMode::SmartSurface)),
+        (icon::STACK, "Select: Layer (whole object)".into(), "3", !comparing, Cmd::Mode(SmartSelectMode::WholeLayer)),
+        (icon::PAINT_BRUSH, "Select: Brush".into(), "4", !comparing, Cmd::Mode(SmartSelectMode::Brush)),
+        (icon::SELECTION, "Select: Box".into(), "5", !comparing, Cmd::Mode(SmartSelectMode::Box)),
+        (icon::X_CIRCLE, "Clear selection".into(), "Esc", scene.has_any_selection(), Cmd::ClearSelection),
+        (icon::CHAT_CIRCLE_TEXT, "Comment on selection".into(), "", !comparing, Cmd::Comment),
+        (icon::PAPER_PLANE_TILT, format!("Send {} to the agent", plural(drafts, "draft", "drafts")), "", drafts > 0, Cmd::SendDrafts),
+        (icon::LIGHTNING, format!("Send comments immediately: {}", if state.auto_send { "on → off" } else { "off → on" }), "", true, Cmd::AutoSend),
+        (icon::CHAT_TEXT, "Show comments".into(), "", true, Cmd::CommentsTab),
+        (icon::GIT_DIFF, "Show revisions".into(), "", true, Cmd::RevisionsTab),
+        (icon::ARROW_LEFT, "Back to live scene".into(), "", comparing, Cmd::BackToLive),
+        (icon::RULER, "Measure".into(), "", !comparing, Cmd::Measure),
+        (icon::AIRPLANE_TILT, "Fly mode".into(), "`", true, Cmd::Fly),
+        (icon::FRAME_CORNERS, "Frame selection".into(), "F", true, Cmd::FrameSelection),
+        (icon::CORNERS_OUT, "Frame all".into(), "", true, Cmd::FrameAll),
+        (icon::CUBE, "View: Front".into(), "", true, Cmd::ViewFront),
+        (icon::CUBE, "View: Right".into(), "", true, Cmd::ViewRight),
+        (icon::CUBE, "View: Top".into(), "", true, Cmd::ViewTop),
+        (icon::PERSPECTIVE, "Toggle orthographic camera".into(), "", true, Cmd::Ortho),
+        (icon::SUN, "Shading: Lit".into(), "", true, Cmd::Shading(ViewportShading::StudioLit)),
+        (icon::SPHERE, "Shading: Clay".into(), "", true, Cmd::Shading(ViewportShading::SculptClay)),
+        (icon::CUBE_TRANSPARENT, "Shading: Wireframe".into(), "", true, Cmd::Shading(ViewportShading::WireframeOnly)),
+        (icon::POLYGON, "Toggle edges".into(), "", true, Cmd::Edges),
+        (icon::GRID_FOUR, "Toggle grid and shadow".into(), "", true, Cmd::Grid),
+        (icon::GHOST, "Toggle ghosting".into(), "", true, Cmd::Ghost),
+        (icon::KNIFE, "Toggle section plane".into(), "", true, Cmd::Section),
+        (icon::ARROW_COUNTER_CLOCKWISE, "Undo".into(), "Ctrl+Z", history.can_undo() && editable, Cmd::Undo),
+        (icon::ARROW_CLOCKWISE, "Redo".into(), "Ctrl+Shift+Z", history.can_redo() && editable, Cmd::Redo),
+        (icon::FLOPPY_DISK, "Save project".into(), "Ctrl+S", !comparing, Cmd::Save),
+        (icon::FLOPPY_DISK, "Save project as…".into(), "", true, Cmd::SaveAs),
+        (icon::FOLDER_OPEN, "Open project…".into(), "", true, Cmd::Open),
+        (icon::FILE_PLUS, "New project…".into(), "Ctrl+N", !comparing, Cmd::New),
+        (icon::CLOCK_COUNTER_CLOCKWISE, "Recover autosave…".into(), "", true, Cmd::Recover),
+        (icon::EXPORT, "Export model…".into(), "", true, Cmd::Export),
+        (icon::KEYBOARD, "Keyboard shortcuts".into(), "F1", true, Cmd::Shortcuts),
+    ];
+    let query = state.palette_query.to_lowercase();
+    commands.retain(|(_, label, _, enabled, _)| {
+        *enabled && query.split_whitespace().all(|w| label.to_lowercase().contains(w))
     });
+    let count = commands.len();
+    if count > 0 {
+        state.palette_index = state.palette_index.min(count - 1);
+    }
+    let (up, down, enter, escape) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+        )
+    });
+    if escape {
+        state.palette_open = false;
+        return;
+    }
+    if down && count > 0 {
+        state.palette_index = (state.palette_index + 1) % count;
+    }
+    if up && count > 0 {
+        state.palette_index = (state.palette_index + count - 1) % count;
+    }
+    let mut run = enter.then(|| commands.get(state.palette_index).map(|c| c.4)).flatten();
+
+    let screen = ctx.screen_rect();
+    // Dim the app behind the palette; clicking outside closes it.
+    let backdrop = egui::Area::new("palette_backdrop".into())
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let (r, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            ui.painter().rect_filled(r, 0, Color32::from_black_alpha(110));
+            resp.clicked()
+        })
+        .inner;
+    egui::Area::new("command_palette".into())
+        .order(egui::Order::Tooltip)
+        .pivot(egui::Align2::CENTER_TOP)
+        .fixed_pos(egui::pos2(screen.center().x, screen.top() + 90.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(CARD)
+                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(54, 66, 84)))
+                .corner_radius(14)
+                .shadow(ctx.style().visuals.window_shadow)
+                .inner_margin(8)
+                .show(ui, |ui| {
+                    ui.set_width(560.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(17.0).color(SUBTLE));
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut state.palette_query)
+                                .hint_text(hint("Type a command…"))
+                                .frame(false)
+                                .font(FontId::proportional(16.0))
+                                .desired_width(f32::INFINITY)
+                                .margin(egui::vec2(4.0, 8.0)),
+                        );
+                        r.request_focus();
+                        if r.changed() {
+                            state.palette_index = 0;
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        if commands.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(small_muted("  No matching commands"));
+                            ui.add_space(8.0);
+                        }
+                        for (i, (glyph, label, keys, _, cmd)) in commands.iter().enumerate() {
+                            let active = i == state.palette_index;
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+                            if resp.hovered() && ui.input(|i| i.pointer.delta().length_sq() > 0.0) {
+                                state.palette_index = i;
+                            }
+                            let p = ui.painter();
+                            if active {
+                                p.rect_filled(rect, 8, SELECTED_ROW);
+                                if up || down {
+                                    ui.scroll_to_rect(rect, None);
+                                }
+                            }
+                            p.text(rect.left_center() + egui::vec2(14.0, 0.0), egui::Align2::LEFT_CENTER, *glyph, FontId::proportional(16.0), if active { ACCENT } else { MUTED });
+                            p.text(rect.left_center() + egui::vec2(42.0, 0.0), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.5), TEXT);
+                            if !keys.is_empty() {
+                                p.text(rect.right_center() - egui::vec2(12.0, 0.0), egui::Align2::RIGHT_CENTER, *keys, medium_font(12.0), SUBTLE);
+                            }
+                            if resp.clicked() {
+                                run = Some(*cmd);
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(small_muted("↑↓ move   ·   Enter run   ·   Esc close"));
+                    });
+                });
+        });
+    if backdrop && run.is_none() {
+        state.palette_open = false;
+    }
+    let Some(cmd) = run else { return };
+    state.palette_open = false;
+    match cmd {
+        Cmd::Mode(m) => {
+            if m == SmartSelectMode::Box && state.select_mode != SmartSelectMode::Box {
+                state.prev_select_mode = state.select_mode;
+            }
+            state.select_mode = m;
+            state.measure_active = false;
+            state.hover_preview_seed_face = None;
+        }
+        Cmd::Measure => state.measure_active = !state.measure_active,
+        Cmd::Fly => state.fly_toggle_requested = true,
+        Cmd::FrameSelection => frame_selection(scene, camera),
+        Cmd::FrameAll => frame_all(scene, camera),
+        Cmd::ViewFront => camera.set_view_front(),
+        Cmd::ViewRight => camera.set_view_right(),
+        Cmd::ViewTop => camera.set_view_top(),
+        Cmd::Ortho => camera.orthographic = !camera.orthographic,
+        Cmd::Shading(s) => renderer.shading = s,
+        Cmd::Edges => renderer.show_wireframe_overlay = !renderer.show_wireframe_overlay,
+        Cmd::Grid => renderer.show_grid = !renderer.show_grid,
+        Cmd::Ghost => renderer.ghost_unselected = !renderer.ghost_unselected,
+        Cmd::Section => {
+            state.clip_enabled = !state.clip_enabled;
+            state.scene_tab = 1;
+        }
+        Cmd::Undo => action(state, "undo", json!({})),
+        Cmd::Redo => action(state, "redo", json!({})),
+        Cmd::Save => {
+            if scene.project_path.is_some() {
+                action(state, "save_project", json!({}));
+            } else {
+                state.project_dialog = Some("save".into());
+            }
+        }
+        Cmd::SaveAs => state.project_dialog = Some("save".into()),
+        Cmd::Open => state.project_dialog = Some("open".into()),
+        Cmd::New => state.confirm_new_project = true,
+        Cmd::Recover => state.project_dialog = Some("recover".into()),
+        Cmd::Export => state.show_io_modal = true,
+        Cmd::SendDrafts => {
+            let n = scene.send_drafts();
+            state.scene_dirty_for_disk = true;
+            state.status_message = format!("Sent {} to the agent", plural(n, "comment", "comments"));
+        }
+        Cmd::AutoSend => state.auto_send = !state.auto_send,
+        Cmd::Comment => {
+            state.review_tab = 0;
+            state.focus_composer = true;
+        }
+        Cmd::CommentsTab => state.review_tab = 0,
+        Cmd::RevisionsTab => state.review_tab = 1,
+        Cmd::BackToLive => {
+            scene.preview_revision = None;
+            state.compare_split = None;
+            scene.invalidate_mesh_caches();
+            renderer.invalidate_cache();
+        }
+        Cmd::ClearSelection => {
+            scene.clear_all_selections();
+            scene.selected_object = None;
+            state.scene_dirty_for_disk = true;
+        }
+        Cmd::Shortcuts => state.show_shortcuts = true,
+    }
 }
 
 fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
@@ -2867,11 +3852,13 @@ fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
                     (
                         "Project",
                         &[
+                            ("Ctrl + K", "Command palette"),
                             ("Ctrl + N", "New project"),
                             ("Ctrl + S", "Save project"),
                             ("Ctrl + Z", "Undo"),
                             ("Ctrl + Shift + Z", "Redo"),
-                            ("Ctrl + Enter", "Post comment or reply"),
+                            ("Ctrl + Enter", "Add comment or post reply"),
+                            ("Drop images", "Attach references to your next comment"),
                             ("F1  or  ?", "Toggle this panel"),
                         ][..],
                     ),

@@ -9,7 +9,7 @@ Please read [`AGENTS.md`](AGENTS.md) for the complete architectural documentatio
   cargo build
   ```
 - **Inspect Open User Comments & Scene State**:
-  Use the `rust-modeler` MCP tools (`get_comments`, `get_scene_info`, `select_comment_region`, `edit_mesh`, `sculpt_stroke`, `voxel_brush`, `set_material`, `capture_viewport`, `resolve_comment`) configured in [`.mcp.json`](.mcp.json), or invoke via CLI:
+  Use the `rust-modeler` MCP tools (`wait_for_feedback`, `get_comments`, `get_scene_info`, `select_comment_region`, `begin_revision`, `edit_mesh`, `boolean`, `add_lathe`, `add_sweep`, `mirror_object`, `array_object`, `sculpt_stroke`, `voxel_brush`, `set_material`, `capture_viewport`, `capture_studio`, `finish_revision`) configured in [`.mcp.json`](.mcp.json), or invoke via CLI:
   ```bash
   ./target/debug/rust_modeler --cmd '{"tool":"get_comments","args":{}}'
   ./target/debug/rust_modeler --cmd '{"tool":"get_scene_info","args":{}}'

@@ -249,6 +249,11 @@ pub fn is_geometry_tool(tool: &str) -> bool {
             | "voxel_brush"
             | "voxel_remesh"
             | "import_model"
+            | "mirror_object"
+            | "array_object"
+            | "add_lathe"
+            | "add_sweep"
+            | "boolean"
     )
 }
 
@@ -274,7 +279,13 @@ fn reset_project_ui(ui_state: &mut UiState) {
 pub fn is_read_only(tool: &str) -> bool {
     matches!(
         tool,
-        "get_scene_info" | "get_comments" | "get_revisions" | "capture_viewport" | "capture_studio"
+        "get_scene_info"
+            | "get_comments"
+            | "get_revisions"
+            | "capture_viewport"
+            | "capture_studio"
+            | "get_feedback_state"
+            | "wait_for_feedback"
     )
 }
 
@@ -717,6 +728,209 @@ fn dispatch(
             }
         }
 
+        "mirror_object" => {
+            let Some(idx) = resolve_object_index(scene, args) else {
+                return IpcResponse::error("No matching or active object found");
+            };
+            let axis = match crate::modeling::axis_index(
+                args.get("axis").and_then(|v| v.as_str()).unwrap_or("x"),
+            ) {
+                Ok(a) => a,
+                Err(e) => return IpcResponse::error(e),
+            };
+            let merge = args.get("merge").and_then(|v| v.as_bool()).unwrap_or(true);
+            history.record("MCP: Mirror", scene);
+            let mirrored = crate::modeling::mirrored(&scene.objects[idx].mesh, axis);
+            let id = if merge {
+                let obj = &mut scene.objects[idx];
+                crate::modeling::append(&mut obj.mesh, &mirrored);
+                obj.voxel_grid = None;
+                obj.id
+            } else {
+                scene.selected_object = Some(idx);
+                let Some(new_idx) = scene.duplicate_selected() else {
+                    return IpcResponse::error("Could not copy the object");
+                };
+                let src = scene.objects[idx].clone();
+                let obj = &mut scene.objects[new_idx];
+                obj.name = format!("{} (mirror)", src.name);
+                obj.transform = src.transform;
+                obj.mesh = mirrored;
+                obj.voxel_grid = None;
+                obj.id
+            };
+            let obj = scene.objects.iter().find(|o| o.id == id).unwrap();
+            ui_state.status_message = format!("Mirrored '{}'", obj.name);
+            IpcResponse::success(
+                format!("Mirrored across local {} into '{}'", ["X", "Y", "Z"][axis], obj.name),
+                json!({"object_id": id, "faces": obj.mesh.faces.len()}),
+            )
+        }
+
+        "array_object" => {
+            let Some(idx) = resolve_object_index(scene, args) else {
+                return IpcResponse::error("No matching or active object found");
+            };
+            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(3).clamp(2, 128) as usize;
+            let offset = parse_vec3(&args["offset"], Vec3::new(1.0, 0.0, 0.0));
+            let rot = parse_vec3(&args["rotation_deg"], Vec3::ZERO);
+            let step_scale = args.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let merge = args.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !offset.is_finite() || !rot.is_finite() || !(step_scale.is_finite() && step_scale > 0.0) {
+                return IpcResponse::error("Array offset, rotation and scale must be finite");
+            }
+            history.record("MCP: Array", scene);
+            let step = crate::modeling::array_step(offset, rot, step_scale);
+            let mut ids = vec![scene.objects[idx].id];
+            if merge {
+                let base = scene.objects[idx].mesh.clone();
+                let obj = &mut scene.objects[idx];
+                let mut m = glam::Mat4::IDENTITY;
+                for _ in 1..count {
+                    m = step * m;
+                    crate::modeling::append(&mut obj.mesh, &crate::modeling::transformed(&base, m));
+                }
+                obj.voxel_grid = None;
+            } else {
+                // Copies follow the step in the source object's local frame.
+                let src = scene.objects[idx].clone();
+                let world = src.transform.matrix();
+                let mut m = glam::Mat4::IDENTITY;
+                for i in 1..count {
+                    m = step * m;
+                    let (s, r, t) = (world * m).to_scale_rotation_translation();
+                    scene.selected_object = Some(idx);
+                    let Some(new_idx) = scene.duplicate_selected() else { break };
+                    let obj = &mut scene.objects[new_idx];
+                    obj.name = format!("{} {}", src.name, i + 1);
+                    obj.transform.translation = t;
+                    obj.transform.scale = s;
+                    let (x, y, z) = r.to_euler(glam::EulerRot::XYZ);
+                    obj.transform.rotation_deg = Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
+                    ids.push(obj.id);
+                }
+            }
+            ui_state.status_message = format!("Arrayed '{}' ×{count}", scene.objects[idx].name);
+            IpcResponse::success(
+                format!("Created an array of {count}"),
+                json!({"object_ids": ids, "merged": merge}),
+            )
+        }
+
+        "add_lathe" | "add_sweep" => {
+            let color = parse_color(&args["color"], [0.78, 0.80, 0.85]);
+            let points2 = |v: &Value| -> Vec<glam::Vec2> {
+                v.as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| {
+                                let p = p.as_array()?;
+                                Some(glam::Vec2::new(p.first()?.as_f64()? as f32, p.get(1)?.as_f64()? as f32))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let cap = args.get("cap").and_then(|v| v.as_bool()).unwrap_or(true);
+            let result = if req.tool == "add_lathe" {
+                crate::modeling::lathe(
+                    &points2(&args["profile"]),
+                    args.get("segments").and_then(|v| v.as_u64()).unwrap_or(32) as usize,
+                    args.get("angle_deg").and_then(|v| v.as_f64()).unwrap_or(360.0) as f32,
+                    cap,
+                    color,
+                )
+            } else {
+                let path: Vec<Vec3> = args["path"]
+                    .as_array()
+                    .map(|a| a.iter().map(|p| parse_vec3(p, Vec3::NAN)).collect())
+                    .unwrap_or_default();
+                let section = if args["profile"].is_array() {
+                    points2(&args["profile"])
+                } else {
+                    crate::modeling::circle_section(
+                        args.get("radius").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32,
+                        args.get("sides").and_then(|v| v.as_u64()).unwrap_or(12) as usize,
+                    )
+                };
+                crate::modeling::sweep(
+                    &path,
+                    &section,
+                    args.get("closed").and_then(|v| v.as_bool()).unwrap_or(false),
+                    cap,
+                    args.get("twist_deg").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    args.get("end_scale").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                    color,
+                )
+            };
+            let mesh = match result {
+                Ok(m) => m,
+                Err(e) => return IpcResponse::error(e),
+            };
+            history.record(format!("MCP: {}", req.tool), scene);
+            let default_name = if req.tool == "add_lathe" { "Lathe" } else { "Sweep" };
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or(default_name);
+            let idx = scene.add_mesh_object(name, mesh, color);
+            let obj = &mut scene.objects[idx];
+            obj.transform.translation = parse_vec3(&args["position"], Vec3::ZERO);
+            obj.transform.rotation_deg = parse_vec3(&args["rotation_deg"], Vec3::ZERO);
+            ui_state.status_message = format!("Added '{}'", obj.name);
+            IpcResponse::success(
+                format!("Added '{}' (object_id={})", obj.name, obj.id),
+                json!({"object_id": obj.id, "name": obj.name, "vertices": obj.mesh.positions.len(), "faces": obj.mesh.faces.len()}),
+            )
+        }
+
+        "boolean" => {
+            let Some(idx) = resolve_object_index(scene, args) else {
+                return IpcResponse::error("No matching or active target object");
+            };
+            let Some(tool_id) = args.get("tool_object_id").and_then(|v| v.as_u64()) else {
+                return IpcResponse::error("Missing 'tool_object_id'");
+            };
+            let Some(tidx) = scene.objects.iter().position(|o| o.id == tool_id) else {
+                return IpcResponse::error("Tool object not found");
+            };
+            if tidx == idx {
+                return IpcResponse::error("Pick two different objects");
+            }
+            let op = match crate::modeling::BooleanOp::parse(
+                args.get("operation").and_then(|v| v.as_str()).unwrap_or("subtract"),
+            ) {
+                Ok(op) => op,
+                Err(e) => return IpcResponse::error(e),
+            };
+            let target = &scene.objects[idx];
+            let tool = &scene.objects[tidx];
+            let mesh = match crate::modeling::boolean(
+                &target.mesh,
+                target.transform.matrix(),
+                &tool.mesh,
+                tool.transform.matrix(),
+                op,
+                tool.color,
+            ) {
+                Ok(m) => m,
+                Err(e) => return IpcResponse::error(e),
+            };
+            history.record("MCP: Boolean", scene);
+            let target_id = scene.objects[idx].id;
+            let obj = &mut scene.objects[idx];
+            obj.mesh = mesh;
+            obj.voxel_grid = None;
+            obj.flat_shading = true;
+            if !args.get("keep_tool").and_then(|v| v.as_bool()).unwrap_or(false) {
+                scene.objects.remove(tidx);
+            }
+            scene.selected_object = scene.objects.iter().position(|o| o.id == target_id);
+            let obj = scene.objects.iter().find(|o| o.id == target_id).unwrap();
+            ui_state.status_message = format!("Boolean {:?} on '{}'", op, obj.name);
+            IpcResponse::success(
+                format!("Applied {:?} to '{}'", op, obj.name),
+                json!({"object_id": target_id, "vertices": obj.mesh.positions.len(), "faces": obj.mesh.faces.len()}),
+            )
+        }
+
         "transform_object" => {
             let Some(idx) = resolve_object_index(scene, args) else {
                 return IpcResponse::error("No matching or active object found");
@@ -1000,9 +1214,16 @@ fn dispatch(
                     obj.mesh.delete_selected(EditElementMode::Face);
                     obj.voxel_grid = None;
                 }
+                "bevel" | "chamfer" => {
+                    let width = args.get("width").and_then(|v| v.as_f64()).unwrap_or(0.05) as f32;
+                    if let Err(e) = crate::modeling::bevel_selected(&mut obj.mesh, width) {
+                        return IpcResponse::error(e);
+                    }
+                    obj.voxel_grid = None;
+                }
                 other => {
                     return IpcResponse::error(format!(
-                        "Unknown edit_mesh operation '{other}'. Supported: select_by_normal, select_all, clear_selection, extrude, inset, subdivide, translate_selected, scale_selected, rotate_selected, delete_selected"
+                        "Unknown edit_mesh operation '{other}'. Supported: select_by_normal, select_all, clear_selection, extrude, inset, bevel, subdivide, translate_selected, scale_selected, rotate_selected, delete_selected"
                     ));
                 }
             }
@@ -1376,9 +1597,21 @@ fn dispatch(
                 .unwrap_or(960)
                 .clamp(700, 1600) as u32;
             let tab = args.get("tab").and_then(|v| v.as_u64()).unwrap_or(0).min(1) as usize;
+            // Optional before/after wipe of a revision.
+            let mut compare_scene = None;
+            let mut split = None;
+            if let Some(rid) = args.get("compare_revision").and_then(|v| v.as_u64()) {
+                if !scene.revisions.iter().any(|r| r.id == rid && r.can_compare()) {
+                    return IpcResponse::error("Revision not found or has no geometry to compare");
+                }
+                let mut s = scene.clone();
+                s.preview_revision = Some((rid, false));
+                compare_scene = Some(s);
+                split = Some(args.get("split").and_then(|v| v.as_f64()).unwrap_or(0.5).clamp(0.02, 0.98) as f32);
+            }
             match crate::renderer::render_headless(
                 camera,
-                scene,
+                compare_scene.as_ref().unwrap_or(scene),
                 *shading,
                 *show_wireframe,
                 *show_grid,
@@ -1386,6 +1619,7 @@ fn dispatch(
                 height,
                 Path::new(path),
                 Some(tab),
+                split,
             ) {
                 Ok(()) => IpcResponse::success(
                     "Studio captured",
@@ -1454,11 +1688,16 @@ fn dispatch(
                 .get("include_resolved")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let include_drafts = args
+                .get("include_drafts")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let comments: Vec<Value> = scene
                 .comments
                 .iter()
                 .filter(|c| include_resolved || !c.resolved)
+                .filter(|c| include_drafts || !c.draft)
                 .map(|c| {
                     json!({
                         "id": c.id,
@@ -1481,6 +1720,8 @@ fn dispatch(
                         "replies": c.replies,
                         "resolved": c.resolved,
                         "agent_reply": c.agent_reply,
+                        "draft": c.draft,
+                        "attachments": c.attachments,
                     })
                 })
                 .collect();
@@ -1490,8 +1731,56 @@ fn dispatch(
                 json!({
                     "count": comments.len(),
                     "comments": comments,
+                    "feedback_batch": scene.feedback_batch,
+                    "drafts_pending": scene.draft_count(),
                 }),
             )
+        }
+
+        "get_feedback_state" => {
+            let open = scene
+                .comments
+                .iter()
+                .filter(|c| !c.draft && !c.resolved && c.status == crate::scene::CommentStatus::Open)
+                .count();
+            IpcResponse::success(
+                "Feedback state",
+                json!({
+                    "feedback_batch": scene.feedback_batch,
+                    "open_comments": open,
+                    "drafts_pending": scene.draft_count(),
+                    "revision_pending": scene.revisions.iter().any(|r| matches!(r.status, crate::review::RevisionStatus::InProgress | crate::review::RevisionStatus::ReadyForReview)),
+                }),
+            )
+        }
+
+        "wait_for_feedback" => {
+            // Blocking waits are handled by the MCP/CLI client so the GUI never stalls.
+            IpcResponse::error("wait_for_feedback must be called through the MCP server or --cmd")
+        }
+
+        "send_comments" => {
+            let n = scene.send_drafts();
+            IpcResponse::success(
+                format!("Sent {n} comment(s) to the agent"),
+                json!({"sent": n, "feedback_batch": scene.feedback_batch}),
+            )
+        }
+
+        "request_changes" => {
+            let id = args.get("revision_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let notes = args.get("notes").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let before = scene.clone();
+            match scene.request_revision_changes(id, notes) {
+                Ok(()) => {
+                    history.record("Request changes", &before);
+                    IpcResponse::success(
+                        "Revision reverted; the comment is open again with your notes",
+                        json!({"revision_id": id, "feedback_batch": scene.feedback_batch}),
+                    )
+                }
+                Err(e) => IpcResponse::error(e),
+            }
         }
 
         "add_comment" => {

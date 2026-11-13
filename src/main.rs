@@ -2,6 +2,7 @@
 
 mod autosave;
 mod box_select;
+pub mod codec;
 pub mod camera;
 pub mod gizmo;
 pub mod history;
@@ -9,6 +10,7 @@ pub mod io;
 pub mod ipc;
 pub mod mcp;
 pub mod mesh;
+pub mod modeling;
 mod navigation;
 pub mod project;
 pub mod renderer;
@@ -912,7 +914,12 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
             event_loop.exit();
             return;
         }
-        self.ui_state.last_agent_activity = Some(std::time::Instant::now());
+        if event.request.tool == "get_feedback_state" {
+            // An agent is listening for feedback; not an edit worth logging.
+            self.ui_state.agent_listening = Some(std::time::Instant::now());
+        } else {
+            self.ui_state.last_agent_activity = Some(std::time::Instant::now());
+        }
         if event.request.tool == "cancel_operation" {
             let response = self.cancel_operation();
             let _ = event.reply_tx.send(response);
@@ -933,6 +940,11 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 | "edit_mesh"
                 | "add_primitive"
                 | "import_model"
+                | "boolean"
+                | "add_lathe"
+                | "add_sweep"
+                | "array_object"
+                | "mirror_object"
                 | "capture_viewport"
                 | "capture_studio"
         ) && self.background.is_none()
@@ -1605,6 +1617,7 @@ fn main() {
             960,
             std::path::Path::new(path),
             Some(tab),
+            None,
         ) {
             eprintln!("{e}");
             std::process::exit(1);
@@ -1621,23 +1634,28 @@ fn main() {
         if let Some(json_str) = args.get(pos + 1) {
             match serde_json::from_str::<IpcRequest>(json_str) {
                 Ok(req) => {
-                    let resp = if let Some(live) = mcp::send_to_live_gui(&req) {
-                        live
+                    let mut scene = Scene::empty();
+                    let mut camera = OrbitCamera::default();
+                    let mut history = UndoHistory::default();
+                    let mut ui_state = UiState::default();
+                    let mut route = |req: &IpcRequest| {
+                        mcp::send_to_live_gui(req).unwrap_or_else(|| {
+                            mcp::execute_headless(
+                                req,
+                                &mut scene,
+                                &mut camera,
+                                &mut history,
+                                &mut ui_state,
+                                &mut ViewportShading::StudioLit,
+                                &mut false,
+                                &mut true,
+                            )
+                        })
+                    };
+                    let resp = if req.tool == "wait_for_feedback" {
+                        mcp::wait_for_feedback(&req.args, &mut route)
                     } else {
-                        let mut scene = Scene::empty();
-                        let mut camera = OrbitCamera::default();
-                        let mut history = UndoHistory::default();
-                        let mut ui_state = UiState::default();
-                        mcp::execute_headless(
-                            &req,
-                            &mut scene,
-                            &mut camera,
-                            &mut history,
-                            &mut ui_state,
-                            &mut ViewportShading::StudioLit,
-                            &mut false,
-                            &mut true,
-                        )
+                        route(&req)
                     };
                     println!(
                         "{}",

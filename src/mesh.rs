@@ -77,10 +77,14 @@ pub fn ray_box_entry(ray: &Ray, min: Vec3, max: Vec3) -> Option<f32> {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mesh {
+    #[serde(with = "crate::codec::vec3s")]
     pub positions: Vec<Vec3>,
+    #[serde(with = "crate::codec::vec3s")]
     pub normals: Vec<Vec3>,
+    #[serde(with = "crate::codec::rgbs")]
     pub colors: Vec<[f32; 3]>,
     /// Each face is a polygon (typically 3 or 4 vertex indices in counter-clockwise order).
+    #[serde(with = "crate::codec::faces")]
     pub faces: Vec<Vec<usize>>,
 
     #[serde(skip)]
@@ -1580,10 +1584,11 @@ impl Mesh {
                         vc[2] * base_color[2],
                     ];
                     if is_face_selected {
+                        // Studio accent (teal), strong enough to read on any material.
                         col = [
-                            col[0] * 0.4 + 0.6 * 1.0,
-                            col[1] * 0.4 + 0.6 * 0.55,
-                            col[2] * 0.4 + 0.6 * 0.15,
+                            col[0] * 0.35 + 0.65 * 0.30,
+                            col[1] * 0.35 + 0.65 * 0.92,
+                            col[2] * 0.35 + 0.65 * 0.78,
                         ];
                     }
                     out.push(GpuVertex {
@@ -1595,6 +1600,39 @@ impl Mesh {
             }
         }
         out
+    }
+
+    /// Border edges of the selected face region (welded by position), in local space.
+    pub fn build_selection_outline(&self, color: [f32; 3]) -> Vec<GpuVertex> {
+        let mut directed: HashMap<((i32, i32, i32), (i32, i32, i32)), (usize, usize)> =
+            HashMap::new();
+        for &fi in &self.selected_faces {
+            let Some(face) = self.faces.get(fi) else { continue };
+            for i in 0..face.len() {
+                let (a, b) = (face[i], face[(i + 1) % face.len()]);
+                let (qa, qb) = (
+                    Self::quantize_pos(self.positions[a]),
+                    Self::quantize_pos(self.positions[b]),
+                );
+                if qa != qb {
+                    directed.insert((qa, qb), (a, b));
+                }
+            }
+        }
+        let mut lines = Vec::new();
+        for (&(qa, qb), &(a, b)) in &directed {
+            if directed.contains_key(&(qb, qa)) {
+                continue;
+            }
+            for v in [a, b] {
+                lines.push(GpuVertex {
+                    position: self.positions[v].to_array(),
+                    normal: [0.0, 1.0, 0.0],
+                    color,
+                });
+            }
+        }
+        lines
     }
 
     /// Builds line segments (`GpuVertex` pairs) for wireframe and selection highlights in world space.
