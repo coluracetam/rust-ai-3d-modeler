@@ -13,7 +13,14 @@ For full architectural details, module layout, and the AI-driven spatial comment
 - `add_primitive`: Create a `cube`, `sphere`, `cylinder`, `plane`, `torus`, or `voxel_sphere` with position, rotation, scale, subdivisions, and RGB color.
 - `transform_object`: Move, rotate, scale, rename, or hide/show any object by `object_id` or `name`.
 - `set_material`: Update base `color`, `secondary_color`, `roughness`, `metallic`, `flat_shading`, tri-planar 3D procedural shader `pattern` (`none`, `checker`, `bricks`, `stone_blocks`, `wood_grain`, `marble`, `hex_grid`, `rune_circuit`), `texture_scale`, emissive glow (`emission_color`, `emission_strength`), and automatic vertex-color baking (`bake_ao`, `ao_strength`, `wear_strength`, `crevice_color`, `wear_color`, `bottom_color`, `top_color`, `top_coat_color`).
-- `edit_mesh`: Perform polygonal modeling operations (`select_by_normal`, `select_all`, `clear_selection`, `extrude`, `inset`, `subdivide`, `translate_selected`, `scale_selected`, `rotate_selected`, `delete_selected`).
+- `edit_mesh`: Perform polygonal modeling operations (`select_by_normal`, `select_all`, `clear_selection`, `extrude`, `inset`, `bevel`, `subdivide`, `translate_selected`, `scale_selected`, `rotate_selected`, `delete_selected`, `bridge`, `fill_holes`, `weld`, `flip_normals`, `smooth`, `subdivide_smooth`, `decimate`, `invert_selection`, `grow_selection`, `shrink_selection`).
+- `query_geometry` / `measure` / `check_mesh`: Read real geometry (world bounds, per-face centres, normals and areas, connected regions), distances and gaps between parts, and mesh health (holes, flipped faces, overlaps, floating parts).
+- `select_faces`: Select faces by `box`, `sphere`, `connected`, `surface`, `normal`, `similar`, `path`, `invert`, `grow` or `shrink`, with `op` replace/add/subtract.
+- `add_mesh` / `add_extrude` / `add_loft`: Create a part from raw vertices and faces, from a 2D outline raised into a solid, or by skinning through cross-sections.
+- `deform_object` / `align_object` / `scatter_object`: Bend, twist or taper a part; line parts up or stack them; spread copies over a surface.
+- `paint_faces`: Colour only the selected faces of a part.
+- `capture_views`: Render several camera angles into one contact-sheet PNG.
+- `batch`: Run many tool calls in one round trip.
 - `sculpt_stroke`: Apply 3D sculpting brushes (`draw`, `inflate`, `smooth`, `flatten`, `grab`, `pinch`, `crease`) at a surface `point` or array of `points`, with optional `symmetry_x`/`y`/`z` and `dyntopo` auto-tessellation.
 - `voxel_brush`: Apply volumetric SDF CSG operations (`add_sphere`, `subtract_sphere`, `add_box`, `subtract_box`, `smooth_field`, `paint_color`) and choose `smooth` (Dual Surface Nets) or `blocky` voxel meshing.
 - `voxel_remesh`: Remesh any object into uniform quad topology at a specified voxel grid resolution.

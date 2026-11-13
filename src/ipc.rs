@@ -50,7 +50,7 @@ impl IpcResponse {
     }
 }
 
-fn parse_vec3(v: &Value, default: Vec3) -> Vec3 {
+pub(crate) fn parse_vec3(v: &Value, default: Vec3) -> Vec3 {
     if let Some(arr) = v.as_array() {
         if arr.len() >= 3 {
             let x = arr[0].as_f64().unwrap_or(default.x as f64) as f32;
@@ -62,7 +62,7 @@ fn parse_vec3(v: &Value, default: Vec3) -> Vec3 {
     default
 }
 
-fn parse_color(v: &Value, default: [f32; 3]) -> [f32; 3] {
+pub(crate) fn parse_color(v: &Value, default: [f32; 3]) -> [f32; 3] {
     if let Some(arr) = v.as_array() {
         if arr.len() >= 3 {
             return [
@@ -75,7 +75,7 @@ fn parse_color(v: &Value, default: [f32; 3]) -> [f32; 3] {
     default
 }
 
-fn resolve_object_index(scene: &Scene, args: &Value) -> Option<usize> {
+pub(crate) fn resolve_object_index(scene: &Scene, args: &Value) -> Option<usize> {
     if let Some(id) = args.get("object_id").and_then(|v| v.as_u64()) {
         return scene.objects.iter().position(|o| o.id == id);
     }
@@ -123,6 +123,8 @@ pub fn summarize_scene(
                 "is_voxel": obj.voxel_grid.is_some(),
                 "vertices": obj.mesh.positions.len(),
                 "faces": obj.mesh.faces.len(),
+                "world_bounds_min": crate::agent_tools::world_bounds(obj).map(|b| b.0.to_array()),
+                "world_bounds_max": crate::agent_tools::world_bounds(obj).map(|b| b.1.to_array()),
                 "selected_faces": obj.mesh.selected_faces.len(),
                 "selected_edges": obj.mesh.selected_edges.len(),
                 "selected_vertices": obj.mesh.selected_vertices.len(),
@@ -151,7 +153,7 @@ pub fn summarize_scene(
         .map(|c| {
             json!({
                 "id": c.id,
-                "is_general": c.is_general || c.object_id == 0,
+                "is_general": c.is_general || (c.object_id == 0 && c.volume.is_none()),
                 "object_id": c.object_id,
                 "object_name": c.object_name,
                 "comment": c.comment,
@@ -254,7 +256,7 @@ pub fn is_geometry_tool(tool: &str) -> bool {
             | "add_lathe"
             | "add_sweep"
             | "boolean"
-    )
+    ) || crate::agent_tools::GEOMETRY.contains(&tool)
 }
 
 /// Clear per-project UI state (hover, clipping, measurements, comment focus, screenshots)
@@ -286,7 +288,7 @@ pub fn is_read_only(tool: &str) -> bool {
             | "capture_studio"
             | "get_feedback_state"
             | "wait_for_feedback"
-    )
+    ) || crate::agent_tools::READ_ONLY.contains(&tool)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1139,6 +1141,7 @@ fn dispatch(
 
             history.record(format!("MCP Mesh Edit: {op}"), scene);
             let obj = &mut scene.objects[idx];
+            let mut op_detail = String::new();
 
             // Optional face selection helper before running the operation
             if let Some(face_arr) = args.get("select_faces").and_then(|v| v.as_array()) {
@@ -1236,17 +1239,30 @@ fn dispatch(
                     }
                     obj.voxel_grid = None;
                 }
-                other => {
-                    return IpcResponse::error(format!(
-                        "Unknown edit_mesh operation '{other}'. Supported: select_by_normal, select_all, clear_selection, extrude, inset, bevel, subdivide, translate_selected, scale_selected, rotate_selected, delete_selected"
-                    ));
-                }
+                other => match crate::agent_tools::edit_mesh_op(other, &mut obj.mesh, args) {
+                    Some(Ok(detail)) => {
+                        obj.voxel_grid = None;
+                        op_detail = detail;
+                    }
+                    Some(Err(e)) => return IpcResponse::error(e),
+                    None => {
+                        return IpcResponse::error(format!(
+                            "Unknown edit_mesh operation '{other}'. Supported: select_by_normal, select_all, clear_selection, extrude, inset, bevel, subdivide, translate_selected, scale_selected, rotate_selected, delete_selected, {}",
+                            crate::agent_tools::EXTRA_EDIT_OPS
+                        ));
+                    }
+                },
             }
 
             ui_state.status_message = format!("MCP mesh edit '{op}' on '{}'", obj.name);
             IpcResponse::success(
-                format!("Executed mesh edit '{op}' on '{}'", obj.name),
+                if op_detail.is_empty() {
+                    format!("Executed mesh edit '{op}' on '{}'", obj.name)
+                } else {
+                    format!("Executed mesh edit '{op}' on '{}': {op_detail}", obj.name)
+                },
                 json!({
+                    "detail": op_detail,
                     "object_id": obj.id,
                     "vertices": obj.mesh.positions.len(),
                     "faces": obj.mesh.faces.len(),
@@ -1652,6 +1668,17 @@ fn dispatch(
             let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(640) as u32;
 
             let mut snap_cam = camera.clone();
+            snap_cam.aspect = width as f32 / height.max(1) as f32;
+            // frame=scene|selection|object|comment aims the camera at that region first.
+            match crate::agent_tools::frame_bounds(scene, args) {
+                Ok(Some(bounds)) => crate::agent_tools::frame_camera(
+                    &mut snap_cam,
+                    bounds,
+                    args.get("padding").and_then(|v| v.as_f64()).unwrap_or(1.25) as f32,
+                ),
+                Ok(None) => {}
+                Err(e) => return IpcResponse::error(e),
+            }
             if !args["target"].is_null() {
                 snap_cam.target = parse_vec3(&args["target"], snap_cam.target);
             }
@@ -1716,7 +1743,16 @@ fn dispatch(
                 .map(|c| {
                     json!({
                         "id": c.id,
-                        "is_general": c.is_general || c.object_id == 0,
+                        "is_general": c.is_general || (c.object_id == 0 && c.volume.is_none()),
+                        "volume": c.volume.as_ref().map(|v| json!({
+                            "label": v.label,
+                            "center": v.center.to_array(),
+                            "size": (v.half_extents * 2.0).to_array(),
+                            "min": v.min().to_array(),
+                            "max": v.max().to_array(),
+                            "space": "world",
+                            "contains_geometry": !scene.faces_in_volume(v).is_empty(),
+                        })),
                         "object_id": c.object_id,
                         "object_name": c.object_name,
                         "comment": c.comment,
@@ -1729,7 +1765,7 @@ fn dispatch(
                         "local_bounds_min": c.local_bounds_min.to_array(),
                         "local_bounds_max": c.local_bounds_max.to_array(),
                         "targets_count": c.targets.len().max(if c.is_general { 0 } else { 1 }),
-                        "targets": c.targets.iter().map(|t| scene.refreshed_target(t).unwrap_or_else(|| t.clone())).collect::<Vec<_>>(),
+                        "targets": scene.resolved_targets(c),
                         "status": c.status,
                         "needs_reattachment": scene.comment_needs_reattachment(c),
                         "replies": c.replies,
@@ -1995,6 +2031,16 @@ fn dispatch(
             }
         }
 
-        other => IpcResponse::error(format!("Unknown MCP tool '{other}'")),
+        other => crate::agent_tools::dispatch(
+            req,
+            scene,
+            camera,
+            history,
+            ui_state,
+            shading,
+            show_wireframe,
+            show_grid,
+        )
+        .unwrap_or_else(|| IpcResponse::error(format!("Unknown MCP tool '{other}'"))),
     }
 }

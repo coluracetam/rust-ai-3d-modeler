@@ -283,7 +283,70 @@ pub fn apply_box_selection(
     op: BoxOp,
 ) -> BoxSelectOutcome {
     let hits = faces_in_rect(scene, camera, viewport, a, b, through);
+    apply_hits(scene, hits, op)
+}
+
+fn point_in_polygon(p: Vec2, poly: &[Vec2]) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Faces inside a freehand screen-space outline: the faces a box around the outline would
+/// pick (visible ones unless `through`), kept when their centre projects inside the outline.
+pub fn faces_in_lasso(
+    scene: &Scene,
+    camera: &OrbitCamera,
+    viewport: Vec2,
+    outline: &[Vec2],
+    through: bool,
+) -> HashMap<usize, HashSet<usize>> {
+    if outline.len() < 3 {
+        return HashMap::new();
+    }
+    let min = outline.iter().fold(Vec2::splat(f32::INFINITY), |m, p| m.min(*p));
+    let max = outline.iter().fold(Vec2::splat(f32::NEG_INFINITY), |m, p| m.max(*p));
+    let mut hits = faces_in_rect(scene, camera, viewport, min, max, through);
+    let view_proj = camera.view_proj_matrix();
+    for (&oi, faces) in hits.iter_mut() {
+        let obj = &scene.objects[oi];
+        let mvp = view_proj * obj.transform.matrix();
+        faces.retain(|&fi| {
+            let clip = mvp * obj.mesh.face_center(fi).extend(1.0);
+            clip.w > 0.0 && point_in_polygon(to_screen(clip, viewport).truncate(), outline)
+        });
+    }
+    hits.retain(|_, f| !f.is_empty());
+    hits
+}
+
+/// Apply a lasso selection to the scene and report what is selected afterwards.
+pub fn apply_lasso_selection(
+    scene: &mut Scene,
+    camera: &OrbitCamera,
+    viewport: Vec2,
+    outline: &[Vec2],
+    through: bool,
+    op: BoxOp,
+) -> BoxSelectOutcome {
+    let hits = faces_in_lasso(scene, camera, viewport, outline, through);
+    apply_hits(scene, hits, op)
+}
+
+fn apply_hits(
+    scene: &mut Scene,
+    hits: HashMap<usize, HashSet<usize>>,
+    op: BoxOp,
+) -> BoxSelectOutcome {
     if op == BoxOp::Replace {
+        scene.selection_volume = None;
         scene.clear_all_selections();
     }
     for (&oi, faces) in &hits {
@@ -468,6 +531,25 @@ mod tests {
         );
         assert_eq!(out.selected_faces, 0);
         assert!(!scene.has_any_selection());
+    }
+
+    #[test]
+    fn lasso_keeps_only_faces_inside_the_outline() {
+        let mut scene = scene_with(&[(Vec3::new(-1.5, 0.0, 0.0), 1.0), (Vec3::new(1.5, 0.0, 0.0), 1.0)]);
+        let camera = front_camera();
+        let viewport = VP;
+        let left = camera.world_to_screen(Vec3::new(-1.5, 0.0, 0.0), viewport).unwrap();
+        // A triangle around the left cube only.
+        let outline = [
+            left + Vec2::new(-120.0, -120.0),
+            left + Vec2::new(120.0, -120.0),
+            left + Vec2::new(0.0, 160.0),
+        ];
+        let outcome = apply_lasso_selection(&mut scene, &camera, viewport, &outline, false, BoxOp::Replace);
+        assert!(outcome.selected_faces > 0);
+        assert!(!scene.objects[0].mesh.selected_faces.is_empty());
+        assert!(scene.objects[1].mesh.selected_faces.is_empty());
+        assert!(faces_in_lasso(&scene, &camera, viewport, &outline[..2], false).is_empty());
     }
 
     #[test]

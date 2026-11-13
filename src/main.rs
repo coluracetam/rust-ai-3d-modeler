@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod agent_tools;
 mod autosave;
 mod box_select;
 pub mod codec;
@@ -11,6 +12,7 @@ pub mod ipc;
 pub mod mcp;
 pub mod mesh;
 pub mod modeling;
+mod modeling_ops;
 mod navigation;
 pub mod project;
 pub mod renderer;
@@ -270,8 +272,15 @@ impl ModelerApp {
                 self.ui_state.status_message = "Measurement point placed".into();
                 return;
             }
-            if self.ui_state.select_mode == SmartSelectMode::Box {
-                self.box_drag_start = Some(self.cursor_pos);
+            if matches!(
+                self.ui_state.select_mode,
+                SmartSelectMode::Box | SmartSelectMode::Lasso
+            ) {
+                self.begin_drag_select();
+                return;
+            }
+            if self.ui_state.select_mode == SmartSelectMode::Volume {
+                self.drop_selection_volume(&hit);
                 return;
             }
             let multi_active = self.ui_state.multi_select
@@ -280,6 +289,7 @@ impl ModelerApp {
 
             if !multi_active {
                 self.scene.clear_all_selections();
+                self.scene.selection_volume = None;
             }
 
             self.scene.selected_object = Some(hit.object_idx);
@@ -306,17 +316,68 @@ impl ModelerApp {
 
             self.apply_section_selection_at_hit(&hit, additive, subtract);
             self.persist();
-        } else if self.ui_state.select_mode == SmartSelectMode::Box && !self.ui_state.measure_active
+        } else if matches!(
+            self.ui_state.select_mode,
+            SmartSelectMode::Box | SmartSelectMode::Lasso
+        ) && !self.ui_state.measure_active
         {
-            self.box_drag_start = Some(self.cursor_pos);
+            self.begin_drag_select();
+        } else if self.ui_state.select_mode == SmartSelectMode::Volume {
+            // Clicking empty space keeps the box; drag its handles or click a surface to move it.
         } else if !self.modifiers.shift_key()
             && !self.modifiers.control_key()
             && !self.ui_state.multi_select
         {
             self.scene.clear_all_selections();
+            self.scene.selection_volume = None;
             self.scene.selected_object = None;
             self.persist();
         }
+    }
+
+    /// Start a box or lasso drag at the cursor.
+    fn begin_drag_select(&mut self) {
+        self.box_drag_start = Some(self.cursor_pos);
+        self.ui_state.lasso_points.clear();
+        if self.ui_state.select_mode == SmartSelectMode::Lasso {
+            let scale = self
+                .gpu
+                .as_ref()
+                .map(|g| g.egui_ctx.pixels_per_point())
+                .unwrap_or(1.0);
+            self.ui_state
+                .lasso_points
+                .push(egui::pos2(self.cursor_pos.x / scale, self.cursor_pos.y / scale));
+        }
+    }
+
+    /// Place the 3D box selector on the clicked surface (keeping its size if it already exists)
+    /// and select everything inside it.
+    fn drop_selection_volume(&mut self, hit: &crate::scene::WorldRayHit) {
+        let (half, label) = match &self.scene.selection_volume {
+            Some(v) => (v.half_extents, v.label.clone()),
+            None => {
+                let size = self
+                    .scene
+                    .objects
+                    .get(hit.object_idx)
+                    .map(|obj| {
+                        let (lo, hi) = obj.mesh.bounds();
+                        ((hi - lo) * obj.transform.scale.abs()).max_element()
+                    })
+                    .unwrap_or(1.0);
+                (Vec3::splat((size * 0.15).clamp(0.02, 50.0)), String::new())
+            }
+        };
+        let mut volume = crate::scene::SelectionVolume::new(hit.world_point, half);
+        volume.label = label;
+        self.scene.selection_volume = Some(volume);
+        let (faces, parts) = self.scene.apply_volume_selection();
+        update_pending_anchor_from_selection(&mut self.scene);
+        self.ui_state.status_message = format!(
+            "[3D box] {faces} faces on {parts} part(s) inside · drag the handles to resize, the centre to move"
+        );
+        self.persist();
     }
 
     fn apply_section_selection_at_hit(
@@ -328,6 +389,9 @@ impl ModelerApp {
         let select_mode = self.ui_state.select_mode;
         let crease_deg = self.ui_state.crease_angle_deg;
         let radius = self.ui_state.selection_radius;
+        let face_path = self.ui_state.face_path;
+        let last_pick = self.ui_state.last_face_pick;
+        let mut new_pick = last_pick;
         self.hover_brush_world = Some((hit.world_point, hit.world_normal));
 
         if let Some(obj) = self.scene.objects.get_mut(hit.object_idx) {
@@ -349,7 +413,29 @@ impl ModelerApp {
                         obj.mesh.select_all(EditElementMode::Face);
                     }
                 }
-                SmartSelectMode::Box => {}
+                SmartSelectMode::Box | SmartSelectMode::Lasso | SmartSelectMode::Volume => {}
+                SmartSelectMode::Face => {
+                    // With Path on, a click fills the shortest run of faces from the last pick.
+                    let from = last_pick.filter(|(id, f)| {
+                        face_path
+                            && !subtract
+                            && *id == obj.id
+                            && *f != seed_face
+                            && obj.mesh.selected_faces.contains(f)
+                    });
+                    let set: std::collections::HashSet<usize> =
+                        match from.and_then(|(_, f)| obj.mesh.face_path(f, seed_face)) {
+                            Some(path) => path.into_iter().collect(),
+                            None => std::iter::once(seed_face).collect(),
+                        };
+                    let path_fill = from.is_some() && set.len() > 1;
+                    obj.mesh.apply_face_set_selection(
+                        &set,
+                        additive || path_fill,
+                        subtract && !path_fill,
+                    );
+                    new_pick = (!subtract || path_fill).then_some((obj.id, seed_face));
+                }
                 SmartSelectMode::Brush => {
                     let avg_scale = ((obj.transform.scale.x.abs()
                         + obj.transform.scale.y.abs()
@@ -390,6 +476,7 @@ impl ModelerApp {
                 ));
             }
 
+            self.ui_state.last_face_pick = new_pick;
             let mode_label = select_mode.label();
             self.ui_state.status_message = format!(
                 "[{mode_label}] Selected {sel_count} / {total_faces} faces on '{obj_name}' (Shift+Click: Add, Ctrl+Click: Subtract, [ / ]: Shrink/Grow)"
@@ -434,7 +521,11 @@ impl ModelerApp {
                 .mesh
                 .compute_smart_surface(seed_face, self.ui_state.crease_angle_deg),
             SmartSelectMode::WholeLayer => (0..obj.mesh.faces.len()).collect(),
-            SmartSelectMode::Brush | SmartSelectMode::Box => std::collections::HashSet::new(),
+            SmartSelectMode::Face => std::iter::once(seed_face).collect(),
+            SmartSelectMode::Brush
+            | SmartSelectMode::Box
+            | SmartSelectMode::Lasso
+            | SmartSelectMode::Volume => std::collections::HashSet::new(),
         };
     }
 
@@ -466,10 +557,22 @@ impl ModelerApp {
                 .as_ref()
                 .map(|g| g.egui_ctx.pixels_per_point())
                 .unwrap_or(1.0);
-            self.ui_state.box_rect = Some(egui::Rect::from_two_pos(
-                egui::pos2(start.x / scale, start.y / scale),
-                egui::pos2(new_pos.x / scale, new_pos.y / scale),
-            ));
+            if self.ui_state.select_mode == SmartSelectMode::Lasso {
+                let p = egui::pos2(new_pos.x / scale, new_pos.y / scale);
+                if self
+                    .ui_state
+                    .lasso_points
+                    .last()
+                    .is_none_or(|last| last.distance(p) > 2.5)
+                {
+                    self.ui_state.lasso_points.push(p);
+                }
+            } else {
+                self.ui_state.box_rect = Some(egui::Rect::from_two_pos(
+                    egui::pos2(start.x / scale, start.y / scale),
+                    egui::pos2(new_pos.x / scale, new_pos.y / scale),
+                ));
+            }
             self.hover_brush_world = None;
             self.update_hover_preview(None);
             return;
@@ -538,7 +641,8 @@ impl ModelerApp {
         }
         if code == KeyCode::Escape && self.box_drag_start.take().is_some() {
             self.ui_state.box_rect = None;
-            self.ui_state.status_message = "Box selection cancelled".into();
+            self.ui_state.lasso_points.clear();
+            self.ui_state.status_message = "Selection drag cancelled".into();
             return;
         }
         if self.scene.preview_revision.is_some() && code != KeyCode::KeyF {
@@ -573,13 +677,46 @@ impl ModelerApp {
                     self.toggle_box_select();
                 }
             }
+            KeyCode::Digit6 => {
+                self.ui_state.select_mode = SmartSelectMode::Face;
+                self.ui_state.hover_preview_seed_face = None;
+            }
+            KeyCode::Digit7 => {
+                self.ui_state.select_mode = SmartSelectMode::Lasso;
+                self.update_hover_preview(None);
+            }
+            KeyCode::Digit8 => {
+                self.ui_state.select_mode = SmartSelectMode::Volume;
+                self.update_hover_preview(None);
+                self.ui_state.status_message =
+                    "3D box · click a surface to place the box, then drag its handles".into();
+            }
+            KeyCode::KeyI => {
+                let mut any = false;
+                for obj in &mut self.scene.objects {
+                    if !obj.mesh.selected_faces.is_empty() {
+                        obj.mesh.invert_selection();
+                        any = true;
+                    }
+                }
+                if any {
+                    self.scene.selection_volume = None;
+                    self.scene.region_labels.clear();
+                    update_pending_anchor_from_selection(&mut self.scene);
+                    self.ui_state.status_message = "Selection inverted".into();
+                    self.persist();
+                }
+            }
             KeyCode::Tab => {
                 self.ui_state.select_mode = match self.ui_state.select_mode {
                     SmartSelectMode::SubPart => SmartSelectMode::SmartSurface,
                     SmartSelectMode::SmartSurface => SmartSelectMode::WholeLayer,
                     SmartSelectMode::WholeLayer => SmartSelectMode::Brush,
                     SmartSelectMode::Brush => SmartSelectMode::Box,
-                    SmartSelectMode::Box => SmartSelectMode::SubPart,
+                    SmartSelectMode::Box => SmartSelectMode::Face,
+                    SmartSelectMode::Face => SmartSelectMode::Lasso,
+                    SmartSelectMode::Lasso => SmartSelectMode::Volume,
+                    SmartSelectMode::Volume => SmartSelectMode::SubPart,
                 };
                 self.ui_state.hover_preview_seed_face = None;
             }
@@ -595,6 +732,8 @@ impl ModelerApp {
             }
             KeyCode::KeyC | KeyCode::Escape => {
                 self.scene.clear_all_selections();
+                self.scene.selection_volume = None;
+                self.ui_state.last_face_pick = None;
                 self.scene.selected_object = None;
                 self.scene.active_comment_id = None;
                 self.persist();
@@ -679,24 +818,40 @@ impl ModelerApp {
             box_select::BoxOp::Replace
         };
         let viewport = self.viewport_size();
-        let outcome = box_select::apply_box_selection(
-            &mut self.scene,
-            &self.camera,
-            viewport,
-            start - origin,
-            self.cursor_pos - origin,
-            self.ui_state.box_through,
-            op,
-        );
+        let lasso: Vec<Vec2> = std::mem::take(&mut self.ui_state.lasso_points)
+            .iter()
+            .map(|p| Vec2::new(p.x * scale, p.y * scale) - origin)
+            .collect();
+        let tool = if lasso.len() >= 3 { "Lasso" } else { "Box" };
+        let outcome = if lasso.len() >= 3 {
+            box_select::apply_lasso_selection(
+                &mut self.scene,
+                &self.camera,
+                viewport,
+                &lasso,
+                self.ui_state.box_through,
+                op,
+            )
+        } else {
+            box_select::apply_box_selection(
+                &mut self.scene,
+                &self.camera,
+                viewport,
+                start - origin,
+                self.cursor_pos - origin,
+                self.ui_state.box_through,
+                op,
+            )
+        };
         if outcome.selected_faces > 0 {
             update_pending_anchor_from_selection(&mut self.scene);
         }
         let found: usize = outcome.hits.values().map(|f| f.len()).sum();
         self.ui_state.status_message = if outcome.selected_faces == 0 {
-            "[Box] Nothing selected".into()
+            format!("[{tool}] Nothing selected")
         } else {
             format!(
-                "[Box] {} {found} faces · selection: {} faces on {} {} in {} {} (each region becomes its own AI target)",
+                "[{tool}] {} {found} faces · selection: {} faces on {} {} in {} {} (each region becomes its own AI target)",
                 if op == box_select::BoxOp::Subtract {
                     "Removed"
                 } else {
@@ -931,7 +1086,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
             ));
             return;
         }
-        if matches!(
+        if (matches!(
             event.request.tool.as_str(),
             "sculpt_stroke"
                 | "voxel_brush"
@@ -947,7 +1102,8 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 | "mirror_object"
                 | "capture_viewport"
                 | "capture_studio"
-        ) && self.background.is_none()
+        ) || agent_tools::HEAVY.contains(&event.request.tool.as_str()))
+            && self.background.is_none()
         {
             let request = event.request.clone();
             let mut scene = self.scene.clone();

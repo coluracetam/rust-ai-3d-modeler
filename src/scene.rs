@@ -226,8 +226,90 @@ pub struct WorldRayHit {
     pub world_distance: f32,
 }
 
+/// A world-space box the user places to mark a region. Unlike face indices it survives
+/// topology changes and can mark empty space ("add something here").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SelectionVolume {
+    pub center: Vec3,
+    pub half_extents: Vec3,
+    #[serde(default)]
+    pub label: String,
+}
+
+impl SelectionVolume {
+    pub const MIN_HALF: f32 = 0.005;
+
+    pub fn new(center: Vec3, half_extents: Vec3) -> Self {
+        Self {
+            center,
+            half_extents: half_extents.abs().max(Vec3::splat(Self::MIN_HALF)),
+            label: String::new(),
+        }
+    }
+
+    pub fn from_min_max(a: Vec3, b: Vec3) -> Self {
+        let (min, max) = (a.min(b), a.max(b));
+        Self::new((min + max) * 0.5, (max - min) * 0.5)
+    }
+
+    pub fn min(&self) -> Vec3 {
+        self.center - self.half_extents
+    }
+
+    pub fn max(&self) -> Vec3 {
+        self.center + self.half_extents
+    }
+
+    pub fn contains(&self, p: Vec3) -> bool {
+        p.cmpge(self.min()).all() && p.cmple(self.max()).all()
+    }
+
+    pub fn corners(&self) -> [Vec3; 8] {
+        let (a, b) = (self.min(), self.max());
+        [
+            Vec3::new(a.x, a.y, a.z),
+            Vec3::new(b.x, a.y, a.z),
+            Vec3::new(b.x, a.y, b.z),
+            Vec3::new(a.x, a.y, b.z),
+            Vec3::new(a.x, b.y, a.z),
+            Vec3::new(b.x, b.y, a.z),
+            Vec3::new(b.x, b.y, b.z),
+            Vec3::new(a.x, b.y, b.z),
+        ]
+    }
+
+    /// Corner index pairs of the 12 edges.
+    pub const EDGES: [(usize, usize); 12] = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ];
+
+    /// Centre of the face on `axis` (0..3), on the positive or negative side.
+    pub fn face_handle(&self, axis: usize, positive: bool) -> Vec3 {
+        let mut p = self.center;
+        p[axis] += if positive { self.half_extents[axis] } else { -self.half_extents[axis] };
+        p
+    }
+
+    /// Move one face along its axis to `value`, keeping the opposite face in place.
+    pub fn move_face(&mut self, axis: usize, positive: bool, value: f32) {
+        let (mut lo, mut hi) = (self.min()[axis], self.max()[axis]);
+        if positive {
+            hi = value.max(lo + 2.0 * Self::MIN_HALF);
+        } else {
+            lo = value.min(hi - 2.0 * Self::MIN_HALF);
+        }
+        self.center[axis] = (lo + hi) * 0.5;
+        self.half_extents[axis] = (hi - lo) * 0.5;
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommentTargetSection {
+    /// Name the user gave this region (e.g. "left tower roof"); empty when unnamed.
+    #[serde(default)]
+    pub label: String,
     #[serde(default)]
     pub topology_hash: Option<u64>,
     #[serde(default)]
@@ -304,6 +386,10 @@ pub struct SpatialComment {
     pub local_bounds_max: Vec3,
     #[serde(default)]
     pub targets: Vec<CommentTargetSection>,
+    /// World-space box marking the region. When present the comment follows the box, so it
+    /// never needs reattachment and may cover empty space.
+    #[serde(default)]
+    pub volume: Option<SelectionVolume>,
     pub comment: String,
     pub resolved: bool,
     pub agent_reply: Option<String>,
@@ -364,6 +450,12 @@ pub struct Scene {
     /// Tracks the latest clicked/painted surface anchor `(object_id, world_point, local_point, world_normal)`
     #[serde(default)]
     pub pending_anchor: Option<(u64, Vec3, Vec3, Vec3)>,
+    /// The 3D box selector, when placed.
+    #[serde(default)]
+    pub selection_volume: Option<SelectionVolume>,
+    /// Names for the current selection's regions, keyed by (object id, lowest face index).
+    #[serde(skip)]
+    pub region_labels: std::collections::HashMap<(u64, usize), String>,
 }
 
 impl Default for Scene {
@@ -390,6 +482,8 @@ impl Default for Scene {
             next_comment_id: 1,
             active_comment_id: None,
             pending_anchor: None,
+            selection_volume: None,
+            region_labels: Default::default(),
         };
         // Start with a high-detail Sculpt/Voxel Sphere and a Reference Cube or single default sculptable sphere
         let grid = VoxelGrid::new_sphere(32, 3.2, 1.15);
@@ -435,6 +529,8 @@ impl Scene {
             next_comment_id: 1,
             active_comment_id: None,
             pending_anchor: None,
+            selection_volume: None,
+            region_labels: Default::default(),
         }
     }
 
@@ -636,6 +732,7 @@ impl Scene {
 
     pub fn comment_needs_reattachment(&self, comment: &SpatialComment) -> bool {
         !comment.is_general
+            && comment.volume.is_none()
             && (comment.targets.is_empty()
                 || comment
                     .targets
@@ -683,7 +780,9 @@ impl Scene {
                 Some(obj.transform.matrix().transform_point3(local))
             })
             .collect();
-        if points.is_empty() {
+        if let (true, Some(v)) = (points.is_empty(), &comment.volume) {
+            v.center
+        } else if points.is_empty() {
             comment.world_anchor
         } else {
             points.iter().sum::<Vec3>() / points.len() as f32
@@ -870,6 +969,141 @@ impl Scene {
             }
         }
         self.pending_anchor = None;
+        self.region_labels.clear();
+    }
+
+    /// Faces of every visible part whose centre lies inside `volume`, per object index.
+    pub fn faces_in_volume(
+        &self,
+        volume: &SelectionVolume,
+    ) -> std::collections::HashMap<usize, std::collections::HashSet<usize>> {
+        let (min, max) = (volume.min(), volume.max());
+        let mut hits = std::collections::HashMap::new();
+        for (oi, obj) in self.objects.iter().enumerate() {
+            if !obj.visible {
+                continue;
+            }
+            let model = obj.transform.matrix();
+            // Skip parts whose bounds miss the box entirely.
+            let (lo, hi) = obj.mesh.bounds();
+            let mut wmin = Vec3::splat(f32::MAX);
+            let mut wmax = Vec3::splat(f32::MIN);
+            for i in 0..8 {
+                let c = Vec3::new(
+                    if i & 1 == 0 { lo.x } else { hi.x },
+                    if i & 2 == 0 { lo.y } else { hi.y },
+                    if i & 4 == 0 { lo.z } else { hi.z },
+                );
+                let w = model.transform_point3(c);
+                wmin = wmin.min(w);
+                wmax = wmax.max(w);
+            }
+            if wmin.cmpgt(max).any() || wmax.cmplt(min).any() {
+                continue;
+            }
+            let faces = obj.mesh.faces_in_world_box(model, min, max);
+            if !faces.is_empty() {
+                hits.insert(oi, faces);
+            }
+        }
+        hits
+    }
+
+    /// Make the face selection exactly the faces inside the 3D box selector.
+    /// Returns (faces, parts) selected.
+    pub fn apply_volume_selection(&mut self) -> (usize, usize) {
+        let Some(volume) = self.selection_volume.clone() else {
+            return (0, 0);
+        };
+        let hits = self.faces_in_volume(&volume);
+        for obj in &mut self.objects {
+            if !obj.mesh.selected_faces.is_empty() {
+                obj.mesh.clear_selection();
+            }
+        }
+        self.region_labels.clear();
+        let mut faces = 0;
+        let mut best: Option<(usize, usize)> = None;
+        for (&oi, set) in &hits {
+            faces += set.len();
+            self.objects[oi].mesh.apply_face_set_selection(set, true, false);
+            if best.is_none_or(|(n, _)| set.len() > n) {
+                best = Some((set.len(), oi));
+            }
+        }
+        self.selected_object = best.map(|(_, oi)| oi);
+        self.pending_anchor = None;
+        (faces, hits.len())
+    }
+
+    /// Targets of a comment as they stand now: refreshed indices where the stored faces can
+    /// still be found, otherwise (for comments with a box) whatever lies inside the box.
+    pub fn resolved_targets(&self, comment: &SpatialComment) -> Vec<CommentTargetSection> {
+        let refreshed: Option<Vec<_>> = comment
+            .targets
+            .iter()
+            .map(|t| self.refreshed_target(t))
+            .collect();
+        match (refreshed, &comment.volume) {
+            (Some(list), _) => list,
+            (None, Some(volume)) => {
+                let mut out = Vec::new();
+                let mut hits: Vec<_> = self.faces_in_volume(volume).into_iter().collect();
+                hits.sort_by_key(|(oi, _)| *oi);
+                for (oi, faces) in hits {
+                    let obj = &self.objects[oi];
+                    let mut probe = obj.mesh.clone();
+                    probe.selected_faces = faces;
+                    for group in probe.selected_components() {
+                        out.push(self.section_for_faces(obj, group, String::new()));
+                    }
+                }
+                out
+            }
+            (None, None) => comment.targets.clone(),
+        }
+    }
+
+    fn section_for_faces(
+        &self,
+        obj: &SceneObject,
+        selected_faces: Vec<usize>,
+        label: String,
+    ) -> CommentTargetSection {
+        let model = obj.transform.matrix();
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        let mut center = Vec3::ZERO;
+        let mut normal = Vec3::ZERO;
+        for &fi in &selected_faces {
+            center += obj.mesh.face_center(fi);
+            normal += obj.mesh.face_normal(fi);
+            for &vi in &obj.mesh.faces[fi] {
+                min = min.min(obj.mesh.positions[vi]);
+                max = max.max(obj.mesh.positions[vi]);
+            }
+        }
+        center /= selected_faces.len().max(1) as f32;
+        CommentTargetSection {
+            label,
+            topology_hash: Some(obj.mesh.topology_hash()),
+            face_signatures: selected_faces
+                .iter()
+                .map(|&i| obj.mesh.face_signature(i))
+                .collect(),
+            object_id: obj.id,
+            object_name: obj.name.clone(),
+            world_anchor: model.transform_point3(center),
+            local_anchor: center,
+            surface_normal: model
+                .inverse()
+                .transpose()
+                .transform_vector3(normal.normalize_or_zero())
+                .normalize_or_zero(),
+            selected_faces,
+            local_bounds_min: min,
+            local_bounds_max: max,
+        }
     }
 
     /// Returns true if any object has selected faces or if `selected_object` is set.
@@ -907,6 +1141,11 @@ impl Scene {
                 }
                 center /= selected_faces.len() as f32;
                 sections.push(CommentTargetSection {
+                    label: selected_faces
+                        .first()
+                        .and_then(|&f| self.region_labels.get(&(obj.id, f)))
+                        .cloned()
+                        .unwrap_or_default(),
                     topology_hash: Some(obj.mesh.topology_hash()),
                     face_signatures: selected_faces
                         .iter()
@@ -963,6 +1202,7 @@ impl Scene {
                     .transform_vector3(local_normal)
                     .normalize_or_zero();
                 sections.push(CommentTargetSection {
+                    label: String::new(),
                     topology_hash: Some(obj.mesh.topology_hash()),
                     face_signatures: Vec::new(),
                     object_id: obj.id,
@@ -986,6 +1226,41 @@ impl Scene {
         comment_text: impl Into<String>,
         selection_radius: f32,
     ) -> Option<SpatialComment> {
+        let has_faces = self.objects.iter().any(|o| !o.mesh.selected_faces.is_empty());
+        if let (false, Some(volume)) = (has_faces, self.selection_volume.clone()) {
+            // The box covers no geometry: a comment about that space itself.
+            let cid = self.next_comment_id.max(1);
+            self.next_comment_id = cid + 1;
+            let item = SpatialComment {
+                status: CommentStatus::Open,
+                replies: Vec::new(),
+                id: cid,
+                is_general: false,
+                object_id: 0,
+                object_name: if volume.label.is_empty() {
+                    "Empty space".to_string()
+                } else {
+                    volume.label.clone()
+                },
+                world_anchor: volume.center,
+                local_anchor: volume.center,
+                surface_normal: Vec3::Y,
+                selection_radius,
+                selected_faces: Vec::new(),
+                local_bounds_min: volume.min(),
+                local_bounds_max: volume.max(),
+                targets: Vec::new(),
+                volume: Some(volume),
+                comment: comment_text.into(),
+                resolved: false,
+                agent_reply: None,
+                draft: false,
+                attachments: Vec::new(),
+            };
+            self.comments.push(item.clone());
+            self.active_comment_id = Some(cid);
+            return Some(item);
+        }
         let targets = self.collect_current_target_sections(selection_radius);
         let first = targets.first()?.clone();
 
@@ -1037,6 +1312,7 @@ impl Scene {
             local_bounds_min: first.local_bounds_min,
             local_bounds_max: first.local_bounds_max,
             targets,
+            volume: self.selection_volume.clone(),
             comment: comment_text.into(),
             resolved: false,
             agent_reply: None,
@@ -1069,6 +1345,7 @@ impl Scene {
             local_bounds_min: Vec3::ZERO,
             local_bounds_max: Vec3::ZERO,
             targets: Vec::new(),
+            volume: None,
             comment: comment_text.into(),
             resolved: false,
             agent_reply: None,
@@ -1087,6 +1364,15 @@ impl Scene {
         if comment.is_general {
             self.active_comment_id = Some(comment_id);
             return Some(Vec3::ZERO);
+        }
+        if let Some(volume) = &comment.volume {
+            // The box is the source of truth: reselect whatever is inside it now.
+            self.selection_volume = Some(volume.clone());
+            if comment.targets.is_empty() || self.restore_targets(&comment.targets).is_err() {
+                self.apply_volume_selection();
+            }
+            self.active_comment_id = Some(comment_id);
+            return Some(volume.center);
         }
         self.restore_targets(&comment.targets).ok()?;
         let anchor = self.current_comment_anchor(&comment);
