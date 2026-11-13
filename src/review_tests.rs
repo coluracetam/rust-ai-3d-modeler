@@ -464,3 +464,132 @@ fn new_project_waits_for_pending_revisions() {
     assert!(e.call("new_project", json!({})).ok);
     assert!(e.scene.revisions.is_empty());
 }
+
+#[test]
+fn finished_revisions_keep_only_changed_objects_and_revert_in_place() {
+    let mut e = Editor::new();
+    e.scene
+        .add_mesh_object("Untouched", Mesh::cube(1.0), [0.2, 0.2, 0.2]);
+    e.scene
+        .add_mesh_object("Deleted", Mesh::cube(1.0), [0.3, 0.3, 0.3]);
+    let order: Vec<u64> = e.scene.objects.iter().map(|o| o.id).collect();
+    let r = e.call("begin_revision", json!({"label":"Edit"}));
+    let id = r.data["revision_id"].as_u64().unwrap();
+    e.scene.objects[0].transform.translation.y = 4.0;
+    e.scene.objects.remove(2);
+    assert!(e.call("add_primitive", json!({"shape":"sphere"})).ok);
+    assert!(
+        e.call("finish_revision", json!({"revision_id":id,"summary":"Done"}))
+            .ok
+    );
+    let rev = e.scene.revisions.iter().find(|r| r.id == id).unwrap();
+    assert!(rev.partial);
+    assert_eq!(rev.before.len(), 2, "moved + deleted");
+    assert_eq!(rev.after.as_ref().unwrap().len(), 2, "moved + added");
+    assert_eq!(e.scene.changed_objects(id).len(), 3);
+    // Comparison views rebuild the full scene from live parts.
+    e.scene.preview_revision = Some((id, true));
+    let before: Vec<u64> = e.scene.display_scene().objects.iter().map(|o| o.id).collect();
+    assert_eq!(before, order);
+    e.scene.preview_revision = None;
+    assert!(e.call("revert_revision", json!({"revision_id":id})).ok);
+    let ids: Vec<u64> = e.scene.objects.iter().map(|o| o.id).collect();
+    assert_eq!(ids, order);
+    assert_eq!(e.scene.objects[0].transform.translation.y, 0.0);
+}
+
+#[test]
+fn old_reviewed_revisions_drop_geometry() {
+    let mut e = Editor::new();
+    for i in 0..4 {
+        let r = e.call("begin_revision", json!({"label": format!("R{i}")}));
+        let id = r.data["revision_id"].as_u64().unwrap();
+        e.scene.objects[0].transform.translation.x = i as f32 + 1.0;
+        assert!(e.call("finish_revision", json!({"revision_id":id,"summary":"s"})).ok);
+        assert!(e.call("accept_revision", json!({"revision_id":id})).ok);
+    }
+    let pruned: Vec<bool> = e.scene.revisions.iter().map(|r| r.geometry_pruned).collect();
+    assert_eq!(pruned, vec![true, true, false, false]);
+    assert!(e.call("get_revisions", json!({})).ok);
+}
+
+#[test]
+fn drafts_are_hidden_until_sent_and_change_requests_reopen_comments() {
+    let mut e = Editor::new();
+    let c = e.scene.add_comment_for_selection("Taller", 0.3).unwrap();
+    e.scene.comments.iter_mut().for_each(|c| c.draft = true);
+    let r = e.call("get_comments", json!({}));
+    assert_eq!(r.data["count"], 0);
+    assert_eq!(r.data["drafts_pending"], 1);
+    let state = e.call("get_feedback_state", json!({}));
+    assert_eq!(state.data["open_comments"], 0);
+    assert_eq!(e.call("send_comments", json!({})).data["sent"], 1);
+    assert_eq!(e.scene.feedback_batch, 1);
+    assert_eq!(e.call("get_comments", json!({})).data["count"], 1);
+
+    // wait_for_feedback returns at once for waiting comments, and times out otherwise.
+    let resp = crate::mcp::wait_for_feedback(&json!({}), |req| e.call(&req.tool, req.args.clone()));
+    assert_eq!(resp.data["woke"], true);
+    let resp = crate::mcp::wait_for_feedback(
+        &json!({"since_batch": 1, "timeout_seconds": 1}),
+        |req| e.call(&req.tool, req.args.clone()),
+    );
+    assert_eq!(resp.data["woke"], false);
+
+    let r = e.call("begin_revision", json!({"label":"Taller","comment_id":c.id}));
+    let id = r.data["revision_id"].as_u64().unwrap();
+    e.scene.objects[0].transform.scale.y = 2.0;
+    assert!(e.call("finish_revision", json!({"revision_id":id,"summary":"Scaled"})).ok);
+    assert!(
+        e.call("request_changes", json!({"revision_id":id,"notes":"Only the top half"}))
+            .ok
+    );
+    assert_eq!(e.scene.objects[0].transform.scale.y, 1.0);
+    let comment = e.scene.comments.iter().find(|x| x.id == c.id).unwrap();
+    assert_eq!(comment.status, CommentStatus::Open);
+    assert_eq!(comment.replies.last().unwrap().text, "Only the top half");
+    assert_eq!(e.scene.feedback_batch, 2);
+    let resp = crate::mcp::wait_for_feedback(
+        &json!({"since_batch": 1, "timeout_seconds": 1}),
+        |req| e.call(&req.tool, req.args.clone()),
+    );
+    assert_eq!(resp.data["woke"], true);
+}
+
+#[test]
+fn modeling_tools_through_the_dispatcher() {
+    let mut e = Editor::new();
+    let base = e.scene.objects[0].id;
+    assert!(e.call("add_primitive", json!({"shape":"cube","size":1.0,"position":[1.0,0.0,0.0]})).ok);
+    let cutter = e.scene.objects.last().unwrap().id;
+    let r = e.call("boolean", json!({"object_id":base,"tool_object_id":cutter,"operation":"subtract"}));
+    assert!(r.ok, "{}", r.message);
+    assert_eq!(e.scene.objects.len(), 1);
+    let v = crate::modeling::signed_volume(&e.scene.objects[0].mesh);
+    assert!((v - 7.5).abs() < 1e-2, "{v}");
+    assert!(e.call("array_object", json!({"object_id":base,"count":4,"offset":[3.0,0.0,0.0]})).ok);
+    assert_eq!(e.scene.objects.len(), 4);
+    assert!((e.scene.objects[3].transform.translation.x - 9.0).abs() < 1e-4);
+    assert!(e.call("mirror_object", json!({"object_id":base,"axis":"x","merge":false})).ok);
+    assert_eq!(e.scene.objects.len(), 5);
+    let lathe = e.call("add_lathe", json!({"profile":[[0.0,0.0],[0.5,0.0],[0.3,1.0],[0.0,1.2]]}));
+    assert!(lathe.ok, "{}", lathe.message);
+    let sweep = e.call("add_sweep", json!({"path":[[0,0,0],[0,1,0],[1,2,0]],"radius":0.05}));
+    assert!(sweep.ok, "{}", sweep.message);
+    let id = sweep.data["object_id"].as_u64().unwrap();
+    let r = e.call("edit_mesh", json!({"object_id":id,"operation":"bevel","select_faces":[0],"width":0.01}));
+    assert!(r.ok, "{}", r.message);
+    assert!(e.call("undo", json!({})).ok);
+}
+
+#[test]
+fn clear_selection_tool_clears_everything() {
+    let mut e = Editor::new();
+    e.scene.selected_object = Some(0);
+    assert!(e.scene.has_any_selection());
+    let r = e.call("clear_selection", json!({}));
+    assert!(r.ok, "{}", r.message);
+    assert_eq!(r.data["cleared_faces"], 1);
+    assert!(!e.scene.has_any_selection());
+    assert!(e.scene.objects[0].mesh.selected_faces.is_empty());
+}

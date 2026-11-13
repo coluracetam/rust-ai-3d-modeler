@@ -43,8 +43,9 @@ pub fn send_to_live_gui(req: &IpcRequest) -> Option<IpcResponse> {
 pub fn mcp_tool_definitions() -> Value {
     json!([
         { "name":"delete_comment", "description":"Delete a comment after its pending revision has been reviewed.", "inputSchema":{"type":"object","properties":{"comment_id":{"type":"integer"}},"required":["comment_id"]} },
+        { "name":"clear_selection", "description":"Clear every face selection, the selected part and the focused comment. Selected parts glow and selected faces are tinted in the viewport and in capture_viewport/capture_studio images, so clear the selection before taking review screenshots. Does not change geometry.", "inputSchema":{"type":"object","properties":{}} },
         { "name":"cancel_operation", "description":"Cancel a running GUI operation and discard its result without changing live geometry.", "inputSchema":{"type":"object","properties":{}} },
-        { "name":"capture_studio", "description":"Capture the full studio UI and viewport as a PNG for visual review.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"tab":{"type":"integer","enum":[0,1]}}} },
+        { "name":"capture_studio", "description":"Capture the full studio UI and viewport as a PNG for visual review. With compare_revision, the viewport shows a before/after wipe of that revision (before on the left of `split`, after on the right) - useful as a finish_revision screenshot.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"tab":{"type":"integer","enum":[0,1]},"compare_revision":{"type":"integer"},"split":{"type":"number","description":"Divider position 0..1 (default 0.5)."}}} },
         { "name":"save_project", "description":"Save the full project, camera, comments, selections and revisions atomically with a backup.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"}}} },
         { "name":"new_project", "description":"Start a blank, unsaved project: removes all objects, comments, revisions, saved selections and views, and resets the camera. Undo restores the previous project. Save first if the current project has never been saved.", "inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Optional project title (default 'Untitled project')."}}} },
         { "name":"open_project", "description":"Open a project, or recover its autosave. Existing work remains undoable.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"recover":{"type":"boolean"}},"required":["path"]} },
@@ -237,7 +238,7 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "edit_mesh",
-            "description": "Perform polygonal mesh modeling operations: select faces by index or normal direction, extrude faces, inset faces, loop-cut/subdivide, or translate/rotate/scale/delete selected faces.",
+            "description": "Perform polygonal mesh modeling operations: select faces by index or normal direction, extrude faces, inset faces, bevel (chamfer) the border of the selected region by `width`, loop-cut/subdivide, or translate/rotate/scale/delete selected faces.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -251,6 +252,7 @@ pub fn mcp_tool_definitions() -> Value {
                             "clear_selection",
                             "extrude",
                             "inset",
+                            "bevel",
                             "subdivide",
                             "translate_selected",
                             "scale_selected",
@@ -276,6 +278,10 @@ pub fn mcp_tool_definitions() -> Value {
                     "distance": {
                         "type": "number",
                         "description": "Extrusion distance along normal (for 'extrude', default 0.45)."
+                    },
+                    "width": {
+                        "type": "number",
+                        "description": "Chamfer width in meters (for 'bevel', default 0.05)."
                     },
                     "inset_factor": {
                         "type": "number",
@@ -480,9 +486,43 @@ pub fn mcp_tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "include_resolved": { "type": "boolean", "description": "Whether to include resolved comments (default false)." }
+                    "include_resolved": { "type": "boolean", "description": "Whether to include resolved comments (default false)." },
+                    "include_drafts": { "type": "boolean", "description": "Also include comments the user has not sent yet (default false; do not act on drafts)." }
                 }
             }
+        },
+        { "name":"mirror_object", "description":"Mirror a part across the plane through its local origin normal to `axis`. merge=true (default) adds the reflected half to the same mesh (build half a symmetric part, then mirror); merge=false creates a separate mirrored part.", "inputSchema":{"type":"object","properties":{"object_id":{"type":"integer"},"name":{"type":"string"},"axis":{"type":"string","enum":["x","y","z"]},"merge":{"type":"boolean"}}} },
+        { "name":"array_object", "description":"Repeat a part `count` times. Each copy applies the step (rotate by rotation_deg about the part's local origin, scale, then move by `offset`, all in the part's local frame) to the previous one, so offset [1,0,0] makes a row and rotation_deg [0,30,0] with offset [0,0,0] makes a radial ring around the origin. merge=false (default) creates separate parts; merge=true combines them into one mesh.", "inputSchema":{"type":"object","properties":{"object_id":{"type":"integer"},"name":{"type":"string"},"count":{"type":"integer","minimum":2,"maximum":128},"offset":{"type":"array","items":{"type":"number"}},"rotation_deg":{"type":"array","items":{"type":"number"}},"scale":{"type":"number"},"merge":{"type":"boolean"}},"required":["count"]} },
+        { "name":"add_lathe", "description":"Create a solid of revolution (vase, column, bowl, wheel, finial) by revolving a profile of [radius, height] points around the local Y axis. Points with radius 0 close the ends.", "inputSchema":{"type":"object","properties":{"profile":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"[[radius, height], ...] from bottom to top."},"segments":{"type":"integer"},"angle_deg":{"type":"number","description":"Sweep angle, default 360."},"cap":{"type":"boolean","description":"Close open ends with flat caps (default true)."},"name":{"type":"string"},"color":{"type":"array","items":{"type":"number"}},"position":{"type":"array","items":{"type":"number"}},"rotation_deg":{"type":"array","items":{"type":"number"}}},"required":["profile"]} },
+        { "name":"add_sweep", "description":"Create a tube, rail, branch, cable, handle or molding by sweeping a cross-section along a 3D path. Use `radius`+`sides` for a round tube or `profile` ([[x, y], ...], counter-clockwise) for a custom section. Supports closed loops, twist and tapering via end_scale.", "inputSchema":{"type":"object","properties":{"path":{"type":"array","items":{"type":"array","items":{"type":"number"}}},"radius":{"type":"number"},"sides":{"type":"integer"},"profile":{"type":"array","items":{"type":"array","items":{"type":"number"}}},"closed":{"type":"boolean"},"cap":{"type":"boolean"},"twist_deg":{"type":"number"},"end_scale":{"type":"number"},"name":{"type":"string"},"color":{"type":"array","items":{"type":"number"}},"position":{"type":"array","items":{"type":"number"}},"rotation_deg":{"type":"array","items":{"type":"number"}}},"required":["path"]} },
+        { "name":"boolean", "description":"Constructive solid geometry between two closed parts: union, subtract (cut tool_object out of the target, e.g. windows, holes, grooves) or intersect. The target (object_id/name) receives the result in its own local space; the tool part is removed unless keep_tool=true. Works best on closed, watertight meshes of moderate size.", "inputSchema":{"type":"object","properties":{"object_id":{"type":"integer"},"name":{"type":"string"},"tool_object_id":{"type":"integer"},"operation":{"type":"string","enum":["union","subtract","intersect"]},"keep_tool":{"type":"boolean"}},"required":["tool_object_id","operation"]} },
+        {
+            "name": "wait_for_feedback",
+            "description": "Block until the user sends comments to the agent (the GUI's 'Send to agent' button) or asks for changes on a revision, then return the open comments with `feedback_batch`. Use it to work in a loop: wait, edit inside a revision, finish_revision, then wait again passing the last feedback_batch as since_batch. Without since_batch it returns immediately if open comments are already waiting. Returns woke=false on timeout; just call again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since_batch": { "type": "integer", "description": "The feedback_batch you last handled; wait for a newer one." },
+                    "timeout_seconds": { "type": "number", "description": "Maximum wait (default 600, max 3600)." }
+                }
+            }
+        },
+        {
+            "name": "request_changes",
+            "description": "Revert a revision that is ready for review and reopen its comment with the user's notes as a reply (what the GUI's 'Request changes' button does).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "revision_id": { "type": "integer" },
+                    "notes": { "type": "string", "description": "What should be different next time." }
+                },
+                "required": ["revision_id"]
+            }
+        },
+        {
+            "name": "send_comments",
+            "description": "Send all draft comments to the agent as one feedback batch (what the GUI's 'Send to agent' button does).",
+            "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "select_comment_region",
@@ -591,6 +631,21 @@ pub fn run_mcp_stdio_server() {
 
                 let ipc_resp = if tool_name == "launch_gui_window" {
                     launch_gui_if_needed()
+                } else if tool_name == "wait_for_feedback" {
+                    wait_for_feedback(&args, |req| {
+                        send_to_live_gui(req).unwrap_or_else(|| {
+                            execute_headless(
+                                req,
+                                &mut fallback_scene,
+                                &mut fallback_camera,
+                                &mut fallback_history,
+                                &mut fallback_ui,
+                                &mut fallback_shading,
+                                &mut fallback_wire,
+                                &mut fallback_grid,
+                            )
+                        })
+                    })
                 } else {
                     let req = IpcRequest {
                         tool: tool_name,
@@ -647,6 +702,58 @@ pub fn run_mcp_stdio_server() {
         };
 
         write_jsonrpc_message(&mut stdout, &response, use_content_length);
+    }
+}
+
+/// Block until the user sends feedback, then return the open comments.
+///
+/// Without `since_batch` it returns at once when open comments are waiting; otherwise it waits
+/// for the next batch. Polls the editor (or the headless scene file) so the GUI never blocks.
+pub fn wait_for_feedback(
+    args: &Value,
+    mut call: impl FnMut(&IpcRequest) -> IpcResponse,
+) -> IpcResponse {
+    let timeout = Duration::from_secs_f64(
+        args.get("timeout_seconds")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(600.0)
+            .clamp(1.0, 3600.0),
+    );
+    let since = args.get("since_batch").and_then(|v| v.as_u64());
+    let state_req = IpcRequest {
+        tool: "get_feedback_state".into(),
+        args: json!({}),
+    };
+    let start = std::time::Instant::now();
+    loop {
+        let state = call(&state_req);
+        if !state.ok {
+            return state;
+        }
+        let batch = state.data["feedback_batch"].as_u64().unwrap_or(0);
+        let open = state.data["open_comments"].as_u64().unwrap_or(0);
+        let ready = match since {
+            Some(since) => batch > since,
+            None => open > 0,
+        };
+        if ready {
+            let mut resp = call(&IpcRequest {
+                tool: "get_comments".into(),
+                args: json!({}),
+            });
+            if let Some(data) = resp.data.as_object_mut() {
+                data.insert("woke".into(), json!(true));
+            }
+            resp.message = format!("New feedback (batch {batch}). {}", resp.message);
+            return resp;
+        }
+        if start.elapsed() >= timeout {
+            return IpcResponse::success(
+                "No new feedback yet; call wait_for_feedback again with the same since_batch",
+                json!({"woke": false, "feedback_batch": batch, "open_comments": open}),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 

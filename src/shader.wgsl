@@ -239,7 +239,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let spec = pow(max(dot(N, H), 0.0), 28.0) * 0.18;
         let ambient = mix(vec3<f32>(0.18, 0.14, 0.13), vec3<f32>(0.34, 0.28, 0.25), N.y * 0.5 + 0.5);
         let col = clay_base * (ambient + vec3<f32>(0.85, 0.82, 0.78) * ndotl + fill) + vec3<f32>(spec + rim) + emissive;
-        return vec4<f32>(col, object.inspection.x);
+        return vec4<f32>(selection_glow(col, N, V), object.inspection.x);
     }
 
     // Mode 0: Studio 3-Point PBR-inspired lighting + Procedural Texture + Emissive Glow
@@ -264,5 +264,53 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let spec_color = mix(vec3<f32>(1.0), surface_color, metallic);
 
     let final_rgb = surface_color * diffuse_light * (1.0 - metallic * 0.45) + spec_color * spec + emissive;
-    return vec4<f32>(final_rgb, object.inspection.x);
+    return vec4<f32>(selection_glow(final_rgb, N, V), object.inspection.x);
+}
+
+// Whole-part selection: a teal tint plus a fresnel rim so the part reads at any distance.
+fn selection_glow(col: vec3<f32>, N: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
+    let g = object.inspection.y;
+    if (g <= 0.0) {
+        return col;
+    }
+    let accent = vec3<f32>(0.40, 0.89, 0.76);
+    let rim = pow(1.0 - clamp(abs(dot(N, V)), 0.0, 1.0), 2.2);
+    return mix(col, accent, 0.16 * g) + accent * rim * 0.85 * g;
+}
+
+struct BackdropOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_backdrop(@builtin(vertex_index) i: u32) -> BackdropOut {
+    var out: BackdropOut;
+    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    out.pos = vec4<f32>(xy, 1.0, 1.0);
+    out.uv = xy * 0.5 + 0.5;
+    return out;
+}
+
+// Studio backdrop: lifted horizon glow fading to a deep top, with a soft vignette.
+@fragment
+fn fs_backdrop(in: BackdropOut) -> @location(0) vec4<f32> {
+    let top = vec3<f32>(0.040, 0.050, 0.070);
+    let horizon = vec3<f32>(0.135, 0.155, 0.195);
+    let floor_col = vec3<f32>(0.075, 0.085, 0.108);
+    let y = in.uv.y;
+    var col = mix(floor_col, horizon, smoothstep(0.0, 0.42, y));
+    col = mix(col, top, smoothstep(0.42, 1.0, y));
+    let d = distance(in.uv, vec2<f32>(0.5, 0.45));
+    col *= 1.0 - smoothstep(0.45, 1.05, d) * 0.45;
+    return vec4<f32>(col, 1.0);
+}
+
+// Soft radial contact shadow on a ground quad (local xz in -1..1).
+@fragment
+fn fs_shadow(in: VertexOutput) -> @location(0) vec4<f32> {
+    if (dot(global.clip_plane.xyz, in.world_pos) + global.clip_plane.w < 0.0) { discard; }
+    let d = length(in.local_pos.xz);
+    let a = pow(1.0 - smoothstep(0.0, 1.0, d), 1.3) * 0.72;
+    return vec4<f32>(0.0, 0.0, 0.0, a);
 }
