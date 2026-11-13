@@ -84,6 +84,7 @@ pub struct Renderer3D {
     pub ghost_pipeline: wgpu::RenderPipeline,
     pub line_depth_pipeline: wgpu::RenderPipeline,
     pub line_overlay_pipeline: wgpu::RenderPipeline,
+    pub line_xray_pipeline: wgpu::RenderPipeline,
     background_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_vertex_buffer: wgpu::Buffer,
@@ -94,10 +95,14 @@ pub struct Renderer3D {
     pub object_bind_group_layout: wgpu::BindGroupLayout,
     pub identity_line_bind_group: wgpu::BindGroup,
     pub depth_texture_view: wgpu::TextureView,
+    msaa_view: wgpu::TextureView,
+    surface_format: wgpu::TextureFormat,
     pub depth_size: (u32, u32),
     pub grid_vertex_buffer: wgpu::Buffer,
     pub grid_vertex_count: u32,
     pub ghost_unselected: bool,
+    /// Draw selection outlines through occluding geometry.
+    pub xray_selection: bool,
     pub show_grid: bool,
     pub show_wireframe_overlay: bool,
     pub shading: ViewportShading,
@@ -142,6 +147,8 @@ impl Renderer3D {
     }
 
     pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+    /// Anti-aliasing samples for the 3D pass (resolved before the UI is drawn).
+    const SAMPLES: u32 = 4;
 
     pub fn new(
         device: &wgpu::Device,
@@ -291,7 +298,10 @@ impl Renderer3D {
                     clamp: 0.0,
                 },
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: Self::SAMPLES,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -332,7 +342,10 @@ impl Renderer3D {
                     clamp: 0.0,
                 },
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: Self::SAMPLES,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -367,7 +380,10 @@ impl Renderer3D {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: Self::SAMPLES,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -403,7 +419,57 @@ impl Renderer3D {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                count: Self::SAMPLES,
+                ..Default::default()
+            },
+                multiview: None,
+                cache: None,
+            });
+
+        // Same lines drawn through geometry at reduced strength (blend constant).
+        let line_xray_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Line X-ray Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &vertex_buffers,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Constant,
+                                dst_factor: wgpu::BlendFactor::OneMinusConstant,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent::OVER,
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: Self::DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                count: Self::SAMPLES,
+                ..Default::default()
+            },
                 multiview: None,
                 cache: None,
             });
@@ -435,7 +501,10 @@ impl Renderer3D {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: Self::SAMPLES,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -466,7 +535,10 @@ impl Renderer3D {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: Self::SAMPLES,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -494,6 +566,7 @@ impl Renderer3D {
         let w = width.max(1);
         let h = height.max(1);
         let depth_texture_view = Self::create_depth_view(device, w, h);
+        let msaa_view = Self::create_msaa_view(device, surface_format, w, h);
         let grid_verts = Self::build_grid_vertices(12, 1.0);
         let grid_vertex_count = grid_verts.len() as u32;
         let grid_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -507,6 +580,7 @@ impl Renderer3D {
             ghost_pipeline,
             line_depth_pipeline,
             line_overlay_pipeline,
+            line_xray_pipeline,
             background_pipeline,
             shadow_pipeline,
             shadow_vertex_buffer,
@@ -516,11 +590,14 @@ impl Renderer3D {
             object_bind_group_layout,
             identity_line_bind_group,
             depth_texture_view,
+            msaa_view,
+            surface_format,
             depth_size: (w, h),
             grid_vertex_buffer,
             grid_vertex_count,
             show_grid: true,
             ghost_unselected: false,
+            xray_selection: true,
             show_wireframe_overlay: false,
             shading: ViewportShading::StudioLit,
             viewport: None,
@@ -534,8 +611,33 @@ impl Renderer3D {
         let h = height.max(1);
         if self.depth_size != (w, h) {
             self.depth_texture_view = Self::create_depth_view(device, w, h);
+            self.msaa_view = Self::create_msaa_view(device, self.surface_format, w, h);
             self.depth_size = (w, h);
         }
+    }
+
+    /// Multisampled colour target the 3D pass draws into before resolving to the output.
+    fn create_msaa_view(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> wgpu::TextureView {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA Colour Buffer"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: Self::SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        tex.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
     fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
@@ -547,7 +649,7 @@ impl Renderer3D {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: Self::SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format: Self::DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -855,6 +957,22 @@ impl Renderer3D {
                     rpass.draw(0..*count, 0..1);
                 }
             }
+            // Selection outlines again without depth testing, so a selected region stays visible
+            // behind other geometry.
+            if self.xray_selection {
+                rpass.set_pipeline(&self.line_xray_pipeline);
+                rpass.set_blend_constant(wgpu::Color { r: 0.4, g: 0.4, b: 0.4, a: 1.0 });
+                rpass.set_bind_group(0, &self.global_bind_group, &[]);
+                for (key, bg, _) in &draws.wire {
+                    if let Some((vb, count)) =
+                        self.mesh_cache.get(key).and_then(|c| c.outline_buffer.as_ref())
+                    {
+                        rpass.set_bind_group(1, bg, &[]);
+                        rpass.set_vertex_buffer(0, vb.slice(..));
+                        rpass.draw(0..*count, 0..1);
+                    }
+                }
+            }
         }
     }
 
@@ -1030,7 +1148,11 @@ impl Renderer3D {
             {
                 continue;
             }
+            // Only the focused comment draws 3D markers; the UI badges mark the rest.
             let is_active = scene.active_comment_id == Some(c.id);
+            if !is_active {
+                continue;
+            }
             let col = if is_active {
                 [0.18, 0.95, 1.0]
             } else if c.draft {
@@ -1092,8 +1214,8 @@ impl Renderer3D {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("3D Viewport Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color_view,
-                resolve_target: None,
+                view: &self.msaa_view,
+                resolve_target: Some(color_view),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
                         r: 0.020,
@@ -1331,6 +1453,7 @@ impl Renderer3D {
         let mut offscreen_renderer = Self::new(device, format, w, h);
         offscreen_renderer.shading = self.shading;
         offscreen_renderer.ghost_unselected = self.ghost_unselected;
+        offscreen_renderer.xray_selection = self.xray_selection;
         offscreen_renderer.show_wireframe_overlay = self.show_wireframe_overlay;
         offscreen_renderer.show_grid = self.show_grid;
         offscreen_renderer.compare_split = self.compare_split;

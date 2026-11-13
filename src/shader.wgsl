@@ -275,7 +275,7 @@ fn selection_glow(col: vec3<f32>, N: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
     }
     let accent = vec3<f32>(0.40, 0.89, 0.76);
     let rim = pow(1.0 - clamp(abs(dot(N, V)), 0.0, 1.0), 2.2);
-    return mix(col, accent, 0.16 * g) + accent * rim * 0.85 * g;
+    return mix(col, accent, 0.10 * g) + accent * rim * 0.50 * g;
 }
 
 struct BackdropOut {

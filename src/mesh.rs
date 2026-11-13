@@ -1586,9 +1586,9 @@ impl Mesh {
                     if is_face_selected {
                         // Studio accent (teal), strong enough to read on any material.
                         col = [
-                            col[0] * 0.35 + 0.65 * 0.30,
-                            col[1] * 0.35 + 0.65 * 0.92,
-                            col[2] * 0.35 + 0.65 * 0.78,
+                            col[0] * 0.52 + 0.48 * 0.30,
+                            col[1] * 0.52 + 0.48 * 0.92,
+                            col[2] * 0.52 + 0.48 * 0.78,
                         ];
                     }
                     out.push(GpuVertex {
@@ -1668,6 +1668,239 @@ impl Mesh {
             });
         }
         lines
+    }
+}
+
+/// What `Mesh::select_similar` compares against the faces already selected.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SimilarBy {
+    /// Faces pointing the same way (tolerance in degrees).
+    Normal,
+    /// Faces of about the same size (tolerance as a fraction, 0.15 = within 15%).
+    Area,
+    /// Faces with about the same vertex colour (tolerance as RGB distance).
+    Color,
+}
+
+impl SimilarBy {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "normal" | "direction" => Ok(Self::Normal),
+            "area" | "size" => Ok(Self::Area),
+            "color" | "colour" => Ok(Self::Color),
+            other => Err(format!("Unknown similarity '{other}'. Use normal, area or color.")),
+        }
+    }
+
+    pub fn default_tolerance(self) -> f32 {
+        match self {
+            Self::Normal => 8.0,
+            Self::Area => 0.15,
+            Self::Color => 0.08,
+        }
+    }
+}
+
+// =========================================================================
+// SELECTION QUERIES (face picking, similarity, paths, volumes)
+// =========================================================================
+impl Mesh {
+    pub fn face_area(&self, fi: usize) -> f32 {
+        let Some(face) = self.faces.get(fi) else { return 0.0 };
+        if face.len() < 3 {
+            return 0.0;
+        }
+        let p0 = self.positions[face[0]];
+        let mut sum = Vec3::ZERO;
+        for i in 1..face.len() - 1 {
+            sum += (self.positions[face[i]] - p0).cross(self.positions[face[i + 1]] - p0);
+        }
+        sum.length() * 0.5
+    }
+
+    /// Average vertex colour of a face (white when the mesh has no vertex colours).
+    pub fn face_color(&self, fi: usize) -> [f32; 3] {
+        let Some(face) = self.faces.get(fi) else { return [1.0; 3] };
+        let mut sum = Vec3::ZERO;
+        for &vi in face {
+            sum += Vec3::from_array(self.colors.get(vi).copied().unwrap_or([1.0; 3]));
+        }
+        (sum / face.len().max(1) as f32).to_array()
+    }
+
+    /// Select every unselected face and deselect the rest.
+    pub fn invert_selection(&mut self) {
+        let inverted: HashSet<usize> = (0..self.faces.len())
+            .filter(|i| !self.selected_faces.contains(i))
+            .collect();
+        self.selected_faces = inverted;
+        self.selected_vertices.clear();
+        self.selected_edges.clear();
+        self.bump_version();
+    }
+
+    /// Faces that resemble any currently selected face. Does not change the selection.
+    pub fn compute_similar(&self, by: SimilarBy, tolerance: f32) -> HashSet<usize> {
+        const MAX_REFERENCES: usize = 48;
+        let mut out = HashSet::new();
+        let selected: Vec<usize> = {
+            let mut v: Vec<usize> = self
+                .selected_faces
+                .iter()
+                .copied()
+                .filter(|&i| i < self.faces.len())
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        if selected.is_empty() {
+            return out;
+        }
+        match by {
+            SimilarBy::Normal => {
+                let min_dot = tolerance.clamp(0.0, 180.0).to_radians().cos();
+                let mut refs: Vec<Vec3> = Vec::new();
+                for &fi in &selected {
+                    let n = self.face_normal(fi);
+                    if n.length_squared() > 0.5 && !refs.iter().any(|r| r.dot(n) > 0.9995) {
+                        refs.push(n);
+                        if refs.len() >= MAX_REFERENCES {
+                            break;
+                        }
+                    }
+                }
+                for fi in 0..self.faces.len() {
+                    let n = self.face_normal(fi);
+                    if refs.iter().any(|r| r.dot(n) >= min_dot) {
+                        out.insert(fi);
+                    }
+                }
+            }
+            SimilarBy::Area => {
+                let tol = tolerance.max(0.0);
+                let mut refs: Vec<f32> = Vec::new();
+                for &fi in &selected {
+                    let a = self.face_area(fi);
+                    if a > 1e-10 && !refs.iter().any(|r| (r - a).abs() <= r * 0.01) {
+                        refs.push(a);
+                        if refs.len() >= MAX_REFERENCES {
+                            break;
+                        }
+                    }
+                }
+                for fi in 0..self.faces.len() {
+                    let a = self.face_area(fi);
+                    if refs.iter().any(|r| (r - a).abs() <= r * tol) {
+                        out.insert(fi);
+                    }
+                }
+            }
+            SimilarBy::Color => {
+                let mut refs: Vec<Vec3> = Vec::new();
+                for &fi in &selected {
+                    let c = Vec3::from_array(self.face_color(fi));
+                    if !refs.iter().any(|r| r.distance(c) < 0.01) {
+                        refs.push(c);
+                        if refs.len() >= MAX_REFERENCES {
+                            break;
+                        }
+                    }
+                }
+                for fi in 0..self.faces.len() {
+                    let c = Vec3::from_array(self.face_color(fi));
+                    if refs.iter().any(|r| r.distance(c) <= tolerance) {
+                        out.insert(fi);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Add every face that resembles the current selection. Returns how many were added.
+    pub fn select_similar(&mut self, by: SimilarBy, tolerance: f32) -> usize {
+        let similar = self.compute_similar(by, tolerance);
+        let before = self.selected_faces.len();
+        self.selected_faces.extend(similar);
+        self.bump_version();
+        self.selected_faces.len() - before
+    }
+
+    /// Faces sharing an edge with `fi` (welded by position).
+    pub fn face_neighbors(&self, fi: usize) -> Vec<usize> {
+        let Some(face) = self.faces.get(fi) else { return Vec::new() };
+        let n = face.len();
+        self.with_edge_faces(|edges| {
+            let mut out = Vec::new();
+            for i in 0..n {
+                let key = Self::edge_key(self.positions[face[i]], self.positions[face[(i + 1) % n]]);
+                if let Some(list) = edges.get(&key) {
+                    for &other in list {
+                        if other != fi && !out.contains(&other) {
+                            out.push(other);
+                        }
+                    }
+                }
+            }
+            out
+        })
+    }
+
+    /// Shortest chain of edge-adjacent faces from `from` to `to`, both included.
+    pub fn face_path(&self, from: usize, to: usize) -> Option<Vec<usize>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        if from >= self.faces.len() || to >= self.faces.len() {
+            return None;
+        }
+        if from == to {
+            return Some(vec![from]);
+        }
+        let mut dist: HashMap<usize, f32> = HashMap::new();
+        let mut prev: HashMap<usize, usize> = HashMap::new();
+        // Distances are non-negative, so their bit patterns order the same way.
+        let mut heap = BinaryHeap::new();
+        dist.insert(from, 0.0);
+        heap.push(Reverse((0u32, from)));
+        while let Some(Reverse((bits, fi))) = heap.pop() {
+            let d = f32::from_bits(bits);
+            if fi == to {
+                let mut path = vec![to];
+                let mut cur = to;
+                while let Some(&p) = prev.get(&cur) {
+                    path.push(p);
+                    cur = p;
+                }
+                path.reverse();
+                return Some(path);
+            }
+            if d > dist.get(&fi).copied().unwrap_or(f32::INFINITY) {
+                continue;
+            }
+            let centre = self.face_center(fi);
+            for next in self.face_neighbors(fi) {
+                let nd = d + centre.distance(self.face_center(next));
+                if nd < dist.get(&next).copied().unwrap_or(f32::INFINITY) {
+                    dist.insert(next, nd);
+                    prev.insert(next, fi);
+                    heap.push(Reverse((nd.to_bits(), next)));
+                }
+            }
+        }
+        None
+    }
+
+    /// Faces whose centre, moved to world space by `model`, lies inside the world box.
+    pub fn faces_in_world_box(&self, model: Mat4, min: Vec3, max: Vec3) -> HashSet<usize> {
+        (0..self.faces.len())
+            .filter(|&fi| {
+                if self.faces[fi].len() < 3 {
+                    return false;
+                }
+                let c = model.transform_point3(self.face_center(fi));
+                c.cmpge(min).all() && c.cmple(max).all()
+            })
+            .collect()
     }
 }
 

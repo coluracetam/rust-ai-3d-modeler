@@ -21,6 +21,12 @@ pub enum SmartSelectMode {
     Brush,
     /// Drag a screen-space rectangle; every visible face inside it is selected.
     Box,
+    /// Click single polygons; with Path on, a click fills the run of faces from the last pick.
+    Face,
+    /// Drag a freehand outline; faces inside it are selected.
+    Lasso,
+    /// A world-space 3D box with handles; everything inside it is selected from any angle.
+    Volume,
 }
 
 impl SmartSelectMode {
@@ -31,12 +37,15 @@ impl SmartSelectMode {
             Self::WholeLayer => "Layer",
             Self::Brush => "Brush",
             Self::Box => "Box",
+            Self::Face => "Face",
+            Self::Lasso => "Lasso",
+            Self::Volume => "3D box",
         }
     }
 
     /// Modes driven by dragging rather than by a hover-previewed click.
     pub fn is_drag(self) -> bool {
-        matches!(self, Self::Brush | Self::Box)
+        matches!(self, Self::Brush | Self::Box | Self::Lasso)
     }
 }
 
@@ -109,6 +118,16 @@ pub struct UiState {
     pub box_through: bool,
     /// Rectangle being dragged by the box selector, in egui points.
     pub box_rect: Option<egui::Rect>,
+    /// Outline being dragged by the lasso selector, in egui points.
+    pub lasso_points: Vec<egui::Pos2>,
+    /// Face mode: a click fills the shortest run of faces from the previous pick.
+    pub face_path: bool,
+    /// Outliner groups ("Group/Part" names) the user has folded.
+    pub collapsed_groups: HashSet<String>,
+    /// World point the camera should centre on next frame.
+    pub frame_point: Option<Vec3>,
+    /// Last face picked in Face mode: (object id, face index).
+    pub last_face_pick: Option<(u64, usize)>,
     /// Free-flight navigation is active (cursor captured, WASD moves).
     pub fly_active: bool,
     /// Requests the app to enter/leave fly mode (needs the window to capture the cursor).
@@ -195,6 +214,11 @@ impl Default for UiState {
             prev_select_mode: SmartSelectMode::SubPart,
             box_through: false,
             box_rect: None,
+            lasso_points: Vec::new(),
+            face_path: false,
+            collapsed_groups: HashSet::new(),
+            frame_point: None,
+            last_face_pick: None,
             fly_active: false,
             fly_toggle_requested: false,
             fly_speed: 3.0,
@@ -769,6 +793,27 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 
 /// Short and full descriptions of the parts a comment targets.
 fn comment_targets(c: &SpatialComment) -> (String, String) {
+    if let Some(v) = &c.volume {
+        // A 3D box target: name it by its label and what it covers, not by region count.
+        let mut names: Vec<&str> = Vec::new();
+        for t in &c.targets {
+            if !names.contains(&t.object_name.as_str()) {
+                names.push(&t.object_name);
+            }
+        }
+        let what = if names.is_empty() { "empty space".to_string() } else { names.join(", ") };
+        let size = v.half_extents * 2.0;
+        let short = if v.label.is_empty() {
+            format!("3D box · {what}")
+        } else {
+            format!("{} · {what}", v.label)
+        };
+        let full = format!(
+            "3D box {:.2} × {:.2} × {:.2} at [{:.2}, {:.2}, {:.2}]\n{what}",
+            size.x, size.y, size.z, v.center.x, v.center.y, v.center.z
+        );
+        return (short, full);
+    }
     if c.targets.is_empty() {
         return (c.object_name.clone(), c.object_name.clone());
     }
@@ -813,6 +858,13 @@ fn selection_summary(scene: &Scene) -> Option<String> {
         .filter(|o| !o.mesh.selected_faces.is_empty())
         .collect();
     if selected.is_empty() {
+        if let Some(v) = &scene.selection_volume {
+            return Some(if v.label.is_empty() {
+                "3D box · empty space".to_string()
+            } else {
+                format!("3D box · {} · empty space", v.label)
+            });
+        }
         return scene
             .active_object()
             .map(|o| format!("{} · whole part", o.name));
@@ -1252,6 +1304,36 @@ fn draw_header(
                 ui.label(RichText::new("●").size(8.0).color(dot));
                 ui.label(small_muted(status));
 
+                // Live agent state, where the eye already is.
+                let (text, color, active) = agent_presence(scene, state);
+                if color != SUBTLE {
+                    ui.add_space(6.0);
+                    let resp = egui::Frame::new()
+                        .fill(color.gamma_multiply(0.12))
+                        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.45)))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(10, 3))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                if active {
+                                    // A soft pulse while the agent is busy.
+                                    let t = ui.input(|i| i.time);
+                                    let pulse = 0.55 + 0.45 * ((t * 3.2).sin() as f32 * 0.5 + 0.5);
+                                    ui.label(RichText::new(icon::ROBOT).size(14.0).color(color.gamma_multiply(pulse)));
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+                                } else {
+                                    ui.label(RichText::new(icon::ROBOT).size(14.0).color(color));
+                                }
+                                ui.label(RichText::new(&text).size(12.5).color(color));
+                            });
+                        })
+                        .response;
+                    if resp.interact(egui::Sense::click()).on_hover_text("Open the review panel").clicked() {
+                        state.review_tab = if text.starts_with("Revision") { 1 } else { 0 };
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(
@@ -1337,6 +1419,40 @@ fn draw_header(
         });
 }
 
+/// What the agent is doing right now, for the header pill and the status bar:
+/// (label, colour, whether it is actively doing something).
+fn agent_presence(scene: &Scene, state: &UiState) -> (String, Color32, bool) {
+    let recent = state
+        .last_agent_activity
+        .is_some_and(|t| t.elapsed().as_secs() < 30);
+    let listening = state
+        .agent_listening
+        .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+    let in_progress = scene
+        .revisions
+        .iter()
+        .rev()
+        .find(|r| r.status == RevisionStatus::InProgress);
+    let ready = scene
+        .revisions
+        .iter()
+        .any(|r| r.status == RevisionStatus::ReadyForReview);
+    if let Some((name, _)) = &state.busy_operation {
+        return (format!("Agent · {name}"), ACCENT, true);
+    }
+    if let Some(r) = in_progress {
+        let label: String = r.label.chars().take(34).collect();
+        return (format!("Agent working · {label}"), ACCENT, true);
+    }
+    match state.last_agent_activity {
+        _ if ready => ("Revision ready for your review".into(), WARN, false),
+        Some(t) if recent => (format!("Agent working · {}", ago(t.elapsed())), ACCENT, true),
+        _ if listening => ("Agent listening for feedback".into(), INFO, false),
+        Some(t) => (format!("Agent idle · last seen {}", ago(t.elapsed())), SUBTLE, false),
+        None => ("No agent connected".into(), SUBTLE, false),
+    }
+}
+
 fn draw_status_bar(ctx: &egui::Context, scene: &Scene, state: &UiState) {
     egui::TopBottomPanel::bottom("studio_status")
         .frame(
@@ -1346,19 +1462,8 @@ fn draw_status_bar(ctx: &egui::Context, scene: &Scene, state: &UiState) {
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let recent = state
-                    .last_agent_activity
-                    .is_some_and(|t| t.elapsed().as_secs() < 30);
-                let listening = state
-                    .agent_listening
-                    .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
                 let drafts = scene.draft_count();
-                let (agent_text, color) = match state.last_agent_activity {
-                    Some(t) if recent => (format!("Agent working · {}", ago(t.elapsed())), ACCENT),
-                    _ if listening => ("Agent listening for feedback".to_string(), INFO),
-                    Some(t) => (format!("Agent idle · last seen {}", ago(t.elapsed())), SUBTLE),
-                    None => ("No agent connected".into(), SUBTLE),
-                };
+                let (agent_text, color, _) = agent_presence(scene, state);
                 ui.label(RichText::new(icon::ROBOT).size(13.0).color(color));
                 ui.label(small_muted(agent_text)).on_hover_ui(|ui| {
                     ui.set_max_width(420.0);
@@ -1634,32 +1739,123 @@ fn scene_parts_tab(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            for (i, obj) in scene.objects.iter_mut().enumerate() {
+            // Parts named "Group/Part" are listed under a collapsible "Group" heading.
+            let mut order: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+            for (i, obj) in scene.objects.iter().enumerate() {
                 if !obj.name.to_lowercase().contains(&search) {
                     continue;
                 }
                 matches += 1;
-                let selected = selected_idx == Some(i) || !obj.mesh.selected_faces.is_empty();
-                let open = open_counts.get(&obj.id).copied().unwrap_or(0);
-                let row = ui
-                    .push_id(obj.id, |ui| {
-                        part_row(
-                            ui,
-                            &obj.name,
-                            obj.mesh.faces.len(),
-                            open,
-                            obj.visible,
-                            selected,
-                            swatch_color(obj),
-                        )
-                    })
-                    .inner;
-                if row.toggle_visibility {
-                    obj.visible = !obj.visible;
-                    state.scene_dirty_for_disk = true;
-                } else if row.clicked || row.double_clicked {
-                    clicked = Some(i);
-                    frame |= row.double_clicked;
+                let group = obj
+                    .name
+                    .split_once('/')
+                    .map(|(g, _)| g.trim().to_string())
+                    .filter(|g| !g.is_empty());
+                match (&group, order.iter_mut().find(|(g, _)| g.is_some() && *g == group)) {
+                    (Some(_), Some((_, list))) => list.push(i),
+                    _ => order.push((group, vec![i])),
+                }
+            }
+            for (group, indices) in order {
+                let grouped = group.is_some() && indices.len() > 1;
+                let mut collapsed = false;
+                if let (true, Some(name)) = (grouped, &group) {
+                    collapsed = state.collapsed_groups.contains(name) && search.is_empty();
+                    let any_visible = indices.iter().any(|&i| scene.objects[i].visible);
+                    let faces: usize = indices.iter().map(|&i| scene.objects[i].mesh.faces.len()).sum();
+                    let (rect, row) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 28.0),
+                        egui::Sense::click(),
+                    );
+                    let eye_rect = egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + 17.0, rect.center().y),
+                        egui::vec2(28.0, 24.0),
+                    );
+                    let eye = ui
+                        .interact(eye_rect, row.id.with("group_eye"), egui::Sense::click())
+                        .on_hover_text(if any_visible { "Hide this group" } else { "Show this group" });
+                    let p = ui.painter();
+                    if row.hovered() {
+                        p.rect_filled(rect, 6, HOVER_ROW);
+                    }
+                    p.text(
+                        eye_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if any_visible { icon::EYE } else { icon::EYE_SLASH },
+                        FontId::proportional(15.0),
+                        if eye.hovered() { TEXT } else { SUBTLE },
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 40.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        if collapsed { icon::CARET_RIGHT } else { icon::CARET_DOWN },
+                        FontId::proportional(12.0),
+                        MUTED,
+                    );
+                    p.text(
+                        egui::pos2(rect.left() + 58.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        medium_font(13.5),
+                        TEXT,
+                    );
+                    p.text(
+                        egui::pos2(rect.right() - 8.0, rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("{} · {}", indices.len(), compact_count(faces)),
+                        FontId::proportional(11.5),
+                        SUBTLE,
+                    );
+                    if eye.clicked() {
+                        for &i in &indices {
+                            scene.objects[i].visible = !any_visible;
+                        }
+                        state.scene_dirty_for_disk = true;
+                    } else if row.clicked() {
+                        if !state.collapsed_groups.remove(name) {
+                            state.collapsed_groups.insert(name.clone());
+                        }
+                    }
+                }
+                if collapsed {
+                    continue;
+                }
+                for i in indices {
+                    let obj = &mut scene.objects[i];
+                    let selected = selected_idx == Some(i) || !obj.mesh.selected_faces.is_empty();
+                    let open = open_counts.get(&obj.id).copied().unwrap_or(0);
+                    let shown = if grouped {
+                        obj.name.split_once('/').map(|(_, n)| n.trim()).unwrap_or(&obj.name).to_string()
+                    } else {
+                        obj.name.clone()
+                    };
+                    let row = ui
+                        .push_id(obj.id, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if grouped {
+                                    ui.add_space(14.0);
+                                }
+                                part_row(
+                                    ui,
+                                    &shown,
+                                    obj.mesh.faces.len(),
+                                    open,
+                                    obj.visible,
+                                    selected,
+                                    swatch_color(obj),
+                                )
+                            })
+                            .inner
+                        })
+                        .inner;
+                    if row.toggle_visibility {
+                        obj.visible = !obj.visible;
+                        state.scene_dirty_for_disk = true;
+                    } else if row.clicked || row.double_clicked {
+                        clicked = Some(i);
+                        frame |= row.double_clicked;
+                    }
                 }
             }
             if matches == 0 {
@@ -1701,6 +1897,8 @@ fn scene_inspect_tab(
         .id_salt("inspect_scroll")
         .show(ui, |ui| {
             eyebrow(ui, "Display");
+            toggle(ui, &mut renderer.xray_selection, "Show selection through geometry")
+                .on_hover_text("Selection outlines stay visible behind other parts");
             toggle(ui, &mut renderer.ghost_unselected, "Ghost unselected parts")
                 .on_hover_text("Fade everything except the selection");
             ui.add_space(8.0);
@@ -1928,17 +2126,25 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
     card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         let sections = scene.collect_current_target_sections(state.selection_radius);
+        let has_faces = scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty());
+        // A 3D box over empty space is a target of its own.
+        let volume_only = scene.selection_volume.is_some() && !has_faces;
+        let sections = if volume_only { Vec::new() } else { sections };
         ui.horizontal(|ui| {
             eyebrow(ui, "New comment");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if sections.is_empty() {
+                if volume_only {
+                    pill(ui, "3D box", ACCENT);
+                } else if sections.is_empty() {
                     pill(ui, "Scene-wide", MUTED);
                 } else {
                     pill(ui, &plural(sections.len(), "region", "regions"), ACCENT);
                 }
             });
         });
-        if sections.is_empty() {
+        if volume_only {
+            ui.label(small_muted("The box covers no geometry, so the comment is about that space: describe what should be added there."));
+        } else if sections.is_empty() {
             ui.label(small_muted("Click a part in the viewport to comment on it, or write feedback for the whole scene."));
         } else {
             // One row per part, however many regions it contributes.
@@ -1987,11 +2193,67 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
                 update_pending_anchor_from_selection(scene);
                 state.scene_dirty_for_disk = true;
             }
+            // Individual regions: name them for the agent, or drop one.
+            let regions: Vec<_> = sections.iter().filter(|t| !t.selected_faces.is_empty()).collect();
+            if regions.len() > 1 || regions.iter().any(|t| !t.label.is_empty()) || regions.len() == 1 {
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("Name or remove {}", if regions.len() == 1 { "this region".to_string() } else { plural(regions.len(), "region", "regions") }))
+                        .small()
+                        .color(MUTED),
+                )
+                .id_salt("region_names")
+                .show(ui, |ui| {
+                    const SHOWN: usize = 12;
+                    let mut drop_region: Option<(u64, Vec<usize>)> = None;
+                    for (i, t) in regions.iter().take(SHOWN).enumerate() {
+                        let key = (t.object_id, t.selected_faces[0]);
+                        let mut label = scene.region_labels.get(&key).cloned().unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label(small_muted(format!("{:>2}", i + 1)));
+                            let w = (ui.available_width() - 96.0).max(60.0);
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut label)
+                                    .hint_text(hint(&format!("{} · {}", t.object_name, plural(t.selected_faces.len(), "face", "faces"))))
+                                    .desired_width(w),
+                            );
+                            if resp.changed() {
+                                if label.trim().is_empty() {
+                                    scene.region_labels.remove(&key);
+                                } else {
+                                    scene.region_labels.insert(key, label.clone());
+                                }
+                            }
+                            if quiet_button(ui, icon::CROSSHAIR, "Show this region") {
+                                state.frame_point = Some(t.world_anchor);
+                            }
+                            if quiet_button(ui, "×", "Remove this region from the selection") {
+                                drop_region = Some((t.object_id, t.selected_faces.clone()));
+                            }
+                        });
+                    }
+                    if regions.len() > SHOWN {
+                        ui.label(small_muted(format!("+ {} more", regions.len() - SHOWN)));
+                    }
+                    if let Some((id, faces)) = drop_region {
+                        if let Some(o) = scene.objects.iter_mut().find(|o| o.id == id) {
+                            for f in &faces {
+                                o.mesh.selected_faces.remove(f);
+                            }
+                            o.mesh.bump_version();
+                        }
+                        scene.region_labels.remove(&(id, faces[0]));
+                        update_pending_anchor_from_selection(scene);
+                        state.scene_dirty_for_disk = true;
+                    }
+                });
+            }
         }
         let draft = ui.add(
             egui::TextEdit::multiline(&mut state.comment_draft)
                 .margin(egui::vec2(10.0, 8.0))
-                .hint_text(hint(if sections.is_empty() {
+                .hint_text(hint(if volume_only {
+                    "What should be added or changed inside this box?"
+                } else if sections.is_empty() {
                     "Describe a change to the whole scene…"
                 } else {
                     "What should change here? Describe the result you want…"
@@ -2095,13 +2357,13 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
             let verb = if state.auto_send { "Send" } else { "Add" };
             if primary(
                 ui,
-                &if sections.is_empty() { format!("{verb} scene comment") } else { format!("{verb} comment") },
+                &if sections.is_empty() && !volume_only { format!("{verb} scene comment") } else { format!("{verb} comment") },
                 enabled,
             ) || (submit_key && enabled)
             {
-                post = Some(sections.is_empty());
+                post = Some(sections.is_empty() && !volume_only);
             }
-            if !sections.is_empty()
+            if (!sections.is_empty() || volume_only)
                 && ui
                     .add_enabled(enabled, egui::Button::new("Scene-wide"))
                     .on_hover_text("Post as feedback for the whole scene instead")
@@ -2740,9 +3002,16 @@ fn draw_viewport(
     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
         state.viewport_rect = ui.max_rect();
         let rect = ui.max_rect();
+        if let Some(p) = state.frame_point.take() {
+            camera.target = p;
+            *view_changed = true;
+        }
 
         viewport_tool_strip(ctx, rect, scene, camera, state, comparing);
-        viewport_context_bar(ctx, rect, state, comparing);
+        viewport_context_bar(ctx, rect, scene, state, comparing);
+        if !comparing && !state.fly_active {
+            viewport_volume(ctx, ui, rect, scene, camera, state);
+        }
         viewport_view_controls(ctx, rect, scene, camera, renderer, state);
         viewport_axis_gizmo(ctx, rect, camera);
         viewport_selection_chip(ctx, rect, scene, state, comparing);
@@ -2866,6 +3135,8 @@ fn draw_viewport(
         // Comment pins
         let viewport = Vec2::new(rect.width(), rect.height());
         if !comparing {
+            // Project every pin, then merge the ones that would overlap into one badge.
+            let mut clusters: Vec<(egui::Pos2, Vec<&SpatialComment>)> = Vec::new();
             for c in &scene.comments {
                 if c.resolved || c.is_general || scene.comment_needs_reattachment(c) {
                     continue;
@@ -2877,13 +3148,26 @@ fn draw_viewport(
                 if !rect.shrink(20.0).contains(pos) {
                     continue;
                 }
-                let active = scene.active_comment_id == Some(c.id);
-                let color = comment_status_color(c.status);
-                egui::Area::new(egui::Id::new(("comment_pin", c.id)))
+                match clusters.iter_mut().find(|(q, _)| q.distance(pos) < 34.0) {
+                    Some((_, list)) => list.push(c),
+                    None => clusters.push((pos, vec![c])),
+                }
+            }
+            for (pos, list) in &clusters {
+                let active_in = list.iter().position(|c| scene.active_comment_id == Some(c.id));
+                let lead = list[active_in.unwrap_or(0)];
+                let active = active_in.is_some();
+                let color = comment_status_color(lead.status);
+                egui::Area::new(egui::Id::new(("comment_pin", list[0].id)))
                     .pivot(egui::Align2::CENTER_BOTTOM)
-                    .fixed_pos(pos)
+                    .fixed_pos(*pos)
                     .show(ctx, |ui| {
-                        let text = RichText::new(format!("#{:02}", c.id))
+                        let label = if list.len() > 1 {
+                            format!("#{:02} +{}", lead.id, list.len() - 1)
+                        } else {
+                            format!("#{:02}", lead.id)
+                        };
+                        let text = RichText::new(label)
                             .font(medium_font(12.5))
                             .color(if active { ON_ACCENT } else { color });
                         let resp = ui
@@ -2896,12 +3180,29 @@ fn draw_viewport(
                             )
                             .on_hover_ui(|ui| {
                                 ui.set_max_width(300.0);
-                                ui.label(RichText::new(c.comment.clone()));
-                                ui.label(small_muted(format!("{} · click to open", c.status.label())));
+                                for c in list.iter().take(6) {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new(format!("#{:02}", c.id)).color(comment_status_color(c.status)));
+                                        ui.label(RichText::new(c.comment.clone()));
+                                    });
+                                }
+                                if list.len() > 6 {
+                                    ui.label(small_muted(format!("+ {} more", list.len() - 6)));
+                                }
+                                ui.label(small_muted(if list.len() > 1 {
+                                    "Click to step through these comments".to_string()
+                                } else {
+                                    format!("{} · click to open", lead.status.label())
+                                }));
                             });
                         if resp.clicked() {
-                            state.focus_comment = Some(c.id);
-                            state.scroll_to_comment = Some(c.id);
+                            // A cluster steps to the next comment each click.
+                            let next = match active_in {
+                                Some(i) => list[(i + 1) % list.len()],
+                                None => lead,
+                            };
+                            state.focus_comment = Some(next.id);
+                            state.scroll_to_comment = Some(next.id);
                             state.review_tab = 0;
                             if state.comment_filter == FILTER_ACCEPTED {
                                 state.comment_filter = FILTER_ACTIVE;
@@ -2918,6 +3219,14 @@ fn draw_viewport(
             let r = r.intersect(rect);
             painter.rect_filled(r, 2.0, ACCENT.gamma_multiply(0.10));
             painter.rect_stroke(r, 2.0, egui::Stroke::new(1.5_f32, ACCENT), egui::StrokeKind::Inside);
+        }
+        if state.lasso_points.len() >= 2 {
+            let mut outline = state.lasso_points.clone();
+            if outline.len() >= 3 {
+                outline.push(outline[0]);
+            }
+            painter.add(egui::Shape::line(outline.clone(), egui::Stroke::new(3.5_f32, Color32::from_black_alpha(110))));
+            painter.add(egui::Shape::line(outline, egui::Stroke::new(1.5_f32, ACCENT)));
         }
         if state.fly_active {
             let c = rect.center();
@@ -2967,10 +3276,15 @@ fn draw_viewport(
                 SmartSelectMode::WholeLayer => "Click an object to select all of it",
                 SmartSelectMode::Brush => "Drag to paint · Ctrl+drag erases · [ ] radius",
                 SmartSelectMode::Box => "Drag boxes over each place to change · Shift adds · Ctrl removes · each separate patch becomes its own AI target",
+                SmartSelectMode::Face => "Click polygons one at a time · Ctrl+click removes · turn on Path to fill between two clicks",
+                SmartSelectMode::Lasso => "Draw around the faces to select · Shift adds · Ctrl removes",
+                SmartSelectMode::Volume => "Click a surface to place the 3D box · drag coloured handles to resize, the centre to move · it can sit in empty space",
             }
             .to_string()
         };
-        let chip_visible = !comparing && !state.fly_active && scene.has_any_selection();
+        let chip_visible = !comparing
+            && !state.fly_active
+            && (scene.has_any_selection() || scene.selection_volume.is_some());
         if !chip_visible || state.measure_active || state.select_mode.is_drag() {
         egui::Area::new("viewport_hint".into())
             .pivot(egui::Align2::LEFT_BOTTOM)
@@ -3001,6 +3315,142 @@ fn mode_icon(mode: SmartSelectMode) -> &'static str {
         SmartSelectMode::WholeLayer => icon::STACK,
         SmartSelectMode::Brush => icon::PAINT_BRUSH,
         SmartSelectMode::Box => icon::SELECTION,
+        SmartSelectMode::Face => icon::TRIANGLE,
+        SmartSelectMode::Lasso => icon::LASSO,
+        SmartSelectMode::Volume => icon::BOUNDING_BOX,
+    }
+}
+
+const AXIS_COLORS: [Color32; 3] = [
+    Color32::from_rgb(240, 96, 96),
+    Color32::from_rgb(104, 214, 120),
+    Color32::from_rgb(96, 156, 250),
+];
+
+/// The 3D box selector: wireframe, size label, six face handles (resize) and a centre handle
+/// (move). Handles live in their own egui areas so the viewport does not treat a press on
+/// them as a click on the model.
+fn viewport_volume(
+    ctx: &egui::Context,
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    scene: &mut Scene,
+    camera: &OrbitCamera,
+    state: &mut UiState,
+) {
+    use crate::scene::SelectionVolume;
+    let Some(mut volume) = scene.selection_volume.clone() else {
+        return;
+    };
+    let viewport = Vec2::new(rect.width(), rect.height());
+    let to_screen = |p: Vec3| {
+        camera
+            .world_to_screen(p, viewport)
+            .map(|s| rect.left_top() + egui::vec2(s.x, s.y))
+    };
+    let painter = ui.painter().with_clip_rect(rect);
+    let pts: Vec<Option<egui::Pos2>> = volume.corners().iter().map(|&c| to_screen(c)).collect();
+    for (a, b) in SelectionVolume::EDGES {
+        if let (Some(a), Some(b)) = (pts[a], pts[b]) {
+            painter.line_segment([a, b], egui::Stroke::new(3.5_f32, Color32::from_black_alpha(90)));
+            painter.line_segment([a, b], egui::Stroke::new(1.5_f32, ACCENT));
+        }
+    }
+    let size = volume.half_extents * 2.0 * scene.unit_factor();
+    if let Some(top) = to_screen(volume.face_handle(1, true)) {
+        let text = format!(
+            "{}{:.2} × {:.2} × {:.2} {}",
+            if volume.label.is_empty() { String::new() } else { format!("{} · ", volume.label) },
+            size.x,
+            size.y,
+            size.z,
+            scene.units
+        );
+        let g = painter.layout_no_wrap(text, medium_font(11.5), TEXT);
+        let r = egui::Align2::CENTER_BOTTOM
+            .anchor_size(top - egui::vec2(0.0, 16.0), g.size())
+            .expand2(egui::vec2(7.0, 3.0));
+        painter.rect_filled(r, 6, OVERLAY);
+        painter.galley(r.min + egui::vec2(7.0, 3.0), g, TEXT);
+    }
+    if state.select_mode != SmartSelectMode::Volume || state.measure_active {
+        return;
+    }
+
+    let mut changed = false;
+    let pointer_ray = |p: egui::Pos2| {
+        camera.screen_ray(Vec2::new(p.x - rect.left(), p.y - rect.top()), viewport)
+    };
+    let handle = |id: egui::Id, pos: egui::Pos2, color: Color32, radius: f32, tip: &str| {
+        egui::Area::new(id)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::drag());
+                let hot = resp.hovered() || resp.dragged();
+                ui.painter().circle(
+                    r.center(),
+                    if hot { radius + 1.5 } else { radius },
+                    color,
+                    egui::Stroke::new(1.5_f32, Color32::WHITE),
+                );
+                if hot {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                resp.on_hover_text(tip)
+            })
+            .inner
+    };
+    for axis in 0..3 {
+        for positive in [false, true] {
+            let Some(pos) = to_screen(volume.face_handle(axis, positive)) else {
+                continue;
+            };
+            if !rect.contains(pos) {
+                continue;
+            }
+            let resp = handle(
+                egui::Id::new(("volume_face", axis, positive)),
+                pos,
+                AXIS_COLORS[axis],
+                5.5,
+                &format!("Drag to resize along {}", ["X", "Y", "Z"][axis]),
+            );
+            if let (true, Some(p)) = (resp.dragged(), resp.interact_pointer_pos()) {
+                let mut dir = Vec3::ZERO;
+                dir[axis] = 1.0;
+                let t = pointer_ray(p).closest_t_on_axis(volume.center, dir);
+                if t.is_finite() {
+                    volume.move_face(axis, positive, volume.center[axis] + t);
+                    changed = true;
+                }
+            }
+        }
+    }
+    if let Some(pos) = to_screen(volume.center).filter(|p| rect.contains(*p)) {
+        let resp = handle(
+            egui::Id::new("volume_centre"),
+            pos,
+            ACCENT,
+            6.5,
+            "Drag to move the box",
+        );
+        if let (true, Some(p)) = (resp.dragged(), resp.interact_pointer_pos()) {
+            let ray = pointer_ray(p);
+            if let Some(t) = ray.intersect_plane(volume.center, camera.forward()) {
+                let hit = ray.at(t);
+                if hit.is_finite() {
+                    volume.center = hit;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        scene.selection_volume = Some(volume);
+        scene.apply_volume_selection();
+        update_pending_anchor_from_selection(scene);
+        state.scene_dirty_for_disk = true;
     }
 }
 
@@ -3028,17 +3478,30 @@ fn viewport_tool_strip(
                             ("3", SmartSelectMode::WholeLayer, "Click selects the entire object"),
                             ("4", SmartSelectMode::Brush, "Drag to paint a selection; Ctrl+drag erases"),
                             ("5", SmartSelectMode::Box, "Drag rectangles over the places to change; Shift adds, Ctrl removes  ·  Ctrl+C"),
+                            ("6", SmartSelectMode::Face, "Click single polygons; Path fills the faces between two clicks"),
+                            ("7", SmartSelectMode::Lasso, "Draw a freehand outline around the faces to select"),
+                            ("8", SmartSelectMode::Volume, "Place a 3D box and resize it; selects everything inside from any angle, and can mark empty space"),
                         ] {
                             let selected = state.select_mode == mode && !state.measure_active;
-                            if icon_button(
-                                ui,
-                                mode_icon(mode),
-                                &format!("{} select  ·  {key}\n{what}", mode.label()),
-                                selected,
-                                !comparing,
-                            )
-                            .clicked()
-                            {
+                            let resp = icon_button(ui, mode_icon(mode), "", selected, !comparing);
+                            // Shortcut digit in the corner, so the keys teach themselves.
+                            ui.painter().text(
+                                resp.rect.right_bottom() - egui::vec2(4.0, 2.0),
+                                egui::Align2::RIGHT_BOTTOM,
+                                key,
+                                FontId::proportional(9.0),
+                                if selected { ACCENT } else { SUBTLE },
+                            );
+                            let resp = resp.on_hover_ui_at_pointer(|ui| {
+                                ui.set_max_width(280.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(mode_icon(mode)).size(16.0).color(ACCENT));
+                                    ui.label(semibold(format!("{} select", mode.label()), 14.0));
+                                    pill(ui, key, MUTED);
+                                });
+                                ui.label(small_muted(what));
+                            });
+                            if resp.clicked() {
                                 if mode == SmartSelectMode::Box && state.select_mode != SmartSelectMode::Box {
                                     state.prev_select_mode = state.select_mode;
                                 }
@@ -3087,6 +3550,7 @@ fn viewport_tool_strip(
 fn viewport_context_bar(
     ctx: &egui::Context,
     rect: egui::Rect,
+    scene: &mut Scene,
     state: &mut UiState,
     comparing: bool,
 ) {
@@ -3131,16 +3595,69 @@ fn viewport_context_bar(
                                         .on_hover_text("Brush radius  ·  [ and ] adjust");
                                     state.sculpt.radius = state.selection_radius;
                                 }
-                                SmartSelectMode::Box => {
+                                SmartSelectMode::Box | SmartSelectMode::Lasso => {
                                     vdivider(ui);
                                     toggle(ui, &mut state.box_through, "Through")
-                                        .on_hover_text("Also pick faces hidden behind other geometry inside the box");
+                                        .on_hover_text("Also pick faces hidden behind other geometry inside the outline");
+                                }
+                                SmartSelectMode::Face => {
+                                    vdivider(ui);
+                                    toggle(ui, &mut state.face_path, "Path")
+                                        .on_hover_text("Each click also selects the shortest run of faces from the previous click");
+                                }
+                                SmartSelectMode::Volume => {
+                                    vdivider(ui);
+                                    let factor = scene.unit_factor();
+                                    let units = scene.units.clone();
+                                    let mut changed = false;
+                                    let mut remove = false;
+                                    if let Some(volume) = scene.selection_volume.as_mut() {
+                                        ui.label(small_muted("Size"));
+                                        for axis in 0..3 {
+                                            let mut v = volume.half_extents[axis] * 2.0 * factor;
+                                            let resp = ui.add(
+                                                egui::DragValue::new(&mut v)
+                                                    .speed(0.01 * factor)
+                                                    .range(0.01 * factor..=10_000.0 * factor)
+                                                    .max_decimals(2)
+                                                    .prefix(["X ", "Y ", "Z "][axis]),
+                                            );
+                                            if resp.on_hover_text(format!("Box size in {units}")).changed() {
+                                                volume.half_extents[axis] = (v / factor * 0.5)
+                                                    .max(crate::scene::SelectionVolume::MIN_HALF);
+                                                changed = true;
+                                            }
+                                        }
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut volume.label)
+                                                .hint_text(hint("Name this region"))
+                                                .desired_width(120.0),
+                                        )
+                                        .on_hover_text("The agent sees this name with your comment");
+                                        if quiet_button(ui, icon::TRASH, "Remove the 3D box") {
+                                            remove = true;
+                                        }
+                                    } else {
+                                        ui.label(small_muted("Click a surface to place the box"));
+                                    }
+                                    if remove {
+                                        scene.selection_volume = None;
+                                        scene.clear_all_selections();
+                                        scene.selected_object = None;
+                                        state.scene_dirty_for_disk = true;
+                                    } else if changed {
+                                        scene.apply_volume_selection();
+                                        update_pending_anchor_from_selection(scene);
+                                        state.scene_dirty_for_disk = true;
+                                    }
                                 }
                                 _ => {}
                             }
+                            if state.select_mode != SmartSelectMode::Volume {
                             vdivider(ui);
                             toggle(ui, &mut state.multi_select, "Add")
                                 .on_hover_text("Multi-select: each click adds to the selection; click a selected region to remove it.\nOff: Shift+click adds, Ctrl+click removes.");
+                            }
                         }
                     });
                 });
@@ -3155,7 +3672,7 @@ fn viewport_selection_chip(
     state: &mut UiState,
     comparing: bool,
 ) {
-    if comparing || state.fly_active || !scene.has_any_selection() {
+    if comparing || state.fly_active || !(scene.has_any_selection() || scene.selection_volume.is_some()) {
         return;
     }
     let Some(summary) = selection_summary(scene) else {
@@ -3212,11 +3729,53 @@ fn viewport_selection_chip(
                             update_pending_anchor_from_selection(scene);
                             state.scene_dirty_for_disk = true;
                         }
+                        if small(ui, icon::SELECTION_INVERSE, "Invert selection on the selected parts  ·  I", has_faces) {
+                            for o in &mut scene.objects {
+                                if !o.mesh.selected_faces.is_empty() {
+                                    o.mesh.invert_selection();
+                                }
+                            }
+                            scene.selection_volume = None;
+                            scene.region_labels.clear();
+                            update_pending_anchor_from_selection(scene);
+                            state.scene_dirty_for_disk = true;
+                        }
+                        let mut similar = None;
+                        ui.add_enabled_ui(has_faces, |ui| {
+                            ui.menu_button(RichText::new(icon::MAGIC_WAND).size(16.0), |ui| {
+                                ui.label(small_muted("Also select faces with a similar…"));
+                                for (label, by, tip) in [
+                                    ("Direction", crate::mesh::SimilarBy::Normal, "Faces pointing the same way, e.g. every sill or every roof slope"),
+                                    ("Size", crate::mesh::SimilarBy::Area, "Faces of about the same area"),
+                                    ("Colour", crate::mesh::SimilarBy::Color, "Faces painted about the same colour"),
+                                ] {
+                                    if ui.button(label).on_hover_text(tip).clicked() {
+                                        similar = Some(by);
+                                        ui.close_menu();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text("Select similar faces on the selected parts");
+                        });
+                        if let Some(by) = similar {
+                            let mut added = 0;
+                            for o in &mut scene.objects {
+                                if !o.mesh.selected_faces.is_empty() {
+                                    added += o.mesh.select_similar(by, by.default_tolerance());
+                                }
+                            }
+                            scene.selection_volume = None;
+                            update_pending_anchor_from_selection(scene);
+                            state.status_message = format!("Added {}", plural(added, "similar face", "similar faces"));
+                            state.scene_dirty_for_disk = true;
+                        }
                         if small(ui, icon::CHAT_CIRCLE_TEXT, "Write a comment about this selection", true) {
                             state.review_tab = 0;
                             state.focus_composer = true;
                         }
                         if small(ui, icon::X_CIRCLE, "Clear selection  ·  Esc", true) {
+                            scene.selection_volume = None;
                             scene.clear_all_selections();
                             scene.selected_object = None;
                             state.scene_dirty_for_disk = true;
@@ -3426,6 +3985,9 @@ fn draw_command_palette(
         (icon::STACK, "Select: Layer (whole object)".into(), "3", !comparing, Cmd::Mode(SmartSelectMode::WholeLayer)),
         (icon::PAINT_BRUSH, "Select: Brush".into(), "4", !comparing, Cmd::Mode(SmartSelectMode::Brush)),
         (icon::SELECTION, "Select: Box".into(), "5", !comparing, Cmd::Mode(SmartSelectMode::Box)),
+        (icon::TRIANGLE, "Select: Face (single polygons)".into(), "6", !comparing, Cmd::Mode(SmartSelectMode::Face)),
+        (icon::LASSO, "Select: Lasso".into(), "7", !comparing, Cmd::Mode(SmartSelectMode::Lasso)),
+        (icon::BOUNDING_BOX, "Select: 3D box (volume)".into(), "8", !comparing, Cmd::Mode(SmartSelectMode::Volume)),
         (icon::X_CIRCLE, "Clear selection".into(), "Esc", scene.has_any_selection(), Cmd::ClearSelection),
         (icon::CHAT_CIRCLE_TEXT, "Comment on selection".into(), "", !comparing, Cmd::Comment),
         (icon::PAPER_PLANE_TILT, format!("Send {} to the agent", plural(drafts, "draft", "drafts")), "", drafts > 0, Cmd::SendDrafts),
@@ -3817,6 +4379,9 @@ fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
                         "Select",
                         &[
                             ("1  2  3  4  5", "Part · Surface · Layer · Brush · Box"),
+                            ("6  7  8", "Face · Lasso · 3D box"),
+                            ("3D box", "Click a surface to place it, drag handles to resize"),
+                            ("I", "Invert selection"),
                             ("Ctrl + C", "Toggle the box selector"),
                             ("Box: drag", "Select visible faces in a rectangle"),
                             ("Tab", "Cycle selection mode"),

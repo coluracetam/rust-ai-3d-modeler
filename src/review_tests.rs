@@ -593,3 +593,190 @@ fn clear_selection_tool_clears_everything() {
     assert!(!e.scene.has_any_selection());
     assert!(e.scene.objects[0].mesh.selected_faces.is_empty());
 }
+
+#[test]
+fn volume_selection_follows_the_box_and_survives_topology_changes() {
+    use crate::scene::SelectionVolume;
+    let mut s = Scene::empty();
+    let a = s.add_mesh_object("Left", Mesh::cube(1.0), [0.7; 3]);
+    let b = s.add_mesh_object("Right", Mesh::cube(1.0), [0.7; 3]);
+    s.objects[b].transform.translation = Vec3::new(3.0, 0.0, 0.0);
+
+    // A box around the top of the left cube only.
+    s.selection_volume = Some(SelectionVolume::from_min_max(
+        Vec3::new(-0.6, 0.4, -0.6),
+        Vec3::new(0.6, 0.6, 0.6),
+    ));
+    let (faces, parts) = s.apply_volume_selection();
+    assert_eq!((faces, parts), (1, 1));
+    assert!(s.objects[b].mesh.selected_faces.is_empty());
+    let top = *s.objects[a].mesh.selected_faces.iter().next().unwrap();
+    assert!(s.objects[a].mesh.face_normal(top).y > 0.9);
+
+    let id = s.add_comment_for_selection("Raise the lid", 0.3).unwrap().id;
+    assert!(s.comments[0].volume.is_some());
+    // Change the topology: stored face indices are now stale, the box is not.
+    s.objects[a].mesh.select_all(crate::mesh::EditElementMode::Face);
+    assert!(s.objects[a].mesh.subdivide_or_loop_cut());
+    s.clear_all_selections();
+    let comment = s.comments[0].clone();
+    assert!(!s.comment_needs_reattachment(&comment));
+    let targets = s.resolved_targets(&comment);
+    assert!(!targets.is_empty());
+    assert!(targets.iter().all(|t| t.object_id == s.objects[a].id));
+    assert!(s.focus_comment(id).is_some());
+    assert!(!s.objects[a].mesh.selected_faces.is_empty());
+
+    // A box over empty space is a valid target on its own.
+    s.clear_all_selections();
+    s.selection_volume = Some(SelectionVolume::new(Vec3::new(0.0, 5.0, 0.0), Vec3::splat(0.5)));
+    assert_eq!(s.apply_volume_selection(), (0, 0));
+    let empty = s.add_comment_for_selection("Add a balcony here", 0.3).unwrap();
+    assert!(empty.targets.is_empty() && empty.volume.is_some() && !empty.is_general);
+    assert!(!s.comment_needs_reattachment(&empty));
+    assert_eq!(s.current_comment_anchor(&empty), Vec3::new(0.0, 5.0, 0.0));
+}
+
+#[test]
+fn face_paths_inversion_similarity_and_region_names() {
+    use crate::mesh::SimilarBy;
+    let mut plane = Mesh::plane(4.0, 4);
+    let total = plane.faces.len();
+    assert_eq!(total, 16);
+    // A path between opposite corners is edge-connected and includes both ends.
+    let path = plane.face_path(0, total - 1).unwrap();
+    assert_eq!((path[0], *path.last().unwrap()), (0, total - 1));
+    assert!(path.len() >= 7);
+    for pair in path.windows(2) {
+        assert!(plane.face_neighbors(pair[0]).contains(&pair[1]));
+    }
+
+    plane.selected_faces.insert(0);
+    plane.invert_selection();
+    assert_eq!(plane.selected_faces.len(), total - 1);
+    assert!(!plane.selected_faces.contains(&0));
+
+    // Every face of a flat grid points the same way and has the same area.
+    plane.selected_faces = [3].into_iter().collect();
+    assert_eq!(plane.select_similar(SimilarBy::Normal, 5.0), total - 1);
+    plane.selected_faces = [3].into_iter().collect();
+    assert_eq!(plane.select_similar(SimilarBy::Area, 0.1), total - 1);
+
+    // On a cube only the clicked side matches by direction.
+    let mut cube = Mesh::cube(1.0);
+    cube.selected_faces = [0].into_iter().collect();
+    assert_eq!(cube.select_similar(SimilarBy::Normal, 5.0), 0);
+
+    // Region names travel with the comment target.
+    let mut s = Scene::empty();
+    let i = s.add_mesh_object("Tower", Mesh::cube(1.0), [0.7; 3]);
+    s.objects[i].mesh.selected_faces.insert(2);
+    let id = s.objects[i].id;
+    s.region_labels.insert((id, 2), "north wall".into());
+    let c = s.add_comment_for_selection("Add a window", 0.3).unwrap();
+    assert_eq!(c.targets[0].label, "north wall");
+}
+
+#[test]
+fn agent_tools_build_query_select_and_verify() {
+    let mut e = Editor::new();
+    e.scene = Scene::empty();
+    let ok = |r: crate::ipc::IpcResponse| {
+        assert!(r.ok, "{}", r.message);
+        r.data
+    };
+
+    // Build: an L-shaped slab, a raw-vertex pyramid and a lofted post.
+    let slab = ok(e.call(
+        "add_extrude",
+        json!({"name": "Slab", "profile": [[0,0],[4,0],[4,2],[2,2],[2,4],[0,4]], "height": 0.5}),
+    ));
+    let slab_id = slab["object_id"].as_u64().unwrap();
+    let pyramid = ok(e.call(
+        "add_mesh",
+        json!({
+            "name": "Pyramid",
+            "vertices": [[-0.5,0,-0.5],[0.5,0,-0.5],[0.5,0,0.5],[-0.5,0,0.5],[0,1,0]],
+            // Deliberately inside-out: the tool fixes the winding.
+            "faces": [[3,2,1,0],[1,4,0],[2,4,1],[3,4,2],[0,4,3]],
+            "position": [8, 0, 0]
+        }),
+    ));
+    assert_eq!(pyramid["watertight"], true);
+    assert_eq!(pyramid["winding_fixed"], true);
+    let pyramid_id = pyramid["object_id"].as_u64().unwrap();
+    assert!(!e.call("add_mesh", json!({"vertices": [[0,0,0],[1,0,0],[0,1,0]], "faces": [[0,1,7]]})).ok);
+
+    // Stack the pyramid on the slab and confirm with a measurement.
+    ok(e.call("align_object", json!({"object_id": pyramid_id, "target_object_id": slab_id, "x": "min", "z": "min", "y": "after"})));
+    let m = ok(e.call("measure", json!({"object_id": pyramid_id, "other_object_id": slab_id})));
+    assert!(m["axis_gap"][1].as_f64().unwrap().abs() < 1e-4, "{m}");
+
+    // Select the slab's top by a world-space box, then read what was selected.
+    let sel = ok(e.call(
+        "select_faces",
+        json!({"object_id": slab_id, "mode": "box", "min": [-1, 0.45, -1], "max": [5, 0.55, 5]}),
+    ));
+    let top_faces = sel["selected_faces"].as_u64().unwrap();
+    assert!(top_faces >= 4, "{sel}");
+    let q = ok(e.call("query_geometry", json!({"object_id": slab_id})));
+    assert_eq!(q["scope"], "selection");
+    assert_eq!(q["face_count"].as_u64().unwrap(), top_faces);
+    assert!((q["total_area"].as_f64().unwrap() - 12.0).abs() < 1e-3, "{q}");
+    assert!(q["faces"][0]["normal"][1].as_f64().unwrap() > 0.99);
+    assert!((q["object_size"][0].as_f64().unwrap() - 4.0).abs() < 1e-3);
+
+    // Paint only those faces, then grow / invert through the selection tool.
+    let painted = ok(e.call("paint_faces", json!({"object_id": slab_id, "color": [0.9, 0.2, 0.1]})));
+    assert_eq!(painted["painted_faces"].as_u64().unwrap(), top_faces);
+    let similar = ok(e.call("select_faces", json!({"object_id": slab_id, "mode": "similar", "by": "color", "op": "add"})));
+    assert_eq!(similar["selected_faces"].as_u64().unwrap(), top_faces);
+    let inverted = ok(e.call("select_faces", json!({"object_id": slab_id, "mode": "invert"})));
+    assert!(inverted["selected_faces"].as_u64().unwrap() > 0);
+    ok(e.call("select_faces", json!({"object_id": slab_id, "mode": "none"})));
+
+    // Scatter studs over the slab's upward faces, deform a post, run extra mesh edits in a batch.
+    let stud = ok(e.call("add_primitive", json!({"shape": "cube", "size": 0.1, "name": "Stud"})));
+    let scattered = ok(e.call(
+        "scatter_object",
+        json!({"object_id": stud["object_id"], "target_object_id": slab_id, "count": 12, "seed": 3, "min_normal_y": 0.9}),
+    ));
+    assert_eq!(scattered["copies"], 12);
+    let batch = ok(e.call(
+        "batch",
+        json!({"commands": [
+            {"tool": "add_loft", "args": {"name": "Post", "sections": [
+                [[-0.2,0,-0.2],[0.2,0,-0.2],[0.2,0,0.2],[-0.2,0,0.2]],
+                [[-0.2,1,-0.2],[0.2,1,-0.2],[0.2,1,0.2],[-0.2,1,0.2]],
+                [[-0.1,2,-0.1],[0.1,2,-0.1],[0.1,2,0.1],[-0.1,2,0.1]]
+            ]}},
+            {"tool": "edit_mesh", "args": {"name": "Post", "operation": "subdivide_smooth", "levels": 1}},
+            {"tool": "deform_object", "args": {"name": "Post", "mode": "twist", "axis": "y", "angle_deg": 90}},
+            {"tool": "check_mesh", "args": {"name": "Post"}}
+        ]}),
+    ));
+    assert_eq!(batch["ran"], 4);
+    assert_eq!(batch["results"][3]["data"]["parts"][0]["watertight"], true, "{batch}");
+    assert_eq!(batch["results"][3]["data"]["parts"][0]["issues"].as_array().unwrap().len(), 0);
+    // A failing command stops the batch and reports where.
+    let stopped = e.call("batch", json!({"commands": [{"tool": "deform_object", "args": {"name": "Post", "mode": "wobble"}}, {"tool": "clear_selection"}]}));
+    assert!(!stopped.ok);
+    assert_eq!(stopped.data["ran"], 1);
+
+    let report = ok(e.call("check_mesh", json!({})));
+    assert!(report["parts"].as_array().unwrap().len() >= 4);
+    let info = ok(e.call("get_scene_info", json!({})));
+    assert!(info["objects"][0]["world_bounds_max"][0].as_f64().is_some());
+
+    // One call, four angles. Rendering needs a GPU adapter; skip the pixel check without one.
+    let path = std::env::temp_dir().join(format!("rust_modeler_views_{}.png", std::process::id()));
+    let shot = e.call("capture_views", json!({"path": path, "cell_width": 200, "cell_height": 150, "frame": "object", "object_id": slab_id}));
+    if shot.ok {
+        let img = image::open(&path).unwrap();
+        assert_eq!((img.width(), img.height()), (400, 300));
+        assert_eq!(shot.data["cells"].as_array().unwrap().len(), 4);
+        let _ = std::fs::remove_file(&path);
+    } else {
+        eprintln!("capture_views skipped: {}", shot.message);
+    }
+}
