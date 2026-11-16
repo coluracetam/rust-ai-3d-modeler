@@ -163,8 +163,6 @@ pub struct UiState {
     pub projects: ProjectsUi,
     /// Short confirmation of the last action, with an Undo button.
     pub toast: Option<Toast>,
-    /// Frame the whole scene on the next frame (after opening an asset as a project).
-    pub frame_all_next: bool,
 }
 
 /// State of the Projects screen. The listing is shared so cloning `UiState` stays cheap.
@@ -188,8 +186,8 @@ pub struct ProjectsUi {
 pub struct Toast {
     pub text: String,
     pub shown: std::time::Instant,
-    /// Offer an Undo button.
-    pub undo: bool,
+    /// History entry that the Undo button can restore.
+    pub undo_id: Option<u64>,
 }
 
 /// Follow-up for a command the user ran from the GUI: confirm what happened where it can be
@@ -199,12 +197,17 @@ pub fn after_action(
     request: &crate::ipc::IpcRequest,
     response: &crate::ipc::IpcResponse,
     camera: &mut OrbitCamera,
+    undo_id: Option<u64>,
 ) {
     if !response.ok {
         return;
     }
-    let toast = |text: &str, undo: bool| {
-        Some(Toast { text: text.to_string(), shown: std::time::Instant::now(), undo })
+    let toast = |text: &str| {
+        Some(Toast {
+            text: text.to_string(),
+            shown: std::time::Instant::now(),
+            undo_id,
+        })
     };
     match request.tool.as_str() {
         "library_insert_asset" => {
@@ -216,10 +219,13 @@ pub fn after_action(
                 crate::agent_tools::frame_camera(camera, (min, max), 1.8);
             }
             let name = request.args["asset"].as_str().and_then(|a| a.rsplit('/').next()).unwrap_or("asset");
-            state.toast = toast(&format!("Added “{name}” to the scene"), true);
+            state.toast = toast(&format!("Added “{name}” to the scene"));
             state.scene_tab = 0;
         }
-        "delete_object" => state.toast = toast(&response.message, true),
+        "delete_object" => state.toast = toast(&response.message),
+        "new_project" if request.args["asset"].is_string() => {
+            state.scene_tab = 0;
+        }
         "undo" => state.toast = None,
         _ => {}
     }
@@ -371,7 +377,6 @@ impl Default for UiState {
             library: LibraryUi::default(),
             projects: ProjectsUi::default(),
             toast: None,
-            frame_all_next: false,
         }
     }
 }
@@ -1377,7 +1382,8 @@ pub fn draw_ui(
     draw_dialogs(ctx, scene, state);
     draw_library_view(ctx, scene, camera, state, comparing);
     draw_projects_view(ctx, scene, state, comparing);
-    draw_toast(ctx, state);
+    let can_undo = !comparing && !in_progress;
+    draw_toast(ctx, state, if can_undo { history.undo_id() } else { None });
     draw_command_palette(ctx, scene, camera, renderer, history, state, comparing, in_progress);
 
     if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
@@ -1408,9 +1414,6 @@ pub fn draw_ui(
             state.status_message =
                 "Delete removes whole parts. Pick the part in the Parts list, then press Delete.".into();
         }
-    }
-    if std::mem::take(&mut state.frame_all_next) && !scene.objects.is_empty() {
-        frame_all(scene, camera);
     }
     if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) && !comparing {
         if scene.project_path.is_some() {
@@ -2042,7 +2045,7 @@ fn scene_parts_tab(
                         egui::pos2(rect.right() - 15.0, rect.center().y),
                         egui::vec2(26.0, 24.0),
                     );
-                    let show_bin = !comparing && ui.rect_contains_pointer(rect);
+                    let show_bin = !comparing && search.is_empty() && ui.rect_contains_pointer(rect);
                     let bin = ui
                         .interact(bin_rect, row.id.with("group_delete"), egui::Sense::click())
                         .on_hover_text(format!(
@@ -3119,12 +3122,7 @@ fn library_asset_card(
         action(
             state,
             "new_project",
-            serde_json::json!({ "name": asset.name, "save": true, "save_current": true, "thumbnail": true }),
-        );
-        action(
-            state,
-            "library_insert_asset",
-            serde_json::json!({ "asset": asset.reference(), "position": [0.0, 0.0, 0.0] }),
+            serde_json::json!({ "asset": asset.reference(), "save": true, "save_current": true, "thumbnail": true }),
         );
         state.library.open = false;
     }
@@ -3157,7 +3155,7 @@ fn library_asset_card(
     library_asset_actions(ui, state, root, asset, insert_at, comparing, add, pressed == Some(1), armed)
 }
 
-fn draw_toast(ctx: &egui::Context, state: &mut UiState) {
+fn draw_toast(ctx: &egui::Context, state: &mut UiState, undo_id: Option<u64>) {
     const SECONDS: f32 = 8.0;
     let Some(toast) = state.toast.clone() else {
         return;
@@ -3179,13 +3177,13 @@ fn draw_toast(ctx: &egui::Context, state: &mut UiState) {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(icon::CHECK_CIRCLE).size(16.0).color(ACCENT));
                     ui.label(RichText::new(&toast.text).color(TEXT));
-                    if toast.undo
+                    if let Some(id) = toast.undo_id.filter(|id| Some(*id) == undo_id)
                         && ui
                             .button(icon_text(icon::ARROW_COUNTER_CLOCKWISE, "Undo"))
                             .on_hover_text("Ctrl+Z")
                             .clicked()
                     {
-                        action(state, "undo", serde_json::json!({}));
+                        action(state, "undo", serde_json::json!({ "history_id": id }));
                         state.toast = None;
                     }
                     if quiet_button(ui, "×", "Dismiss") {
@@ -3327,7 +3325,8 @@ fn draw_projects_view(ctx: &egui::Context, scene: &Scene, state: &mut UiState, c
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                         for project in shown {
-                            let current = scene.project_path.as_deref() == Some(project.path.as_str());
+                            let current = scene.project_path.as_deref()
+                                .is_some_and(|path| crate::project::same_project(path, &project.path));
                             match project_card(ui, state, project, current, blocked.is_some()) {
                                 Some(true) => {
                                     action(
@@ -6506,7 +6505,7 @@ mod library_view_tests {
             };
             let _ = ctx.run(input, |ctx| {
                 draw_projects_view(ctx, scene, state, false);
-                draw_toast(ctx, state);
+                draw_toast(ctx, state, Some(1));
             });
         };
         state.library.open = false;
@@ -6515,8 +6514,7 @@ mod library_view_tests {
         assert!(state.projects.list.is_empty());
         std::fs::create_dir_all(&projects).unwrap();
         for name in ["Castle", "Bookshelf"] {
-            let path = crate::project::new_project_path(&projects, name).unwrap();
-            crate::project::save(&path, &scene, &camera).unwrap();
+            crate::project::create_project(&projects, name, &scene, &camera).unwrap();
         }
         state.projects.scanned = None;
         state.projects.search = "cast".into();
@@ -6535,11 +6533,11 @@ mod library_view_tests {
         );
         let mut view = OrbitCamera::default();
         state.scene_tab = 3;
-        after_action(&mut state, &request, &response, &mut view);
+        after_action(&mut state, &request, &response, &mut view, Some(1));
         assert_eq!(view.target, Vec3::new(11.0, 1.0, 1.0));
         assert_eq!(state.scene_tab, 0);
         let toast = state.toast.clone().unwrap();
-        assert!(toast.undo && toast.text.contains("Stool"));
+        assert!(toast.undo_id == Some(1) && toast.text.contains("Stool"));
         frame_projects(&scene, &mut state);
         // A new asset stands beside the scene, on its floor, never inside it.
         let spot = library_insert_point(&scene, &camera);

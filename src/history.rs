@@ -1,7 +1,9 @@
 use crate::scene::Scene;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug)]
 pub struct HistoryEntry {
+    id: u64,
     pub label: String,
     pub scene_snapshot: Scene,
 }
@@ -25,6 +27,7 @@ impl Default for UndoHistory {
 
 impl UndoHistory {
     pub fn record(&mut self, label: impl Into<String>, current_scene: &Scene) {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         if current_scene
             .revisions
             .iter()
@@ -36,6 +39,7 @@ impl UndoHistory {
             self.undo_stack.remove(0);
         }
         self.undo_stack.push(HistoryEntry {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             label: label.into(),
             scene_snapshot: current_scene.clone(),
         });
@@ -47,6 +51,7 @@ impl UndoHistory {
         let entry = self.undo_stack.pop()?;
         let action_label = entry.label.clone();
         self.redo_stack.push(HistoryEntry {
+            id: entry.id,
             label: action_label.clone(),
             scene_snapshot: current_scene.clone(),
         });
@@ -60,6 +65,7 @@ impl UndoHistory {
         let entry = self.redo_stack.pop()?;
         let action_label = entry.label.clone();
         self.undo_stack.push(HistoryEntry {
+            id: entry.id,
             label: action_label.clone(),
             scene_snapshot: current_scene.clone(),
         });
@@ -71,6 +77,10 @@ impl UndoHistory {
 
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
+    }
+
+    pub fn undo_id(&self) -> Option<u64> {
+        self.undo_stack.last().map(|entry| entry.id)
     }
 
     pub fn can_redo(&self) -> bool {

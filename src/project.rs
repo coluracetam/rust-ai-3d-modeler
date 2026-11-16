@@ -3,8 +3,9 @@ use crate::{camera::OrbitCamera, scene::Scene};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -33,30 +34,41 @@ pub fn backup_path(path: &Path) -> PathBuf {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8], backup: bool) -> Result<(), String> {
+    write_atomically(path, bytes, |temp| {
+        if backup && path.exists() {
+            fs::copy(path, backup_path(path))?;
+        }
+        fs::rename(temp, path)
+    })
+    .map_err(|e| format!("Could not save {}: {e}", path.display()))
+}
+
+fn write_atomically(
+    path: &Path,
+    bytes: &[u8],
+    publish: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .ok_or("Choose a file path")?
-        .to_string_lossy();
-    let temp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = fs::File::create(&temp)?;
+    let (temp, mut file) = loop {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".rust-modeler-{}-{id}.tmp", std::process::id()));
+        match fs::File::create_new(&temp) {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
-        if backup && path.exists() {
-            fs::copy(path, backup_path(path))?;
-        }
-        fs::rename(&temp, path)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
+        publish(&temp)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result.map_err(|e| format!("Could not save {}: {e}", path.display()))
+    let _ = fs::remove_file(&temp);
+    result.and_then(|()| fs::File::open(parent)?.sync_all())
 }
 
 pub fn save(path: &Path, scene: &Scene, camera: &OrbitCamera) -> Result<(), String> {
@@ -133,10 +145,15 @@ pub fn data_dir() -> PathBuf {
 
 /// Projects folder: `$RUST_MODELER_PROJECTS`, else `projects` in the app's data folder.
 pub fn projects_dir() -> PathBuf {
-    std::env::var_os("RUST_MODELER_PROJECTS")
+    let dir = std::env::var_os("RUST_MODELER_PROJECTS")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir().join("projects"))
+        .unwrap_or_else(|| data_dir().join("projects"));
+    if dir.is_absolute() {
+        dir
+    } else {
+        std::env::current_dir().unwrap_or_default().join(dir)
+    }
 }
 
 const PROJECT_EXT: &str = ".spatial.json";
@@ -198,7 +215,7 @@ pub fn list_projects(dir: &Path) -> Vec<ProjectInfo> {
         .filter_map(|path| project_info(&path, true))
         .collect();
     for path in recent_paths(dir) {
-        if !projects.iter().any(|p| p.path == path) {
+        if !projects.iter().any(|p| same_project(&p.path, &path)) {
             projects.extend(project_info(Path::new(&path), false));
         }
     }
@@ -208,30 +225,64 @@ pub fn list_projects(dir: &Path) -> Vec<ProjectInfo> {
 
 /// Keeps a project saved or opened outside the projects folder on the Projects screen.
 pub fn remember_recent(dir: &Path, path: &str) {
-    if Path::new(path).parent() == Some(dir) {
+    let canonical = fs::canonicalize(path).ok();
+    if Path::new(path).parent() == Some(dir)
+        || canonical.as_deref().and_then(Path::parent)
+            .is_some_and(|parent| fs::canonicalize(dir).is_ok_and(|dir| dir == parent))
+    {
         return;
     }
     let mut recent = recent_paths(dir);
-    recent.retain(|p| p != path);
+    recent.retain(|p| !same_project(p, path));
     recent.insert(0, path.to_string());
     recent.truncate(30);
     if fs::create_dir_all(dir).is_ok() {
         if let Ok(bytes) = serde_json::to_vec_pretty(&recent) {
-            let _ = fs::write(dir.join(RECENT_FILE), bytes);
+            let _ = atomic_write(&dir.join(RECENT_FILE), &bytes, false);
         }
     }
 }
 
-/// A free `<name>.spatial.json` in `dir`: `Castle`, then `Castle 2`, `Castle 3`…
-pub fn new_project_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+pub fn same_project(a: &str, b: &str) -> bool {
+    a == b || fs::canonicalize(a).is_ok_and(|a| fs::canonicalize(b).is_ok_and(|b| a == b))
+}
+
+pub fn clean_project_name(name: &str) -> Result<String, String> {
     let name = name.trim();
     let name = if name.is_empty() { "Untitled project" } else { name };
-    let name = crate::library::clean_name(name, "project")?;
-    Ok((1..)
-        .map(|n| if n == 1 { name.clone() } else { format!("{name} {n}") })
-        .map(|candidate| dir.join(format!("{candidate}{PROJECT_EXT}")))
-        .find(|path| !path.exists())
-        .unwrap())
+    crate::library::clean_name(name, "project")
+}
+
+/// Save a complete new project with a validated name without replacing another file.
+pub fn create_project(
+    dir: &Path,
+    name: &str,
+    scene: &Scene,
+    camera: &OrbitCamera,
+) -> Result<String, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    let mut project = Project {
+        format_version: 1,
+        scene: scene.clone(),
+        camera: camera.clone(),
+    };
+    for number in 1u64.. {
+        let candidate = if number == 1 { name.to_string() } else { format!("{name} {number}") };
+        let path = dir.join(format!("{candidate}{PROJECT_EXT}"));
+        if path.symlink_metadata().is_ok() {
+            continue;
+        }
+        let text = path.to_string_lossy().into_owned();
+        project.scene.project_path = Some(text.clone());
+        let bytes = serde_json::to_vec(&project).map_err(|e| e.to_string())?;
+        // A hard link publishes the complete file and fails if another writer claimed the name.
+        match write_atomically(&path, &bytes, |temp| fs::hard_link(temp, &path)) {
+            Ok(()) => return Ok(text),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Could not save {}: {e}", path.display())),
+        }
+    }
+    unreachable!("project name suffixes exhausted")
 }
 
 /// Where a project's preview picture is kept (one folder for all projects, so files saved
@@ -276,7 +327,7 @@ pub fn delete_project(dir: &Path, info: &ProjectInfo) -> Result<(), String> {
         let mut recent = recent_paths(dir);
         recent.retain(|p| *p != info.path);
         let bytes = serde_json::to_vec_pretty(&recent).map_err(|e| e.to_string())?;
-        return fs::write(dir.join(RECENT_FILE), bytes).map_err(|e| e.to_string());
+        return atomic_write(&dir.join(RECENT_FILE), &bytes, false);
     }
     let trash = dir.join(".trash");
     fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
@@ -285,7 +336,8 @@ pub fn delete_project(dir: &Path, info: &ProjectInfo) -> Result<(), String> {
         .map_or(0, |d| d.as_millis());
     let file = path.file_name().ok_or("Not a project file")?.to_string_lossy().into_owned();
     // The project file goes last so a failure part-way never hides a project that still exists.
-    for source in [autosave_path(path), backup_path(path), path.to_path_buf()] {
+    let autosave = autosave_path(path);
+    for source in [backup_path(&autosave), autosave, backup_path(path), path.to_path_buf()] {
         if source.exists() {
             let suffix = source.to_string_lossy()[info.path.len()..].to_string();
             fs::rename(&source, trash.join(format!("{stamp} {file}{suffix}")))
@@ -299,24 +351,26 @@ pub fn delete_project(dir: &Path, info: &ProjectInfo) -> Result<(), String> {
 /// Saves the project being left so switching never loses work: to its own file, or, when it
 /// has content but was never saved, to a new file in the projects folder. Returns that file.
 pub fn save_before_switching(scene: &mut Scene, camera: &OrbitCamera, thumbnail: bool) -> Result<Option<String>, String> {
-    let path = match &scene.project_path {
-        Some(path) => PathBuf::from(path),
-        None if scene.objects.is_empty() && scene.comments.is_empty() => return Ok(None),
+    let text = match &scene.project_path {
+        Some(path) => {
+            save(Path::new(path), scene, camera)?;
+            path.clone()
+        }
+        None if scene.objects.is_empty()
+            && scene.comments.is_empty()
+            && scene.revisions.is_empty()
+            && scene.saved_selections.is_empty()
+            && scene.saved_views.is_empty() => return Ok(None),
         None => {
-            let dir = projects_dir();
-            fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-            new_project_path(&dir, &scene.project_name)?
+            // Older projects can have titles that aren't valid filenames.
+            let name = clean_project_name(&scene.project_name).unwrap_or_else(|_| "Untitled project".into());
+            create_project(&projects_dir(), &name, scene, camera)?
         }
     };
-    let text = path.to_string_lossy().into_owned();
-    let previous = scene.project_path.replace(text.clone());
-    if let Err(e) = save(&path, scene, camera) {
-        scene.project_path = previous;
-        return Err(e);
-    }
+    scene.project_path = Some(text.clone());
     remember_recent(&projects_dir(), &text);
     if thumbnail {
-        let _ = render_thumbnail(scene, camera, &path);
+        let _ = render_thumbnail(scene, camera, Path::new(&text));
     }
     Ok(Some(text))
 }
@@ -335,6 +389,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rust_modeler_switch_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         unsafe { std::env::set_var("RUST_MODELER_PROJECTS", &dir) };
+        let library = dir.join("library");
+        unsafe { std::env::set_var("RUST_MODELER_LIBRARY", &library) };
 
         let mut scene = Scene::empty();
         scene.project_name = "Castle".into();
@@ -358,6 +414,9 @@ mod tests {
         };
 
         // Deleting a group is one undo step.
+        assert!(!run(&mut scene, "delete_object", json!({ "object_ids": [] })).ok);
+        assert!(!run(&mut scene, "delete_object", json!({ "group": 42 })).ok);
+        assert_eq!(scene.objects.len(), 3);
         let deleted = run(&mut scene, "delete_object", json!({ "group": "Tower" }));
         assert!(deleted.ok && deleted.message.contains("'Tower' (2 parts)"), "{}", deleted.message);
         assert_eq!(scene.objects.len(), 1);
@@ -368,22 +427,46 @@ mod tests {
         assert_eq!(scene.objects[0].name, "Tower/Roof");
 
         // The never-saved Castle is kept in the projects folder when a new project starts.
-        let started = run(&mut scene, "new_project", json!({ "name": "Bookshelf", "save": true, "save_current": true }));
+        let started = run(&mut scene, "new_project", json!({ "name": "Castle", "save": true, "save_current": true }));
         assert!(started.ok, "{}", started.message);
         let castle = dir.join("Castle.spatial.json");
-        let shelf = dir.join("Bookshelf.spatial.json");
+        let shelf = dir.join("Castle 2.spatial.json");
         assert!(castle.is_file() && shelf.is_file());
         assert_eq!(scene.project_path.as_deref(), shelf.to_str());
         assert!(scene.objects.is_empty());
+        assert_eq!(load(&castle).unwrap().scene.objects[0].name, "Tower/Roof");
 
         // Work in the new project is saved when switching back; the same name gets a new file.
         scene.add_mesh_object("Shelf", Mesh::cube(1.0), [0.5; 3]);
+        let alias = dir.join(".").join("Castle 2.spatial.json");
+        let reopened = run(&mut scene, "open_project", json!({ "path": alias, "save_current": true }));
+        assert_eq!(reopened.message, "That project is already open");
+        assert_eq!(scene.objects[0].name, "Shelf");
         let opened = run(&mut scene, "open_project", json!({ "path": castle, "save_current": true }));
         assert!(opened.ok, "{}", opened.message);
         assert_eq!((scene.project_name.as_str(), scene.objects.len()), ("Castle", 1));
         assert_eq!(load(&shelf).unwrap().scene.objects.len(), 1);
-        let again = run(&mut scene, "new_project", json!({ "name": "Bookshelf", "save": true, "save_current": true }));
-        assert!(again.data["project_path"].as_str().unwrap().ends_with("Bookshelf 2.spatial.json"));
+        let saved_asset = run(&mut scene, "library_save_asset", json!({ "name": "Castle", "section": "Props", "all": true, "thumbnail": false }));
+        assert!(saved_asset.ok, "{}", saved_asset.message);
+
+        let missing = run(&mut scene, "new_project", json!({ "asset": "Missing", "save": true, "save_current": true }));
+        assert!(!missing.ok);
+        assert_eq!(scene.project_path.as_deref(), castle.to_str());
+        let bad_folder = dir.join("not-a-folder");
+        fs::write(&bad_folder, "keep me").unwrap();
+        unsafe { std::env::set_var("RUST_MODELER_PROJECTS", &bad_folder) };
+        let failed = run(&mut scene, "new_project", json!({ "asset": saved_asset.data["asset"], "save": true, "save_current": true }));
+        assert!(!failed.ok);
+        assert_eq!(scene.project_path.as_deref(), castle.to_str());
+        assert_eq!(scene.objects[0].name, "Tower/Roof");
+        unsafe { std::env::set_var("RUST_MODELER_PROJECTS", &dir) };
+
+        let again = run(&mut scene, "new_project", json!({ "asset": saved_asset.data["asset"], "save": true, "save_current": true }));
+        assert!(again.ok, "{}", again.message);
+        let asset_project = again.data["project_path"].as_str().unwrap();
+        assert!(asset_project.ends_with("Castle 3.spatial.json"));
+        assert_eq!(scene.objects[0].name, "Castle");
+        assert_eq!(load(Path::new(asset_project)).unwrap().scene.objects[0].name, "Castle");
 
         let listed = run(&mut scene, "list_projects", json!({}));
         assert_eq!(listed.data["projects"].as_array().unwrap().len(), 3);
@@ -394,6 +477,7 @@ mod tests {
         assert_eq!(list_projects(&dir).len(), 3);
 
         unsafe { std::env::remove_var("RUST_MODELER_PROJECTS") };
+        unsafe { std::env::remove_var("RUST_MODELER_LIBRARY") };
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -407,14 +491,14 @@ mod tests {
         let mut scene = Scene::empty();
         scene.add_mesh_object("Tower", Mesh::cube(1.0), [0.5; 3]);
         let camera = OrbitCamera::default();
-        let first = new_project_path(&dir, "Castle").unwrap();
+        let first = PathBuf::from(create_project(&dir, "Castle", &scene, &camera).unwrap());
         assert!(first.ends_with("Castle.spatial.json"));
-        save(&first, &scene, &camera).unwrap();
         save(&first, &scene, &camera).unwrap(); // writes the .bak
-        let second = new_project_path(&dir, "Castle").unwrap();
-        assert!(second.ends_with("Castle 2.spatial.json"));
-        assert!(new_project_path(&dir, "../escape").is_err());
-        assert!(new_project_path(&dir, "  ").unwrap().ends_with("Untitled project.spatial.json"));
+        let autosave = autosave_path(&first);
+        save(&autosave, &scene, &camera).unwrap();
+        save(&autosave, &scene, &camera).unwrap(); // writes the .autosave.bak
+        assert!(clean_project_name("../escape").is_err());
+        assert_eq!(clean_project_name("  ").unwrap(), "Untitled project");
 
         // A project saved elsewhere shows up once it is remembered, and is only forgotten.
         let outside = std::env::temp_dir().join(format!("rust_modeler_outside_{}.spatial.json", std::process::id()));
@@ -430,9 +514,30 @@ mod tests {
         assert!(outside.exists());
         delete_project(&dir, castle).unwrap();
         assert!(!first.exists() && list_projects(&dir).is_empty());
-        assert_eq!(fs::read_dir(dir.join(".trash")).unwrap().count(), 2);
+        assert!(!backup_path(&autosave).exists());
+        assert_eq!(fs::read_dir(dir.join(".trash")).unwrap().count(), 4);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(&outside);
         let _ = fs::remove_file(backup_path(&outside));
+    }
+
+    #[test]
+    fn concurrent_creates_preserve_both_projects() {
+        let dir = std::env::temp_dir().join(format!("rust_modeler_create_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let create = |title: &str| {
+            let mut scene = Scene::empty();
+            scene.project_name = title.into();
+            create_project(&dir, "Shared", &scene, &OrbitCamera::default()).unwrap()
+        };
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| create("First"));
+            let second = scope.spawn(|| create("Second"));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(first, second);
+        assert_eq!(load(Path::new(&first)).unwrap().scene.project_name, "First");
+        assert_eq!(load(Path::new(&second)).unwrap().scene.project_name, "Second");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

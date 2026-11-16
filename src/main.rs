@@ -1511,6 +1511,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                         ));
                         continue;
                     }
+                    let previous_undo = self.history.undo_id();
                     let response = execute_ipc_command(
                         &request,
                         &mut self.scene,
@@ -1521,7 +1522,14 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                         &mut gpu.renderer_3d.show_wireframe_overlay,
                         &mut gpu.renderer_3d.show_grid,
                     );
-                    ui::after_action(&mut self.ui_state, &request, &response, &mut self.camera);
+                    let undo_id = self.history.undo_id().filter(|id| Some(*id) != previous_undo);
+                    ui::after_action(
+                        &mut self.ui_state,
+                        &request,
+                        &response,
+                        &mut self.camera,
+                        undo_id,
+                    );
                     self.ui_state.status_message = response.message;
                     self.scene.invalidate_mesh_caches();
                     gpu.renderer_3d.invalidate_cache();

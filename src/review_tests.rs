@@ -51,6 +51,23 @@ impl Editor {
 }
 
 #[test]
+fn undo_for_an_older_action_leaves_the_latest_edit_alone() {
+    let mut e = Editor::new();
+    let id = e.scene.objects[0].id;
+    assert!(e.call("delete_object", json!({ "object_ids": [id] })).ok);
+    let deletion = e.history.undo_id().unwrap();
+    assert!(e.call("add_primitive", json!({ "shape": "cube" })).ok);
+    let addition = e.history.undo_id().unwrap();
+
+    assert!(!e.call("undo", json!({ "history_id": deletion })).ok);
+    assert_eq!(e.scene.objects.len(), 1);
+    assert!(e.call("undo", json!({ "history_id": addition })).ok);
+    assert!(e.scene.objects.is_empty());
+    assert!(e.call("undo", json!({ "history_id": deletion })).ok);
+    assert_eq!(e.scene.objects[0].id, id);
+}
+
+#[test]
 fn comment_remaps_reordered_faces_and_rejects_remeshing() {
     let mut scene = scene();
     let c = scene
