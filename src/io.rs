@@ -285,7 +285,6 @@ fn parse_ascii_stl(text: &str) -> Result<Mesh, String> {
 // GLTF 2.0 BINARY (.GLB) IMPORT / EXPORT
 // =============================================================================
 
-/// Exports the visible scene into a standard Binary glTF 2.0 (`.glb`) file.
 /// Exports the visible parts as a binary glTF with named nodes, materials and colours.
 pub fn export_glb_file(scene: &Scene, path: &Path) -> Result<(), String> {
     let parts: Vec<&crate::scene::SceneObject> = scene.objects.iter().filter(|o| o.visible).collect();
@@ -319,20 +318,29 @@ pub fn import_glb_file(path: &Path) -> Result<Mesh, String> {
     let bin = &data[bin_start..bin_start + bin_len];
     let empty = Vec::new();
     let list = |key: &str| doc[key].as_array().unwrap_or(&empty);
-    let (accessors, views, meshes, nodes) =
-        (list("accessors"), list("bufferViews"), list("meshes"), list("nodes"));
+    let (accessors, views, meshes, nodes, materials) = (
+        list("accessors"),
+        list("bufferViews"),
+        list("meshes"),
+        list("nodes"),
+        list("materials"),
+    );
     if meshes.is_empty() {
         return Err("No mesh in GLB".to_string());
     }
 
     // Reads accessor `index` as rows of `width` numbers (floats as-is, integers as values,
-    // normalised integers scaled to 0..1).
+    // normalised integers scaled to the component's normalised range).
     let read = |index: &Value, width: usize| -> Result<Vec<f64>, String> {
         let accessor = index
             .as_u64()
             .and_then(|i| accessors.get(i as usize))
             .ok_or("GLB refers to a missing accessor")?;
-        let count = accessor["count"].as_u64().unwrap_or(0) as usize;
+        if !accessor["sparse"].is_null() {
+            return Err("Sparse GLB accessors are unsupported".into());
+        }
+        let read_size = |value: &Value| value.as_u64().and_then(|n| usize::try_from(n).ok());
+        let count = read_size(&accessor["count"]).filter(|&n| n > 0).ok_or("Invalid GLB accessor count")?;
         let component = accessor["componentType"].as_u64().unwrap_or(5126);
         let size = match component {
             5120 | 5121 => 1,
@@ -340,17 +348,32 @@ pub fn import_glb_file(path: &Path) -> Result<Mesh, String> {
             5125 | 5126 => 4,
             other => return Err(format!("Unsupported GLB component type {other}")),
         };
-        let Some(view) = accessor["bufferView"].as_u64().and_then(|i| views.get(i as usize)) else {
-            return Ok(vec![0.0; count * width]);
-        };
-        let start = (view["byteOffset"].as_u64().unwrap_or(0) + accessor["byteOffset"].as_u64().unwrap_or(0)) as usize;
-        let stride = view["byteStride"].as_u64().map_or(size * width, |s| s as usize);
+        let view = read_size(&accessor["bufferView"])
+            .and_then(|i| views.get(i))
+            .ok_or("GLB accessor has no valid buffer view")?;
+        if view["buffer"].as_u64().unwrap_or(0) != 0 {
+            return Err("External GLB buffers are unsupported".into());
+        }
+        let view_offset = read_size(&view["byteOffset"]).unwrap_or(0);
+        let view_bytes = read_size(&view["byteLength"])
+            .and_then(|len| bin.get(view_offset..view_offset.checked_add(len)?))
+            .ok_or("GLB buffer view reads past the binary chunk")?;
+        let start = read_size(&accessor["byteOffset"]).unwrap_or(0);
+        let row_size = size * width;
+        let stride = read_size(&view["byteStride"]).unwrap_or(row_size);
+        let end = (count - 1)
+            .checked_mul(stride)
+            .and_then(|last| last.checked_add(start))
+            .and_then(|last| last.checked_add(row_size));
+        if stride < row_size || end.is_none_or(|end| end > view_bytes.len()) {
+            return Err("GLB accessor reads past its buffer view".into());
+        }
         let normalized = accessor["normalized"].as_bool().unwrap_or(false);
         let mut out = Vec::with_capacity(count * width);
         for row in 0..count {
             for column in 0..width {
                 let at = start + row * stride + column * size;
-                let bytes = bin.get(at..at + size).ok_or("GLB accessor reads past the buffer")?;
+                let bytes = &view_bytes[at..at + size];
                 let (value, max) = match component {
                     5120 => (bytes[0] as i8 as f64, 127.0),
                     5121 => (bytes[0] as f64, 255.0),
@@ -359,7 +382,7 @@ pub fn import_glb_file(path: &Path) -> Result<Mesh, String> {
                     5125 => (u32::from_le_bytes(bytes.try_into().unwrap()) as f64, 1.0),
                     _ => (f32::from_le_bytes(bytes.try_into().unwrap()) as f64, 1.0),
                 };
-                out.push(if normalized && component != 5126 { value / max } else { value });
+                out.push(if normalized && component != 5126 { (value / max).max(-1.0) } else { value });
             }
         }
         Ok(out)
@@ -367,7 +390,6 @@ pub fn import_glb_file(path: &Path) -> Result<Mesh, String> {
 
     let mut positions: Vec<Vec3> = Vec::new();
     let mut colors: Vec<[f32; 3]> = Vec::new();
-    let mut any_color = false;
     let mut faces: Vec<Vec<usize>> = Vec::new();
     let mut add_mesh = |mesh: &Value, matrix: Mat4| -> Result<(), String> {
         for primitive in mesh["primitives"].as_array().unwrap_or(&empty) {
@@ -384,30 +406,49 @@ pub fn import_glb_file(path: &Path) -> Result<Mesh, String> {
                 matrix.transform_point3(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
             }));
             let count = positions.len() - base;
-            let color_accessor = &attributes["COLOR_0"];
-            let width = color_accessor
-                .as_u64()
-                .and_then(|i| accessors.get(i as usize))
-                .map(|a| if a["type"] == "VEC4" { 4 } else { 3 });
-            match width {
-                Some(width) => {
-                    let values = read(color_accessor, width)?;
-                    colors.extend(values.chunks_exact(width).take(count).map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]));
-                    any_color = true;
-                }
-                None => {}
+            if positions[base..].iter().any(|p| !p.is_finite()) {
+                return Err("GLB contains non-finite vertex positions".into());
             }
-            colors.resize(positions.len(), [1.0; 3]);
+            let factor = primitive["material"].as_u64().and_then(|i| materials.get(i as usize));
+            let factor = [0, 1, 2].map(|channel| {
+                factor.and_then(|m| m["pbrMetallicRoughness"]["baseColorFactor"][channel].as_f64())
+                    .unwrap_or(1.0).clamp(0.0, 1.0) as f32
+            });
+            let color_accessor = &attributes["COLOR_0"];
+            if color_accessor.is_null() {
+                colors.resize(positions.len(), factor);
+            } else {
+                let width = color_accessor
+                    .as_u64()
+                    .and_then(|i| accessors.get(i as usize))
+                    .map_or(3, |a| if a["type"] == "VEC4" { 4 } else { 3 });
+                let values = read(color_accessor, width)?;
+                if values.len() / width != count {
+                    return Err("GLB vertex colour count differs from the position count".into());
+                }
+                colors.extend(values.chunks_exact(width).map(|c| {
+                    [0, 1, 2].map(|i| (c[i] as f32 * factor[i]).clamp(0.0, 1.0))
+                }));
+                if colors[base..].iter().flatten().any(|value| !value.is_finite()) {
+                    return Err("GLB contains non-finite vertex colours".into());
+                }
+            }
             let indices: Vec<usize> = if primitive["indices"].is_null() {
                 (0..count).collect()
             } else {
-                read(&primitive["indices"], 1)?.into_iter().map(|i| i as usize).collect()
+                read(&primitive["indices"], 1)?
+                    .into_iter()
+                    .map(|i| {
+                        if i >= 0.0 && i < count as f64 && i.fract() == 0.0 {
+                            Ok(i as usize)
+                        } else {
+                            Err("GLB contains an invalid vertex index")
+                        }
+                    })
+                    .collect::<Result<_, _>>()?
             };
             let flip = matrix.determinant() < 0.0;
             for tri in indices.chunks_exact(3) {
-                if tri.iter().any(|&i| i >= count) {
-                    return Err("GLB indices point past the vertices".to_string());
-                }
                 let (a, b, c) = (base + tri[0], base + tri[1], base + tri[2]);
                 faces.push(if flip { vec![a, c, b] } else { vec![a, b, c] });
             }
@@ -469,8 +510,6 @@ pub fn import_glb_file(path: &Path) -> Result<Mesh, String> {
         return Err("The GLB has no triangle geometry".to_string());
     }
     let mut mesh = Mesh::new(positions, faces);
-    if any_color {
-        mesh.colors = colors.into();
-    }
+    mesh.colors = colors.into();
     Ok(mesh)
 }

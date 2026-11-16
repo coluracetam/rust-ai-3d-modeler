@@ -498,6 +498,25 @@ pub fn export_path(info: &AssetInfo, directory: &Path, target: ExportTarget) -> 
         .join(format!("{}.glb", spell(&info.name)))
 }
 
+/// Detect export names that would overwrite one another in the same batch.
+pub fn check_export_paths<'a>(
+    assets: impl IntoIterator<Item = &'a AssetInfo>,
+    directory: &Path,
+    target: ExportTarget,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashMap::new();
+    for asset in assets {
+        let path = export_path(asset, directory, target);
+        if let Some(previous) = seen.insert(path.clone(), asset) {
+            return Err(format!(
+                "'{}' and '{}' both export to {}. Rename one of the assets or export them to separate folders.",
+                previous.reference(), asset.reference(), path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Writes one asset as a `.glb` for Godot or Blender and returns the file and what it holds.
 pub fn export_asset(
     info: &AssetInfo,
@@ -805,6 +824,7 @@ pub fn dispatch(
             if assets.is_empty() {
                 return Err("No library assets match that export".into());
             }
+            check_export_paths(&assets, &directory, options.target)?;
             let mut exported = Vec::new();
             let mut failed = Vec::new();
             for info in &assets {
@@ -1045,6 +1065,8 @@ mod tests {
         assert_eq!((entry["meshes"].as_u64(), entry["collision_shapes"].as_u64()), (Some(2), Some(0)));
         let back = crate::io::import_glb_file(Path::new(entry["path"].as_str().unwrap())).unwrap();
         assert_eq!(back.faces.len(), 24, "two cubes come back as triangles");
+        assert!(back.colors.contains(&[0.6, 0.4, 0.2]));
+        assert!(back.colors.contains(&[0.5, 0.3, 0.2]));
         assert!(!run(&mut scene, "library_export", json!({ "directory": out, "section": "Nope" })).ok);
         let exported = run(&mut scene, "export_model", json!({ "path": out.join("scene.glb"), "group": "Chair", "merge": true }));
         assert!(exported.ok, "{}", exported.message);
@@ -1054,6 +1076,17 @@ mod tests {
         assert!(!run(&mut scene, "library_delete_section", json!({ "section": "Furniture" })).ok);
         assert!(run(&mut scene, "library_delete_asset", json!({ "asset": "Furniture/General/Oak chair" })).ok);
         assert!(run(&mut scene, "library_delete_section", json!({ "section": "Furniture" })).ok);
+
+        for name in ["Oak chair", "Oak-chair"] {
+            assert!(run(&mut scene, "library_save_asset", json!({
+                "name": name, "section": "Furniture", "group": "Chair", "thumbnail": false
+            })).ok);
+        }
+        let collision_out = root.join("colliding-exports");
+        let result = run(&mut scene, "library_export", json!({ "directory": collision_out }));
+        assert!(!result.ok);
+        assert!(result.message.contains("both export to"));
+        assert!(!collision_out.exists());
         unsafe { std::env::remove_var("RUST_MODELER_LIBRARY") };
         let _ = fs::remove_dir_all(&root);
     }

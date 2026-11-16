@@ -1641,7 +1641,12 @@ fn dispatch(
                         .and_then(|v| v.as_str())
                         .or_else(|| path.file_stem().and_then(|s| s.to_str()))
                         .unwrap_or("Imported Model");
-                    let idx = scene.add_mesh_object(name, mesh, [0.80, 0.82, 0.85]);
+                    let color = if matches!(ext.as_str(), "glb" | "gltf") {
+                        [1.0; 3]
+                    } else {
+                        [0.80, 0.82, 0.85]
+                    };
+                    let idx = scene.add_mesh_object(name, mesh, color);
                     let obj = &scene.objects[idx];
                     ui_state.status_message = format!("MCP imported '{}'", obj.name);
                     IpcResponse::success(

@@ -2501,9 +2501,14 @@ fn library_export_form(
                 scale: 1.0,
                 max_triangles: export.max_triangles(),
             };
+            let path = std::path::Path::new(&directory);
+            if let Err(e) = library::check_export_paths(assets.iter().copied(), path, options.target) {
+                state.last_error = Some(e);
+                return;
+            }
             let (mut done, mut triangles, mut failed, mut note) = (0, 0, Vec::new(), None);
             for asset in &assets {
-                match library::export_asset(asset, std::path::Path::new(&directory), &options) {
+                match library::export_asset(asset, path, &options) {
                     Ok((_, report)) => {
                         done += 1;
                         triangles += report.triangles;

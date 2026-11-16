@@ -651,7 +651,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         ));
     }
     if let Some(budget) = options.max_triangles {
-        if w.report.triangles > budget + budget / 4 {
+        if w.report.triangles > budget.saturating_add(budget / 4) {
             w.report.warnings.push(format!(
                 "Simplified from {source_triangles} to {} triangles; that is as far as the parts simplify, so the {budget} budget was not reached.",
                 w.report.triangles
@@ -869,6 +869,36 @@ mod tests {
         let doc = document(&glb);
         let cube = &doc["meshes"][1]["primitives"][0];
         assert_eq!(doc["accessors"][cube["indices"].as_u64().unwrap() as usize]["count"], 36);
+        let (_, oversized_budget) = build_glb(&parts, &GltfOptions {
+            max_triangles: Some(usize::MAX),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(oversized_budget.triangles, full.triangles);
+    }
+
+    #[test]
+    fn importer_rejects_accessors_larger_than_their_view() {
+        let scene = shelf();
+        let parts: Vec<&SceneObject> = scene.objects.iter().collect();
+        let (glb, _) = build_glb(&parts, &GltfOptions::default()).unwrap();
+        let mut doc = document(&glb);
+        doc["accessors"][0]["count"] = json!(u64::MAX);
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let bin_chunk = &glb[20 + json_len..];
+        let mut json = serde_json::to_vec(&doc).unwrap();
+        json.resize(json.len().next_multiple_of(4), b' ');
+        let mut invalid = glb[..20].to_vec();
+        invalid[8..12].copy_from_slice(&((20 + json.len() + bin_chunk.len()) as u32).to_le_bytes());
+        invalid[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
+        invalid.extend_from_slice(&json);
+        invalid.extend_from_slice(bin_chunk);
+
+        let path = std::env::temp_dir().join(format!("rust-modeler-invalid-{}.glb", std::process::id()));
+        std::fs::write(&path, invalid).unwrap();
+        let result = crate::io::import_glb_file(&path);
+        let _ = std::fs::remove_file(path);
+        let Err(error) = result else { panic!("Invalid GLB should fail to import") };
+        assert!(error.contains("accessor reads past its buffer view"), "{error}");
     }
 
     #[test]
