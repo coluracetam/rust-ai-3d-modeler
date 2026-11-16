@@ -296,6 +296,7 @@ pub fn is_read_only(tool: &str) -> bool {
             | "get_feedback_state"
             | "export_model"
             | "wait_for_feedback"
+            | "list_projects"
     ) || crate::agent_tools::READ_ONLY.contains(&tool)
         || crate::library::READ_ONLY.contains(&tool)
 }
@@ -415,6 +416,10 @@ fn dispatch(
             scene.project_path = Some(path.clone());
             match crate::project::save(Path::new(&path), scene, camera) {
                 Ok(()) => {
+                    crate::project::remember_recent(&crate::project::projects_dir(), &path);
+                    if args["thumbnail"].as_bool().unwrap_or(false) {
+                        let _ = crate::project::render_thumbnail(scene, camera, Path::new(&path));
+                    }
                     ui_state.status_message = format!("Saved {path}");
                     IpcResponse::success("Project saved", json!({"path":path}))
                 }
@@ -441,8 +446,22 @@ fn dispatch(
             } else {
                 Path::new(&path).to_path_buf()
             };
+            if scene.project_path.as_deref() == Some(path.as_str())
+                && !args["recover"].as_bool().unwrap_or(false)
+                && args["save_current"].as_bool().unwrap_or(false)
+            {
+                return IpcResponse::success("That project is already open", json!({"path":path}));
+            }
             match crate::project::load(&source) {
                 Ok(mut project) => {
+                    if args["save_current"].as_bool().unwrap_or(false) {
+                        // Leaving a project from the GUI keeps it: nothing to confirm or lose.
+                        let thumbnail = args["thumbnail"].as_bool().unwrap_or(false);
+                        if let Err(e) = crate::project::save_before_switching(scene, camera, thumbnail) {
+                            return IpcResponse::error(format!("Could not save the current project first: {e}"));
+                        }
+                    }
+                    crate::project::remember_recent(&crate::project::projects_dir(), &path);
                     history.record("Open project", scene);
                     project.scene.project_path = Some(path.clone());
                     project.scene.project_generation = scene.project_generation + 1;
@@ -460,17 +479,49 @@ fn dispatch(
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            // `save: true` creates the project's file in the projects folder straight away.
+            let save = args["save"].as_bool().unwrap_or(false);
+            let dir = crate::project::projects_dir();
+            let new_path = if save {
+                let created = std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("Could not create {}: {e}", dir.display()))
+                    .and_then(|()| crate::project::new_project_path(&dir, name));
+                match created {
+                    Ok(path) => Some(path),
+                    Err(e) => return IpcResponse::error(e),
+                }
+            } else {
+                None
+            };
+            if args["save_current"].as_bool().unwrap_or(false) {
+                let thumbnail = args["thumbnail"].as_bool().unwrap_or(false);
+                if let Err(e) = crate::project::save_before_switching(scene, camera, thumbnail) {
+                    return IpcResponse::error(format!("Could not save the current project first: {e}"));
+                }
+            }
             history.record("New project", scene);
             let previous = scene.start_new_project(name);
             let aspect = camera.aspect;
             *camera = OrbitCamera::default();
             camera.aspect = aspect;
             reset_project_ui(ui_state);
+            if let Some(path) = new_path {
+                scene.project_path = Some(path.to_string_lossy().into_owned());
+                if let Err(e) = crate::project::save(&path, scene, camera) {
+                    scene.project_path = None;
+                    return IpcResponse::error(format!("Started the project, but could not create its file: {e}"));
+                }
+            }
             ui_state.status_message = format!("Started {}", scene.project_name);
             IpcResponse::success(
-                "Started a new, unsaved project. Undo restores the previous one.",
+                if save {
+                    "Started a new project in the projects folder. Undo restores the previous one."
+                } else {
+                    "Started a new, unsaved project. Undo restores the previous one."
+                },
                 json!({
                     "project_name": scene.project_name,
+                    "project_path": scene.project_path,
                     "previous_project_name": previous.project_name,
                     "previous_project_path": previous.project_path,
                 }),
@@ -1128,6 +1179,43 @@ fn dispatch(
             } else {
                 IpcResponse::error("No object selected to duplicate")
             }
+        }
+
+        "list_projects" => {
+            let dir = crate::project::projects_dir();
+            let projects = crate::project::list_projects(&dir);
+            IpcResponse::success(
+                format!("{} project(s)", projects.len()),
+                json!({
+                    "projects_folder": dir.to_string_lossy(),
+                    "current_project_path": scene.project_path,
+                    "projects": projects,
+                }),
+            )
+        }
+
+        "delete_object" if !args["object_ids"].is_null() || !args["group"].is_null() => {
+            // Several parts, or a whole "Group/…", as one undo step.
+            let indices = match crate::library::parts_from_args(scene, args) {
+                Ok(indices) => indices,
+                Err(e) => return IpcResponse::error(e),
+            };
+            history.record("Delete parts", scene);
+            let names: Vec<String> = indices.iter().map(|&i| scene.objects[i].name.clone()).collect();
+            let ids: std::collections::HashSet<u64> = indices.iter().map(|&i| scene.objects[i].id).collect();
+            let selected = scene.active_object().map(|o| o.id);
+            scene.objects.retain(|o| !ids.contains(&o.id));
+            scene.selected_object =
+                selected.and_then(|id| scene.objects.iter().position(|o| o.id == id));
+            scene.pending_anchor = None;
+            let what = match (names.len(), names[0].split_once('/')) {
+                (1, _) => format!("'{}'", names[0]),
+                (n, Some((group, _))) if names.iter().all(|x| x.starts_with(&format!("{group}/"))) => {
+                    format!("'{group}' ({n} parts)")
+                }
+                (n, _) => format!("{n} parts"),
+            };
+            IpcResponse::success(format!("Deleted {what}"), json!({ "deleted": names.len() }))
         }
 
         "delete_object" => {

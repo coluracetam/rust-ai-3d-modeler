@@ -47,8 +47,9 @@ pub fn mcp_tool_definitions() -> Value {
         { "name":"cancel_operation", "description":"Cancel a running GUI operation and discard its result without changing live geometry.", "inputSchema":{"type":"object","properties":{}} },
         { "name":"capture_studio", "description":"Capture the full studio UI and viewport as a PNG for visual review. With compare_revision, the viewport shows a before/after wipe of that revision (before on the left of `split`, after on the right) - useful as a finish_revision screenshot.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"tab":{"type":"integer","enum":[0,1]},"compare_revision":{"type":"integer"},"split":{"type":"number","description":"Divider position 0..1 (default 0.5)."}}} },
         { "name":"save_project", "description":"Save the full project, camera, comments, selections and revisions atomically with a backup.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"}}} },
-        { "name":"new_project", "description":"Start a blank, unsaved project: removes all objects, comments, revisions, saved selections and views, and resets the camera. Undo restores the previous project. Save first if the current project has never been saved.", "inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Optional project title (default 'Untitled project')."}}} },
-        { "name":"open_project", "description":"Open a project, or recover its autosave. Existing work remains undoable.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"recover":{"type":"boolean"}},"required":["path"]} },
+        { "name":"new_project", "description":"Start a blank project: removes all objects, comments, revisions, saved selections and views, and resets the camera. Undo restores the previous project. Pass save: true to create its file in the projects folder at once (the response gives project_path), and save_current: true to save the project being left first; without them the new project is unsaved and the old one is left as it is on disk.", "inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Optional project title (default 'Untitled project')."},"save":{"type":"boolean","description":"Create the project file in the projects folder now."},"save_current":{"type":"boolean","description":"Save the current project before leaving it (a never-saved project with content goes to the projects folder)."}}} },
+        { "name":"open_project", "description":"Open a project, or recover its autosave. Existing work remains undoable. Use list_projects to find project files.", "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"recover":{"type":"boolean"},"save_current":{"type":"boolean","description":"Save the current project before leaving it."}},"required":["path"]} },
+        { "name":"list_projects", "description":"List the projects in the projects folder and other project files recently opened or saved, most recently changed first, with the path of the project that is open now.", "inputSchema":{"type":"object","properties":{}} },
         { "name":"begin_revision", "description":"Start one named, cancellable geometry revision, optionally linked to a user comment. Finish it for user review.", "inputSchema":{"type":"object","properties":{"label":{"type":"string"},"comment_id":{"type":"integer"}},"required":["label"]} },
         { "name":"finish_revision", "description":"Submit grouped changes for review with a summary and optional screenshot paths. The user can compare, accept or revert.", "inputSchema":{"type":"object","properties":{"revision_id":{"type":"integer"},"summary":{"type":"string"},"screenshots":{"type":"array","items":{"type":"string"}}},"required":["revision_id","summary"]} },
         { "name":"get_revisions", "description":"List revision status, changed object IDs, summaries and screenshot paths.", "inputSchema":{"type":"object","properties":{}} },
@@ -227,12 +228,14 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "delete_object",
-            "description": "Delete the selected or specified object from the scene.",
+            "description": "Delete the selected or specified object from the scene. Pass object_ids or group to delete several parts (for example a whole inserted library asset) as one undo step.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "object_id": { "type": "integer" },
-                    "name": { "type": "string" }
+                    "name": { "type": "string" },
+                    "object_ids": { "type": "array", "items": { "type": "integer" }, "description": "Delete these parts, by id." },
+                    "group": { "type": "string", "description": "Delete every part named 'Group/…'." }
                 }
             }
         },

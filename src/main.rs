@@ -1521,6 +1521,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                         &mut gpu.renderer_3d.show_wireframe_overlay,
                         &mut gpu.renderer_3d.show_grid,
                     );
+                    ui::after_action(&mut self.ui_state, &request, &response, &mut self.camera);
                     self.ui_state.status_message = response.message;
                     self.scene.invalidate_mesh_caches();
                     gpu.renderer_3d.invalidate_cache();
