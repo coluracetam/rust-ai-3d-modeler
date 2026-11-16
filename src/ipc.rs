@@ -123,6 +123,8 @@ pub fn summarize_scene(
                 "is_voxel": obj.voxel_grid.is_some(),
                 "vertices": obj.mesh.positions.len(),
                 "faces": obj.mesh.faces.len(),
+                "triangles": crate::agent_tools::triangle_count(&obj.mesh),
+                "texture_layers": obj.textures.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
                 "world_bounds_min": crate::agent_tools::world_bounds(obj).map(|b| b.0.to_array()),
                 "world_bounds_max": crate::agent_tools::world_bounds(obj).map(|b| b.1.to_array()),
                 "selected_faces": obj.mesh.selected_faces.len(),
@@ -206,6 +208,7 @@ pub fn summarize_scene(
         "mode": scene.mode.label(),
         "selected_object_index": scene.selected_object,
         "object_count": scene.objects.len(),
+        "weight": crate::agent_tools::weight_report(scene, None),
         "objects": objects,
         "unresolved_comments_count": unresolved_comments.len(),
         "unresolved_comments": unresolved_comments,
@@ -587,7 +590,22 @@ fn dispatch(
                     .into(),
                 screenshots,
             ) {
-                Ok(()) => IpcResponse::success("Ready for review", json!({"revision_id":id})),
+                Ok(()) => {
+                    // Say so when the finished model is heavy for a game, while it is cheap to fix.
+                    let weight = crate::agent_tools::weight_report(scene, None);
+                    let warnings: Vec<String> = weight["warnings"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|w| w.as_str().map(String::from))
+                        .collect();
+                    let message = if warnings.is_empty() {
+                        "Ready for review".to_string()
+                    } else {
+                        format!("Ready for review. Weight warning: {}", warnings.join(" "))
+                    };
+                    IpcResponse::success(message, json!({"revision_id":id, "weight": weight}))
+                }
                 Err(e) => IpcResponse::error(e),
             }
         }

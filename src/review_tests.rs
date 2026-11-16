@@ -886,3 +886,133 @@ fn agent_tools_build_query_select_and_verify() {
         eprintln!("capture_views skipped: {}", shot.message);
     }
 }
+
+#[test]
+fn heavy_models_are_reported_while_they_are_cheap_to_fix() {
+    let mut e = Editor::new();
+    let light = e.call("check_mesh", json!({}));
+    assert_eq!(light.data["weight"]["total_triangles"], 12);
+    assert_eq!(light.data["weight"]["over_budget"], false);
+    assert!(light.data["weight"]["warnings"].as_array().unwrap().is_empty());
+    assert_eq!(e.call("get_scene_info", json!({})).data["objects"][0]["triangles"], 12);
+
+    let r = e.call("begin_revision", json!({"label":"Dense ball"}));
+    let id = r.data["revision_id"].as_u64().unwrap();
+    e.scene.add_mesh_object("Ball", Mesh::sphere(1.0, 80, 80), [0.5; 3]);
+    let checked = e.call("check_mesh", json!({ "triangle_budget": 5000 }));
+    let weight = &checked.data["weight"];
+    assert_eq!(weight["over_budget"], true);
+    assert_eq!(weight["heavy_parts"], 1);
+    assert_eq!(weight["heaviest_parts"][0]["name"], "Ball");
+    let ball = checked.data["parts"].as_array().unwrap().iter().find(|p| p["name"] == "Ball").unwrap();
+    assert!(ball["issues"].as_array().unwrap().iter().any(|i| i.as_str().unwrap().contains("heavy for one part")));
+    let finished = e.call("finish_revision", json!({"revision_id":id,"summary":"Added a ball"}));
+    assert!(finished.ok && finished.message.contains("Weight warning"), "{}", finished.message);
+}
+
+#[test]
+fn text_and_images_go_on_a_part_without_adding_geometry() {
+    let mut e = Editor::new();
+    let id = e.scene.objects[0].id; // a 2 m cube centred at the origin
+    let faces = e.scene.objects[0].mesh.faces.len();
+    let put = e.call("set_texture", json!({ "object_id": id, "text": "Moby Dick", "side": "front" }));
+    assert!(put.ok, "{}", put.message);
+    assert_eq!(e.scene.objects[0].mesh.faces.len(), faces);
+    let layer = e.scene.objects[0].textures[0].clone();
+    assert_eq!(layer.name, "Moby Dick");
+    assert_eq!((layer.origin, layer.u_axis, layer.v_axis), (Vec3::new(-1.0, 1.0, 1.0), Vec3::X * 2.0, Vec3::NEG_Y * 2.0));
+    assert_eq!(layer.normal(), Vec3::Z);
+    // It reaches the front face only, and the letters cover part of it.
+    assert!(layer.uv(Vec3::new(0.0, 0.0, 1.0), Vec3::Z).is_some());
+    assert!(layer.uv(Vec3::new(0.0, 0.0, -1.0), Vec3::Z).is_none());
+    let inked = layer.image.rgba.chunks_exact(4).filter(|p| p[3] > 128).count();
+    assert!(inked > 200 && layer.image.width == 512 && layer.image.height == 512);
+    assert_eq!(e.call("get_scene_info", json!({})).data["objects"][0]["texture_layers"], json!(["Moby Dick"]));
+
+    // A region of the right side, turned a quarter so the text runs down it.
+    let spine = e.call(
+        "set_texture",
+        json!({ "object_id": id, "text": "Spine", "side": "right", "region": [0.25, 0.0, 0.75, 1.0],
+                "rotate_deg": 90, "background": [0.1, 0.1, 0.4], "layer": "spine" }),
+    );
+    assert!(spine.ok, "{}", spine.message);
+    let layer = e.scene.objects[0].textures[1].clone();
+    // Right side seen from +X: left edge at z = +1. The middle half spans z 0.5..-0.5.
+    assert_eq!(layer.origin, Vec3::new(1.0, 1.0, -0.5));
+    assert_eq!((layer.u_axis, layer.v_axis), (Vec3::NEG_Y * 2.0, Vec3::Z));
+    assert_eq!(layer.normal(), Vec3::X);
+    assert!(layer.image.width > layer.image.height, "drawn along the long edge");
+    assert!(layer.image.rgba.chunks_exact(4).all(|p| p[3] == 255));
+
+    // Reusing a name replaces the layer; four is the limit; clearing and undo work.
+    assert!(e.call("set_texture", json!({ "object_id": id, "text": "New", "side": "top", "layer": "spine" })).ok);
+    assert_eq!(e.scene.objects[0].textures.len(), 2);
+    assert_eq!(e.scene.objects[0].textures[1].normal(), Vec3::Y);
+    for name in ["a", "b"] {
+        assert!(e.call("set_texture", json!({ "object_id": id, "text": name, "side": "back" })).ok);
+    }
+    assert!(!e.call("set_texture", json!({ "object_id": id, "text": "c", "side": "back" })).ok);
+    assert!(!e.call("set_texture", json!({ "object_id": id, "side": "front" })).ok, "needs text or an image");
+    assert!(!e.call("set_texture", json!({ "object_id": id, "text": "x", "side": "inside" })).ok);
+    assert!(e.call("set_texture", json!({ "object_id": id, "clear": true, "layer": "a" })).ok);
+    assert_eq!(e.scene.objects[0].textures.len(), 3);
+    assert!(e.call("undo", json!({})).ok);
+    assert_eq!(e.scene.objects[0].textures.len(), 4);
+
+    // With no side, the selected faces say where it goes (face 5 is selected in this scene).
+    let normal = e.scene.objects[0].mesh.face_normal(5);
+    assert!(e.call("set_texture", json!({ "object_id": id, "clear": true })).ok);
+    assert!(e.call("set_texture", json!({ "object_id": id, "text": "Here" })).ok);
+    assert!(e.scene.objects[0].textures[0].normal().dot(normal) > 0.99);
+
+    // Layers are part of the project file and of the part's identity for revisions.
+    let path = std::env::temp_dir().join(format!("rust_modeler_textured_{}.spatial.json", std::process::id()));
+    project::save(&path, &e.scene, &e.camera).unwrap();
+    let loaded = project::load(&path).unwrap();
+    assert_eq!(loaded.scene.objects[0].textures[0].image, e.scene.objects[0].textures[0].image);
+    assert_eq!(crate::review::object_hash(&loaded.scene.objects[0]), crate::review::object_hash(&e.scene.objects[0]));
+    let mut plain = e.scene.objects[0].clone();
+    plain.textures.clear();
+    assert_ne!(crate::review::object_hash(&plain), crate::review::object_hash(&e.scene.objects[0]));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(project::backup_path(&path));
+}
+
+/// Renders a few textured books so the result can be looked at:
+/// `TEXTURE_PREVIEW=/some/file.png cargo test textured_books_preview -- --ignored`
+#[test]
+#[ignore]
+fn textured_books_preview() {
+    let out = std::env::var("TEXTURE_PREVIEW").expect("set TEXTURE_PREVIEW to a .png path");
+    let mut e = Editor::new();
+    e.scene = Scene::empty();
+    let books = [("Moby Dick", [0.10, 0.16, 0.30]), ("Dune", [0.45, 0.22, 0.08]), ("Walden", [0.12, 0.28, 0.14])];
+    for (i, (title, color)) in books.iter().enumerate() {
+        let index = e.scene.add_mesh_object(format!("Book {}", i + 1), Mesh::cube(1.0), *color);
+        let obj = &mut e.scene.objects[index];
+        obj.flat_shading = true;
+        // A book standing upright: 4 cm thick, 24 cm tall, 16 cm deep, spine towards +Z.
+        obj.transform.scale = Vec3::new(0.04 + 0.01 * i as f32, 0.24, 0.16);
+        obj.transform.translation = Vec3::new(0.06 * i as f32, 0.12, 0.0);
+        let id = obj.id;
+        let spine = e.call(
+            "set_texture",
+            json!({ "object_id": id, "text": title, "side": "front", "rotate_deg": 90,
+                    "region": [0.0, 0.08, 1.0, 0.8], "text_color": [0.9, 0.78, 0.4] }),
+        );
+        assert!(spine.ok, "{}", spine.message);
+        let band = e.call(
+            "set_texture",
+            json!({ "object_id": id, "text": "*", "side": "front", "region": [0.0, 0.84, 1.0, 0.96],
+                    "text_color": [0.9, 0.78, 0.4], "background": [0.05, 0.05, 0.05], "layer": "band" }),
+        );
+        assert!(band.ok, "{}", band.message);
+    }
+    e.scene.clear_all_selections();
+    e.scene.selected_object = None;
+    let shot = e.call(
+        "capture_viewport",
+        json!({ "path": out, "width": 900, "height": 700, "frame": "scene", "yaw_deg": 25, "pitch_deg": 12, "padding": 1.3 }),
+    );
+    assert!(shot.ok, "{}", shot.message);
+}

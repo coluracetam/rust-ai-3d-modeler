@@ -164,6 +164,9 @@ pub struct SceneObject {
     pub emission_color: [f32; 3],
     #[serde(default)]
     pub emission_strength: f32,
+    /// Images projected onto the part (titles, labels, signs), lowest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub textures: Vec<crate::texture::TextureLayer>,
 }
 
 impl SceneObject {
@@ -185,6 +188,7 @@ impl SceneObject {
             texture_scale: 2.5,
             emission_color: color,
             emission_strength: 0.0,
+            textures: Vec::new(),
         }
     }
 
@@ -207,6 +211,7 @@ impl SceneObject {
             texture_scale: 2.5,
             emission_color: color,
             emission_strength: 0.0,
+            textures: Vec::new(),
         }
     }
 
@@ -594,6 +599,12 @@ impl Scene {
                     {
                         return Err("Invalid voxel grid".into());
                     }
+                }
+                if o.textures.len() > crate::texture::MAX_LAYERS {
+                    return Err(format!("Too many texture layers on '{}'", o.name));
+                }
+                for layer in &o.textures {
+                    layer.validate()?;
                 }
                 if !o.transform.rotation_deg.is_finite()
                     || !o.transform.translation.is_finite()

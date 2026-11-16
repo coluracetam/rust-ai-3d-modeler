@@ -23,6 +23,7 @@ pub mod review;
 #[cfg(test)]
 mod review_tests;
 pub mod scene;
+pub mod texture;
 pub mod ui;
 mod viewport_input;
 pub mod voxel;
