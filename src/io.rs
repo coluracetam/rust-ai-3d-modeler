@@ -285,271 +285,231 @@ fn parse_ascii_stl(text: &str) -> Result<Mesh, String> {
 // GLTF 2.0 BINARY (.GLB) IMPORT / EXPORT
 // =============================================================================
 
-/// Exports the visible scene into a standard Binary glTF 2.0 (`.glb`) file.
+/// Exports the visible parts as a binary glTF with named nodes, materials and colours.
 pub fn export_glb_file(scene: &Scene, path: &Path) -> Result<(), String> {
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-
-    let mut min_pos = Vec3::splat(f32::MAX);
-    let mut max_pos = Vec3::splat(f32::MIN);
-
-    for obj in &scene.objects {
-        if !obj.visible {
-            continue;
-        }
-        let model = obj.transform.matrix();
-        let normal_mat = model.inverse().transpose();
-        let base_v = positions.len() as u32;
-
-        for (i, &p) in obj.mesh.positions.iter().enumerate() {
-            let wp = model.transform_point3(p);
-            min_pos = min_pos.min(wp);
-            max_pos = max_pos.max(wp);
-            positions.push(wp.to_array());
-
-            let n = obj.mesh.normals.get(i).copied().unwrap_or(Vec3::Y);
-            let wn = normal_mat.transform_vector3(n).normalize_or_zero();
-            normals.push(wn.to_array());
-        }
-
-        for face in &obj.mesh.faces {
-            if face.len() < 3 {
-                continue;
-            }
-            let v0 = base_v + face[0] as u32;
-            for i in 1..(face.len() - 1) {
-                let v1 = base_v + face[i] as u32;
-                let v2 = base_v + face[i + 1] as u32;
-                indices.push(v0);
-                indices.push(v1);
-                indices.push(v2);
-            }
-        }
-    }
-
-    if positions.is_empty() || indices.is_empty() {
-        return Err("Scene has no geometry to export".to_string());
-    }
-
-    let pos_bytes: &[u8] = bytemuck::cast_slice(&positions);
-    let norm_bytes: &[u8] = bytemuck::cast_slice(&normals);
-    let idx_bytes: &[u8] = bytemuck::cast_slice(&indices);
-
-    let pos_offset = 0usize;
-    let pos_len = pos_bytes.len();
-    let norm_offset = pos_offset + pos_len;
-    let norm_len = norm_bytes.len();
-    let idx_offset = norm_offset + norm_len;
-    let idx_len = idx_bytes.len();
-
-    let mut bin_chunk = Vec::with_capacity(pos_len + norm_len + idx_len + 4);
-    bin_chunk.extend_from_slice(pos_bytes);
-    bin_chunk.extend_from_slice(norm_bytes);
-    bin_chunk.extend_from_slice(idx_bytes);
-    while bin_chunk.len() % 4 != 0 {
-        bin_chunk.push(0);
-    }
-
-    let json_val = serde_json::json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "Rust 3D Modeler"
-        },
-        "scene": 0,
-        "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "mesh": 0, "name": "ExportedScene" }],
-        "meshes": [{
-            "name": "SceneMesh",
-            "primitives": [{
-                "attributes": {
-                    "POSITION": 0,
-                    "NORMAL": 1
-                },
-                "indices": 2,
-                "mode": 4
-            }]
-        }],
-        "buffers": [{
-            "byteLength": bin_chunk.len()
-        }],
-        "bufferViews": [
-            {
-                "buffer": 0,
-                "byteOffset": pos_offset,
-                "byteLength": pos_len,
-                "target": 34962
-            },
-            {
-                "buffer": 0,
-                "byteOffset": norm_offset,
-                "byteLength": norm_len,
-                "target": 34962
-            },
-            {
-                "buffer": 0,
-                "byteOffset": idx_offset,
-                "byteLength": idx_len,
-                "target": 34963
-            }
-        ],
-        "accessors": [
-            {
-                "bufferView": 0,
-                "byteOffset": 0,
-                "componentType": 5126,
-                "count": positions.len(),
-                "type": "VEC3",
-                "min": [min_pos.x, min_pos.y, min_pos.z],
-                "max": [max_pos.x, max_pos.y, max_pos.z]
-            },
-            {
-                "bufferView": 1,
-                "byteOffset": 0,
-                "componentType": 5126,
-                "count": normals.len(),
-                "type": "VEC3"
-            },
-            {
-                "bufferView": 2,
-                "byteOffset": 0,
-                "componentType": 5125,
-                "count": indices.len(),
-                "type": "SCALAR"
-            }
-        ]
-    });
-
-    let mut json_bytes =
-        serde_json::to_vec(&json_val).map_err(|e| format!("Failed to serialize glTF JSON: {e}"))?;
-    while json_bytes.len() % 4 != 0 {
-        json_bytes.push(b' ');
-    }
-
-    let total_length = 12 + 8 + json_bytes.len() + 8 + bin_chunk.len();
-    let mut glb = Vec::with_capacity(total_length);
-
-    // GLB Header (magic "glTF", version 2, total_length)
-    glb.extend_from_slice(&0x46546C67u32.to_le_bytes());
-    glb.extend_from_slice(&2u32.to_le_bytes());
-    glb.extend_from_slice(&(total_length as u32).to_le_bytes());
-
-    // JSON Chunk (length, type "JSON" = 0x4E4F534A)
-    glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
-    glb.extend_from_slice(&0x4E4F534Au32.to_le_bytes());
-    glb.extend_from_slice(&json_bytes);
-
-    // BIN Chunk (length, type "BIN\0" = 0x004E4942)
-    glb.extend_from_slice(&(bin_chunk.len() as u32).to_le_bytes());
-    glb.extend_from_slice(&0x004E4942u32.to_le_bytes());
-    glb.extend_from_slice(&bin_chunk);
-
-    fs::write(path, glb).map_err(|e| format!("Failed to write GLB file: {e}"))
+    let parts: Vec<&crate::scene::SceneObject> = scene.objects.iter().filter(|o| o.visible).collect();
+    crate::gltf::export_glb(&parts, path, &crate::gltf::GltfOptions::default()).map(|_| ())
 }
 
+/// Reads every mesh of a binary glTF into one mesh, applying node transforms and keeping
+/// vertex colours. Godot collision-hint nodes (`-colonly`, `-convcolonly`) are skipped.
 pub fn import_glb_file(path: &Path) -> Result<Mesh, String> {
+    use glam::{Mat4, Quat};
+    use serde_json::Value;
     let data = fs::read(path).map_err(|e| format!("Failed to read GLB: {e}"))?;
     if data.len() < 20 {
         return Err("File is too short to be a valid GLB".to_string());
     }
-    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    if magic != 0x46546C67 {
+    if u32::from_le_bytes(data[0..4].try_into().unwrap()) != 0x46546C67 {
         return Err("Invalid GLB magic header".to_string());
     }
-
     let json_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
     let json_end = 20 + json_len;
     if data.len() < json_end + 8 {
         return Err("Truncated GLB chunks".to_string());
     }
-    let json_val: serde_json::Value = serde_json::from_slice(&data[20..json_end])
+    let doc: Value = serde_json::from_slice(&data[20..json_end])
         .map_err(|e| format!("Invalid GLB JSON chunk: {e}"))?;
-
     let bin_len = u32::from_le_bytes(data[json_end..json_end + 4].try_into().unwrap()) as usize;
     let bin_start = json_end + 8;
     if data.len() < bin_start + bin_len {
         return Err("Truncated GLB binary buffer".to_string());
     }
     let bin = &data[bin_start..bin_start + bin_len];
-
-    let accessors = json_val["accessors"]
-        .as_array()
-        .ok_or("Missing accessors in GLB")?;
-    let buffer_views = json_val["bufferViews"]
-        .as_array()
-        .ok_or("Missing bufferViews in GLB")?;
-    let meshes = json_val["meshes"]
-        .as_array()
-        .ok_or("Missing meshes in GLB")?;
-
-    let prim = &meshes
-        .first()
-        .ok_or("No mesh in GLB")?["primitives"]
-        .as_array()
-        .ok_or("No primitives in GLB")?
-        .first()
-        .ok_or("Empty primitives")?;
-
-    let pos_acc_idx = prim["attributes"]["POSITION"]
-        .as_u64()
-        .ok_or("Missing POSITION attribute")? as usize;
-    let pos_acc = &accessors[pos_acc_idx];
-    let pos_bv_idx = pos_acc["bufferView"].as_u64().unwrap_or(0) as usize;
-    let pos_bv = &buffer_views[pos_bv_idx];
-    let pos_offset = (pos_bv["byteOffset"].as_u64().unwrap_or(0)
-        + pos_acc["byteOffset"].as_u64().unwrap_or(0)) as usize;
-    let pos_count = pos_acc["count"].as_u64().unwrap_or(0) as usize;
-
-    let mut positions = Vec::with_capacity(pos_count);
-    for i in 0..pos_count {
-        let off = pos_offset + i * 12;
-        if off + 12 <= bin.len() {
-            let x = f32::from_le_bytes(bin[off..off + 4].try_into().unwrap());
-            let y = f32::from_le_bytes(bin[off + 4..off + 8].try_into().unwrap());
-            let z = f32::from_le_bytes(bin[off + 8..off + 12].try_into().unwrap());
-            positions.push(Vec3::new(x, y, z));
-        }
+    let empty = Vec::new();
+    let list = |key: &str| doc[key].as_array().unwrap_or(&empty);
+    let (accessors, views, meshes, nodes, materials) = (
+        list("accessors"),
+        list("bufferViews"),
+        list("meshes"),
+        list("nodes"),
+        list("materials"),
+    );
+    if meshes.is_empty() {
+        return Err("No mesh in GLB".to_string());
     }
 
-    let mut faces = Vec::new();
-    if let Some(idx_acc_idx) = prim["indices"].as_u64() {
-        let idx_acc = &accessors[idx_acc_idx as usize];
-        let idx_bv = &buffer_views[idx_acc["bufferView"].as_u64().unwrap_or(0) as usize];
-        let idx_offset = (idx_bv["byteOffset"].as_u64().unwrap_or(0)
-            + idx_acc["byteOffset"].as_u64().unwrap_or(0)) as usize;
-        let idx_count = idx_acc["count"].as_u64().unwrap_or(0) as usize;
-        let comp_type = idx_acc["componentType"].as_u64().unwrap_or(5125);
-
-        let mut raw_indices = Vec::with_capacity(idx_count);
-        for i in 0..idx_count {
-            match comp_type {
-                5123 => {
-                    // UNSIGNED_SHORT
-                    let off = idx_offset + i * 2;
-                    if off + 2 <= bin.len() {
-                        raw_indices
-                            .push(u16::from_le_bytes(bin[off..off + 2].try_into().unwrap()) as usize);
-                    }
-                }
-                5125 => {
-                    // UNSIGNED_INT
-                    let off = idx_offset + i * 4;
-                    if off + 4 <= bin.len() {
-                        raw_indices
-                            .push(u32::from_le_bytes(bin[off..off + 4].try_into().unwrap()) as usize);
-                    }
-                }
-                _ => {}
+    // Reads accessor `index` as rows of `width` numbers (floats as-is, integers as values,
+    // normalised integers scaled to the component's normalised range).
+    let read = |index: &Value, width: usize| -> Result<Vec<f64>, String> {
+        let accessor = index
+            .as_u64()
+            .and_then(|i| accessors.get(i as usize))
+            .ok_or("GLB refers to a missing accessor")?;
+        if !accessor["sparse"].is_null() {
+            return Err("Sparse GLB accessors are unsupported".into());
+        }
+        let read_size = |value: &Value| value.as_u64().and_then(|n| usize::try_from(n).ok());
+        let count = read_size(&accessor["count"]).filter(|&n| n > 0).ok_or("Invalid GLB accessor count")?;
+        let component = accessor["componentType"].as_u64().unwrap_or(5126);
+        let size = match component {
+            5120 | 5121 => 1,
+            5122 | 5123 => 2,
+            5125 | 5126 => 4,
+            other => return Err(format!("Unsupported GLB component type {other}")),
+        };
+        let view = read_size(&accessor["bufferView"])
+            .and_then(|i| views.get(i))
+            .ok_or("GLB accessor has no valid buffer view")?;
+        if view["buffer"].as_u64().unwrap_or(0) != 0 {
+            return Err("External GLB buffers are unsupported".into());
+        }
+        let view_offset = read_size(&view["byteOffset"]).unwrap_or(0);
+        let view_bytes = read_size(&view["byteLength"])
+            .and_then(|len| bin.get(view_offset..view_offset.checked_add(len)?))
+            .ok_or("GLB buffer view reads past the binary chunk")?;
+        let start = read_size(&accessor["byteOffset"]).unwrap_or(0);
+        let row_size = size * width;
+        let stride = read_size(&view["byteStride"]).unwrap_or(row_size);
+        let end = (count - 1)
+            .checked_mul(stride)
+            .and_then(|last| last.checked_add(start))
+            .and_then(|last| last.checked_add(row_size));
+        if stride < row_size || end.is_none_or(|end| end > view_bytes.len()) {
+            return Err("GLB accessor reads past its buffer view".into());
+        }
+        let normalized = accessor["normalized"].as_bool().unwrap_or(false);
+        let mut out = Vec::with_capacity(count * width);
+        for row in 0..count {
+            for column in 0..width {
+                let at = start + row * stride + column * size;
+                let bytes = &view_bytes[at..at + size];
+                let (value, max) = match component {
+                    5120 => (bytes[0] as i8 as f64, 127.0),
+                    5121 => (bytes[0] as f64, 255.0),
+                    5122 => (i16::from_le_bytes(bytes.try_into().unwrap()) as f64, 32767.0),
+                    5123 => (u16::from_le_bytes(bytes.try_into().unwrap()) as f64, 65535.0),
+                    5125 => (u32::from_le_bytes(bytes.try_into().unwrap()) as f64, 1.0),
+                    _ => (f32::from_le_bytes(bytes.try_into().unwrap()) as f64, 1.0),
+                };
+                out.push(if normalized && component != 5126 { (value / max).max(-1.0) } else { value });
             }
         }
-        for tri in raw_indices.chunks_exact(3) {
-            faces.push(vec![tri[0], tri[1], tri[2]]);
+        Ok(out)
+    };
+
+    let mut positions: Vec<Vec3> = Vec::new();
+    let mut colors: Vec<[f32; 3]> = Vec::new();
+    let mut faces: Vec<Vec<usize>> = Vec::new();
+    let mut add_mesh = |mesh: &Value, matrix: Mat4| -> Result<(), String> {
+        for primitive in mesh["primitives"].as_array().unwrap_or(&empty) {
+            if primitive["mode"].as_u64().unwrap_or(4) != 4 {
+                continue;
+            }
+            let attributes = &primitive["attributes"];
+            if attributes["POSITION"].is_null() {
+                continue;
+            }
+            let base = positions.len();
+            let points = read(&attributes["POSITION"], 3)?;
+            positions.extend(points.chunks_exact(3).map(|p| {
+                matrix.transform_point3(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
+            }));
+            let count = positions.len() - base;
+            if positions[base..].iter().any(|p| !p.is_finite()) {
+                return Err("GLB contains non-finite vertex positions".into());
+            }
+            let factor = primitive["material"].as_u64().and_then(|i| materials.get(i as usize));
+            let factor = [0, 1, 2].map(|channel| {
+                factor.and_then(|m| m["pbrMetallicRoughness"]["baseColorFactor"][channel].as_f64())
+                    .unwrap_or(1.0).clamp(0.0, 1.0) as f32
+            });
+            let color_accessor = &attributes["COLOR_0"];
+            if color_accessor.is_null() {
+                colors.resize(positions.len(), factor);
+            } else {
+                let width = color_accessor
+                    .as_u64()
+                    .and_then(|i| accessors.get(i as usize))
+                    .map_or(3, |a| if a["type"] == "VEC4" { 4 } else { 3 });
+                let values = read(color_accessor, width)?;
+                if values.len() / width != count {
+                    return Err("GLB vertex colour count differs from the position count".into());
+                }
+                colors.extend(values.chunks_exact(width).map(|c| {
+                    [0, 1, 2].map(|i| (c[i] as f32 * factor[i]).clamp(0.0, 1.0))
+                }));
+                if colors[base..].iter().flatten().any(|value| !value.is_finite()) {
+                    return Err("GLB contains non-finite vertex colours".into());
+                }
+            }
+            let indices: Vec<usize> = if primitive["indices"].is_null() {
+                (0..count).collect()
+            } else {
+                read(&primitive["indices"], 1)?
+                    .into_iter()
+                    .map(|i| {
+                        if i >= 0.0 && i < count as f64 && i.fract() == 0.0 {
+                            Ok(i as usize)
+                        } else {
+                            Err("GLB contains an invalid vertex index")
+                        }
+                    })
+                    .collect::<Result<_, _>>()?
+            };
+            let flip = matrix.determinant() < 0.0;
+            for tri in indices.chunks_exact(3) {
+                let (a, b, c) = (base + tri[0], base + tri[1], base + tri[2]);
+                faces.push(if flip { vec![a, c, b] } else { vec![a, b, c] });
+            }
+        }
+        Ok(())
+    };
+
+    if nodes.is_empty() {
+        for mesh in meshes {
+            add_mesh(mesh, Mat4::IDENTITY)?;
         }
     } else {
-        for tri in (0..positions.len()).collect::<Vec<_>>().chunks_exact(3) {
-            faces.push(vec![tri[0], tri[1], tri[2]]);
+        let numbers = |v: &Value, n: usize| -> Option<Vec<f32>> {
+            let a = v.as_array()?;
+            (a.len() == n).then(|| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+        };
+        let local = |node: &Value| -> Mat4 {
+            if let Some(m) = numbers(&node["matrix"], 16) {
+                return Mat4::from_cols_slice(&m);
+            }
+            let t = numbers(&node["translation"], 3).map_or(Vec3::ZERO, |v| Vec3::from_slice(&v));
+            let r = numbers(&node["rotation"], 4).map_or(Quat::IDENTITY, |v| Quat::from_slice(&v).normalize());
+            let s = numbers(&node["scale"], 3).map_or(Vec3::ONE, |v| Vec3::from_slice(&v));
+            Mat4::from_scale_rotation_translation(s, r, t)
+        };
+        // Roots are the default scene's nodes, or every node that is nobody's child.
+        let scene = doc["scene"].as_u64().unwrap_or(0) as usize;
+        let mut stack: Vec<(usize, Mat4)> = match doc["scenes"][scene]["nodes"].as_array() {
+            Some(roots) => roots.iter().filter_map(|r| Some((r.as_u64()? as usize, Mat4::IDENTITY))).collect(),
+            None => {
+                let children: std::collections::HashSet<u64> = nodes
+                    .iter()
+                    .flat_map(|n| n["children"].as_array().into_iter().flatten())
+                    .filter_map(|c| c.as_u64())
+                    .collect();
+                (0..nodes.len()).filter(|i| !children.contains(&(*i as u64))).map(|i| (i, Mat4::IDENTITY)).collect()
+            }
+        };
+        let mut visited = vec![false; nodes.len()];
+        while let Some((index, parent)) = stack.pop() {
+            let Some(node) = nodes.get(index) else { continue };
+            if std::mem::replace(&mut visited[index], true) {
+                continue;
+            }
+            let matrix = parent * local(node);
+            let name = node["name"].as_str().unwrap_or("");
+            let hint = ["-colonly", "-convcolonly"].iter().any(|s| name.ends_with(s));
+            if let (false, Some(mesh)) = (hint, node["mesh"].as_u64().and_then(|m| meshes.get(m as usize))) {
+                add_mesh(mesh, matrix)?;
+            }
+            for child in node["children"].as_array().into_iter().flatten() {
+                if let Some(child) = child.as_u64() {
+                    stack.push((child as usize, matrix));
+                }
+            }
         }
     }
-
-    Ok(Mesh::new(positions, faces))
+    if positions.is_empty() || faces.is_empty() {
+        return Err("The GLB has no triangle geometry".to_string());
+    }
+    let mut mesh = Mesh::new(positions, faces);
+    mesh.colors = colors.into();
+    Ok(mesh)
 }
