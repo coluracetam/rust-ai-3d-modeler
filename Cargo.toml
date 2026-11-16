@@ -20,6 +20,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 egui-phosphor = "0.9"
 flate2 = "1"
 base64 = "0.22"
+ab_glyph = "0.2"
 
 
 

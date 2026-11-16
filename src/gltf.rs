@@ -640,6 +640,12 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
             baked.detail * 100.0
         ));
     }
+    let layered = parts.iter().filter(|(obj, _)| !obj.textures.is_empty()).count();
+    if layered > 0 && !textured {
+        w.report.warnings.push(format!(
+            "{layered} part(s) carry image layers (titles, labels). They are only exported with bake_texture: true; without it those parts keep their plain colour."
+        ));
+    }
     let patterned = parts.iter().filter(|(obj, _)| obj.pattern != ProceduralPattern::None).count();
     if patterned > 0 {
         w.report.warnings.push(format!(
@@ -1106,6 +1112,57 @@ mod tests {
             assert_eq!(material["pbrMetallicRoughness"]["baseColorTexture"]["index"], 0);
         }
         assert!(doc["meshes"][1]["primitives"][0]["attributes"]["TEXCOORD_0"].is_u64());
+    }
+
+    /// A 12-triangle book whose title is an image layer: the bake keeps the title, and an
+    /// unbaked export says that it cannot.
+    #[test]
+    fn image_layers_are_baked_into_the_exported_texture() {
+        use crate::texture::{TextStyle, TextureLayer, render_text};
+        let mut scene = Scene::empty();
+        scene.add_mesh_object("Book", Mesh::cube(1.0), [0.1, 0.1, 0.1]);
+        let book = &mut scene.objects[0];
+        book.flat_shading = true;
+        book.transform.scale = Vec3::new(0.04, 0.24, 0.16);
+        // Yellow letters on blue, covering the whole spine (+Z side), reading down it.
+        let style = TextStyle { color: [1.0, 0.9, 0.0], background: Some([0.0, 0.0, 1.0]), bold: true, padding: 0.1 };
+        book.textures.push(TextureLayer {
+            name: "Title".into(),
+            image: std::sync::Arc::new(render_text("DUNE", 384, 64, &style).unwrap()),
+            origin: Vec3::new(0.5, 0.5, 0.5),
+            u_axis: Vec3::NEG_Y,
+            v_axis: Vec3::NEG_X,
+            depth: 0.05,
+            opacity: 1.0,
+        });
+        book.textures[0].validate().unwrap();
+        assert_eq!(book.textures[0].normal(), Vec3::Z);
+        let parts: Vec<&SceneObject> = scene.objects.iter().collect();
+
+        let (_, plain) = build_glb(&parts, &GltfOptions::default()).unwrap();
+        assert!(plain.warnings.iter().any(|w| w.contains("image layers")), "{:?}", plain.warnings);
+
+        let options = GltfOptions { merge: true, bake_texture: Some(1024), ..Default::default() };
+        let (glb, report) = build_glb(&parts, &options).unwrap();
+        assert_eq!((report.triangles, report.textures), (12, 1));
+        assert!(!report.warnings.iter().any(|w| w.contains("image layers")));
+        let doc = document(&glb);
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let bin = &glb[20 + json_len + 8..];
+        let view = &doc["bufferViews"][doc["images"][0]["bufferView"].as_u64().unwrap() as usize];
+        let start = view["byteOffset"].as_u64().unwrap() as usize;
+        let png = &bin[start..start + view["byteLength"].as_u64().unwrap() as usize];
+        if let Ok(path) = std::env::var("BAKE_PREVIEW") {
+            std::fs::write(path, png).unwrap();
+        }
+        let image = image::load_from_memory(png).unwrap().to_rgb8();
+        let count = |test: fn(&image::Rgb<u8>) -> bool| image.pixels().filter(|p| test(p)).count();
+        let blue = count(|p| p[2] > 200 && p[0] < 60 && p[1] < 60);
+        let yellow = count(|p| p[0] > 200 && p[1] > 180 && p[2] < 80);
+        // The spine is mostly blue with clearly resolved yellow letters, at the image's own
+        // resolution although the mesh has only two triangles there.
+        assert!(blue > 2000 && yellow > 300, "blue {blue}, yellow {yellow}");
+        assert!(report.texels_per_metre > 1000.0, "{} texels per metre", report.texels_per_metre);
     }
 
     #[test]

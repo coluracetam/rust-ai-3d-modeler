@@ -23,6 +23,7 @@ pub const GEOMETRY: &[&str] = &[
     "align_object",
     "scatter_object",
     "paint_faces",
+    "set_texture",
 ];
 /// Tools worth running off the GUI thread.
 pub const HEAVY: &[&str] = &[
@@ -190,6 +191,113 @@ fn view_direction(name: &str) -> Option<Vec3> {
     })
 }
 
+/// The rectangle a texture layer covers: top-left corner, the top edge and the left edge.
+type LayerRect = (Vec3, Vec3, Vec3);
+
+/// One side of a part's local bounding box as seen from outside, upright (+Y up; the top is
+/// seen from above with -Z at the top of the image, the bottom from below with +Z at the top).
+fn side_rect(min: Vec3, max: Vec3, side: &str) -> Result<(LayerRect, f32), String> {
+    let size = max - min;
+    let rect = match side {
+        "front" | "+z" => (Vec3::new(min.x, max.y, max.z), Vec3::X * size.x, Vec3::NEG_Y * size.y, size.z),
+        "back" | "-z" => (Vec3::new(max.x, max.y, min.z), Vec3::NEG_X * size.x, Vec3::NEG_Y * size.y, size.z),
+        "right" | "+x" => (Vec3::new(max.x, max.y, max.z), Vec3::NEG_Z * size.z, Vec3::NEG_Y * size.y, size.x),
+        "left" | "-x" => (Vec3::new(min.x, max.y, min.z), Vec3::Z * size.z, Vec3::NEG_Y * size.y, size.x),
+        "top" | "+y" => (Vec3::new(min.x, max.y, min.z), Vec3::X * size.x, Vec3::Z * size.z, size.y),
+        "bottom" | "-y" => (Vec3::new(min.x, min.y, max.z), Vec3::X * size.x, Vec3::NEG_Z * size.z, size.y),
+        other => {
+            return Err(format!("Unknown side '{other}'. Use front, back, left, right, top or bottom."));
+        }
+    };
+    Ok(((rect.0, rect.1, rect.2), rect.3))
+}
+
+/// The side of the bounding box the selected faces look out of, and their extent on it.
+fn selection_rect(obj: &SceneObject) -> Result<(LayerRect, f32), String> {
+    let mesh = &obj.mesh;
+    if mesh.selected_faces.is_empty() {
+        return Err("Select the faces the image should cover, or name a side".into());
+    }
+    let mut normal = Vec3::ZERO;
+    let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for &fi in &mesh.selected_faces {
+        normal += mesh.face_normal(fi) * mesh.face_area(fi);
+        for &v in &mesh.faces[fi] {
+            min = min.min(mesh.positions[v]);
+            max = max.max(mesh.positions[v]);
+        }
+    }
+    let axis = (0..3).max_by(|&a, &b| normal[a].abs().total_cmp(&normal[b].abs())).unwrap();
+    let side = match (axis, normal[axis] >= 0.0) {
+        (0, true) => "right",
+        (0, false) => "left",
+        (1, true) => "top",
+        (1, false) => "bottom",
+        (_, true) => "front",
+        (_, false) => "back",
+    };
+    let (rect, _) = side_rect(min, max, side)?;
+    // The faces lie on the plane, so a thin slab around it is enough.
+    let thickness = (max - min)[axis];
+    Ok((rect, thickness.max((max - min).length() * 0.02)))
+}
+
+/// A part above this many triangles is almost always denser than its shape needs.
+pub const HEAVY_PART_TRIANGLES: usize = 5_000;
+/// A whole model above this is heavy for a game asset (a prop is usually well under 20,000).
+pub const HEAVY_MODEL_TRIANGLES: usize = 100_000;
+
+pub fn triangle_count(mesh: &Mesh) -> usize {
+    mesh.faces.iter().map(|f| f.len().saturating_sub(2)).sum()
+}
+
+/// How heavy the visible model is for a game, with the parts to look at first. Cheap: it
+/// only counts faces, so `get_scene_info` and `finish_revision` can include it every time.
+pub fn weight_report(scene: &Scene, budget: Option<usize>) -> Value {
+    let mut parts: Vec<(usize, &SceneObject)> = scene
+        .objects
+        .iter()
+        .filter(|o| o.visible)
+        .map(|o| (triangle_count(&o.mesh), o))
+        .collect();
+    let total: usize = parts.iter().map(|(t, _)| t).sum();
+    let budget = budget.unwrap_or(HEAVY_MODEL_TRIANGLES);
+    let heavy_parts = parts.iter().filter(|(t, _)| *t > HEAVY_PART_TRIANGLES).count();
+    parts.sort_by(|a, b| b.0.cmp(&a.0));
+    let heaviest: Vec<Value> = parts
+        .iter()
+        .take(8)
+        .filter(|(t, _)| *t > 0)
+        .map(|(t, o)| {
+            json!({
+                "object_id": o.id,
+                "name": o.name,
+                "triangles": t,
+                "share": if total > 0 { (*t as f64 / total as f64 * 1000.0).round() / 1000.0 } else { 0.0 },
+            })
+        })
+        .collect();
+    let mut warnings: Vec<String> = Vec::new();
+    if total > budget {
+        warnings.push(format!(
+            "The model has {total} triangles, over the {budget} budget. Game props are usually a few hundred to 20,000."
+        ));
+    }
+    if heavy_parts > 0 {
+        warnings.push(format!(
+            "{heavy_parts} part(s) have more than {HEAVY_PART_TRIANGLES} triangles. A part should have only the triangles its silhouette needs: do not subdivide to paint detail; use paint_faces for crisp colour areas and set_texture for labels, titles and patterns. edit_mesh decimate (ratio) thins a part that is already too dense."
+        ));
+    }
+    json!({
+        "total_triangles": total,
+        "budget": budget,
+        "over_budget": total > budget,
+        "heavy_parts": heavy_parts,
+        "heaviest_parts": heaviest,
+        "warnings": warnings,
+    })
+}
+
 fn object_report(obj: &SceneObject) -> Value {
     let r = ops::check_mesh(&obj.mesh);
     let mut issues: Vec<String> = Vec::new();
@@ -208,9 +316,16 @@ fn object_report(obj: &SceneObject) -> Value {
     if r.inside_out {
         issues.push("faces are wound inside-out; edit_mesh flip_normals fixes it".into());
     }
+    let triangles = triangle_count(&obj.mesh);
+    if triangles > HEAVY_PART_TRIANGLES {
+        issues.push(format!(
+            "{triangles} triangles is heavy for one part (over {HEAVY_PART_TRIANGLES}); keep only what the silhouette needs, or thin it with edit_mesh decimate"
+        ));
+    }
     json!({
         "object_id": obj.id,
         "name": obj.name,
+        "triangles": triangles,
         "faces": obj.mesh.faces.len(),
         "vertices": obj.mesh.positions.len(),
         "watertight": r.watertight,
@@ -576,6 +691,7 @@ pub fn dispatch(
                 ),
                 json!({
                     "parts": reports,
+                    "weight": weight_report(scene, args["triangle_budget"].as_u64().map(|b| b as usize)),
                     "parts_with_issues": problems,
                     "bounding_box_overlaps": overlaps,
                     "isolated_parts": isolated,
@@ -1128,6 +1244,146 @@ pub fn dispatch(
                     "cells": cells,
                     "framed_bounds_min": round3(bounds.0),
                     "framed_bounds_max": round3(bounds.1),
+                }),
+            )
+        }
+
+        // ------------------------------------------------------------------- set_texture
+        "set_texture" => {
+            use crate::texture::{MAX_LAYERS, TextStyle, TextureImage, TextureLayer, render_text};
+            let Some(idx) = resolve_object_index(scene, args) else {
+                return Some(IpcResponse::error("Object not found"));
+            };
+            let layer_name = args["layer"].as_str().map(str::trim).filter(|n| !n.is_empty());
+            let summary = |obj: &SceneObject| -> Vec<Value> {
+                obj.textures
+                    .iter()
+                    .map(|l| json!({ "layer": l.name, "width": l.image.width, "height": l.image.height }))
+                    .collect()
+            };
+            if bool_arg(args, "clear", false) {
+                history.record("Clear texture", scene);
+                let obj = &mut scene.objects[idx];
+                let before = obj.textures.len();
+                obj.textures.retain(|l| layer_name.is_some_and(|n| !l.name.eq_ignore_ascii_case(n)));
+                return Some(IpcResponse::success(
+                    format!("Removed {} texture layer(s) from '{}'", before - obj.textures.len(), obj.name),
+                    json!({ "object_id": obj.id, "layers": summary(obj) }),
+                ));
+            }
+
+            // Where it goes: a side of the bounding box, the selected faces, or a given rectangle.
+            let obj = &scene.objects[idx];
+            let (min, max) = obj.mesh.bounds();
+            let explicit = !args["origin"].is_null();
+            let ((mut origin, mut u_axis, mut v_axis), reach) = if explicit {
+                let rect = (
+                    parse_vec3(&args["origin"], Vec3::ZERO),
+                    parse_vec3(&args["u"], Vec3::ZERO),
+                    parse_vec3(&args["v"], Vec3::ZERO),
+                );
+                (rect, (max - min).length() * 0.02)
+            } else if let Some(side) = args["side"].as_str() {
+                let (rect, thickness) = tri!(side_rect(min, max, &side.trim().to_lowercase()));
+                // Only the faces on that side: a twentieth of the way in.
+                (rect, thickness * 0.05)
+            } else {
+                tri!(selection_rect(obj))
+            };
+            // `region` narrows it to part of that rectangle: [left, top, right, bottom] in 0..1.
+            if let Some(region) = args["region"].as_array() {
+                let r: Vec<f32> = region.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
+                if r.len() != 4 || r.iter().any(|v| !(0.0..=1.0).contains(v)) || r[2] <= r[0] || r[3] <= r[1] {
+                    return Some(IpcResponse::error("region is [left, top, right, bottom], each 0..1"));
+                }
+                origin += u_axis * r[0] + v_axis * r[1];
+                (u_axis, v_axis) = (u_axis * (r[2] - r[0]), v_axis * (r[3] - r[1]));
+            }
+            // Quarter turns, for text that runs up a book spine.
+            let turns = match args["rotate_deg"].as_f64().unwrap_or(0.0).rem_euclid(360.0) as i64 {
+                0 => 0,
+                90 => 1,
+                180 => 2,
+                270 => 3,
+                _ => return Some(IpcResponse::error("rotate_deg must be 0, 90, 180 or 270")),
+            };
+            for _ in 0..turns {
+                // A clockwise quarter turn: the image's top-left moves to the old top-right.
+                (origin, u_axis, v_axis) = (origin + u_axis, v_axis, -u_axis);
+            }
+            // Real size on the model: the rectangle is in local space, so apply the part's scale.
+            let part_scale = obj.transform.scale.abs();
+            let (width, height) = ((u_axis * part_scale).length(), (v_axis * part_scale).length());
+            if !(width > 1e-6 && height > 1e-6) || !origin.is_finite() {
+                return Some(IpcResponse::error("The image rectangle has no area; check side, region or origin/u/v"));
+            }
+
+            // What it shows: a PNG file, or text drawn to fit the rectangle.
+            let image = if let Some(path) = args["image_path"].as_str() {
+                tri!(TextureImage::load(Path::new(path)))
+            } else if let Some(text) = args["text"].as_str() {
+                let resolution = usize_arg(args, "resolution", 512).clamp(32, crate::texture::MAX_IMAGE_SIDE as usize) as f32;
+                let (px_w, px_h) = if width >= height {
+                    (resolution, (resolution * height / width).max(8.0))
+                } else {
+                    ((resolution * width / height).max(8.0), resolution)
+                };
+                let style = TextStyle {
+                    color: parse_color(&args["text_color"], [0.95, 0.93, 0.88]),
+                    background: (!args["background"].is_null()).then(|| parse_color(&args["background"], [0.0; 3])),
+                    bold: bool_arg(args, "bold", true),
+                    padding: f32_arg(args, "padding", 0.12),
+                };
+                tri!(render_text(text, px_w.round() as u32, px_h.round() as u32, &style))
+            } else {
+                return Some(IpcResponse::error("Give image_path (a PNG file) or text"));
+            };
+            // "contain" keeps the picture's proportions, centred in the rectangle.
+            if args["fit"].as_str() == Some("contain") {
+                let (image_aspect, rect_aspect) = (image.width as f32 / image.height as f32, width / height);
+                if image_aspect > rect_aspect {
+                    let keep = rect_aspect / image_aspect;
+                    origin += v_axis * (0.5 - keep * 0.5);
+                    v_axis *= keep;
+                } else {
+                    let keep = image_aspect / rect_aspect;
+                    origin += u_axis * (0.5 - keep * 0.5);
+                    u_axis *= keep;
+                }
+            }
+            let name = layer_name.map(str::to_string).unwrap_or_else(|| {
+                args["text"].as_str().map_or("Image".to_string(), |t| t.lines().next().unwrap_or("Text").trim().to_string())
+            });
+            let layer = TextureLayer {
+                name: name.clone(),
+                image: std::sync::Arc::new(image),
+                origin,
+                u_axis,
+                v_axis,
+                depth: f32_arg(args, "depth", reach).max(1e-4),
+                opacity: f32_arg(args, "opacity", 1.0).clamp(0.0, 1.0),
+            };
+            tri!(layer.validate());
+            let replaces = obj.textures.iter().position(|l| l.name.eq_ignore_ascii_case(&name));
+            if replaces.is_none() && obj.textures.len() >= MAX_LAYERS {
+                return Some(IpcResponse::error(format!(
+                    "'{}' already has {MAX_LAYERS} texture layers; reuse a layer name to replace one, or clear them",
+                    obj.name
+                )));
+            }
+            history.record("Set texture", scene);
+            let obj = &mut scene.objects[idx];
+            match replaces {
+                Some(i) => obj.textures[i] = layer,
+                None => obj.textures.push(layer),
+            }
+            IpcResponse::success(
+                format!("Put '{name}' on '{}' ({width:.3} x {height:.3})", obj.name),
+                json!({
+                    "object_id": obj.id,
+                    "layer": name,
+                    "size": [width, height],
+                    "layers": summary(obj),
                 }),
             )
         }

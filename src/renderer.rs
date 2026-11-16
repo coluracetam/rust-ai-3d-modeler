@@ -24,6 +24,41 @@ pub struct ObjectUniforms {
     pub tex_params: [f32; 4],
     pub emission: [f32; 4],
     pub inspection: [f32; 4],
+    /// x = number of image layers.
+    pub layer_info: [f32; 4],
+    /// Five vec4 per layer: origin+opacity, u+depth, v, normal, atlas rect (shader `ImageLayer`).
+    pub layers: [[f32; 4]; 20],
+}
+
+/// A part's image layers on the GPU: one atlas texture and the uniform rows that place them.
+struct LayerAtlas {
+    /// The images it was built from (address, width, height), to notice replaced layers.
+    key: Vec<(usize, u32, u32)>,
+    view: wgpu::TextureView,
+    /// Atlas rectangle of each layer: corner and size in 0..1, inset by half a texel.
+    rects: Vec<[f32; 4]>,
+}
+
+fn layer_atlas_key(layers: &[crate::texture::TextureLayer]) -> Vec<(usize, u32, u32)> {
+    layers
+        .iter()
+        .map(|l| (std::sync::Arc::as_ptr(&l.image) as usize, l.image.width, l.image.height))
+        .collect()
+}
+
+fn layer_uniforms(layers: &[crate::texture::TextureLayer], rects: &[[f32; 4]]) -> ([f32; 4], [[f32; 4]; 20]) {
+    let mut rows = [[0.0_f32; 4]; 20];
+    let count = layers.len().min(crate::texture::MAX_LAYERS).min(rects.len());
+    for (i, layer) in layers.iter().take(count).enumerate() {
+        let (u, v, n) = (layer.u_axis, layer.v_axis, layer.normal());
+        let (u, v) = (u / u.length_squared(), v / v.length_squared());
+        rows[i * 5] = [layer.origin.x, layer.origin.y, layer.origin.z, layer.opacity.clamp(0.0, 1.0)];
+        rows[i * 5 + 1] = [u.x, u.y, u.z, layer.depth];
+        rows[i * 5 + 2] = [v.x, v.y, v.z, 0.0];
+        rows[i * 5 + 3] = [n.x, n.y, n.z, 0.0];
+        rows[i * 5 + 4] = rects[i];
+    }
+    ([count as f32, 0.0, 0.0, 0.0], rows)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -110,6 +145,10 @@ pub struct Renderer3D {
     pub shading: ViewportShading,
     pub viewport: Option<[f32; 4]>,
     mesh_cache: HashMap<DrawKey, CachedGpuMesh>,
+    /// Image-layer atlases of textured parts.
+    layer_atlases: HashMap<DrawKey, LayerAtlas>,
+    blank_layers: wgpu::TextureView,
+    layer_sampler: wgpu::Sampler,
     /// Hover-preview outline, rebuilt only when the hovered face set or its mesh changes.
     hover_lines: Option<(HoverKey, wgpu::Buffer, u32)>,
 }
@@ -145,6 +184,7 @@ impl HoverKey {
 impl Renderer3D {
     pub fn invalidate_cache(&mut self) {
         self.mesh_cache.clear();
+        self.layer_atlases.clear();
         self.hover_lines = None;
     }
 
@@ -181,16 +221,34 @@ impl Renderer3D {
         let object_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Object Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
             });
 
         let global_uniforms = GlobalUniforms {
@@ -221,7 +279,28 @@ impl Renderer3D {
             tex_params: [0.3, 0.3, 0.3, 1.0],
             emission: [0.0, 0.0, 0.0, 0.0],
             inspection: [1.0, 0.0, 0.0, 0.0],
+            layer_info: [0.0; 4],
+            layers: [[0.0; 4]; 20],
         };
+        // Parts without image layers bind this one-pixel texture.
+        let blank_layers = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("Blank Layer Atlas"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let layer_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Layer Sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let identity_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Identity Line Object Uniform Buffer"),
             contents: bytemuck::cast_slice(&[identity_u]),
@@ -230,10 +309,11 @@ impl Renderer3D {
         let identity_line_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Identity Line Bind Group"),
             layout: &object_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: identity_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: identity_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&blank_layers) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&layer_sampler) },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -604,6 +684,9 @@ impl Renderer3D {
             shading: ViewportShading::StudioLit,
             viewport: None,
             mesh_cache: HashMap::new(),
+            layer_atlases: HashMap::new(),
+            blank_layers,
+            layer_sampler,
             hover_lines: None,
         }
     }
@@ -720,9 +803,16 @@ impl Renderer3D {
         emission_strength: f32,
         opacity: f32,
         glow: f32,
+        layers: Option<(&wgpu::TextureView, [f32; 4], [[f32; 4]; 20])>,
     ) -> wgpu::BindGroup {
         let normal_mat = model.inverse().transpose();
+        let (atlas, layer_info, layer_rows) = match layers {
+            Some((view, info, rows)) => (view, info, rows),
+            None => (&self.blank_layers, [0.0; 4], [[0.0; 4]; 20]),
+        };
         let u = ObjectUniforms {
+            layer_info,
+            layers: layer_rows,
             model: model.to_cols_array_2d(),
             normal_mat: normal_mat.to_cols_array_2d(),
             params: [roughness, metallic, shading_mode, pattern_id],
@@ -748,11 +838,76 @@ impl Renderer3D {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Object Bind Group"),
             layout: &self.object_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(atlas) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.layer_sampler) },
+            ],
         })
+    }
+
+    /// Makes sure the part's image layers are on the GPU as one atlas (a 2x2 grid of cells
+    /// with a gutter, so neighbours never bleed into each other).
+    fn refresh_layer_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: DrawKey,
+        layers: &[crate::texture::TextureLayer],
+    ) {
+        use wgpu::util::DeviceExt;
+        let layers = &layers[..layers.len().min(crate::texture::MAX_LAYERS)];
+        let atlas_key = layer_atlas_key(layers);
+        if self.layer_atlases.get(&key).is_some_and(|a| a.key == atlas_key) {
+            return;
+        }
+        const GUTTER: u32 = 2;
+        let cell_w = layers.iter().map(|l| l.image.width).max().unwrap_or(1) + GUTTER;
+        let cell_h = layers.iter().map(|l| l.image.height).max().unwrap_or(1) + GUTTER;
+        let columns = if layers.len() > 1 { 2 } else { 1 };
+        let rows = (layers.len() as u32).div_ceil(columns).max(1);
+        let (width, height) = (cell_w * columns, cell_h * rows);
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut rects = Vec::new();
+        for (i, layer) in layers.iter().enumerate() {
+            let image = &layer.image;
+            let (x0, y0) = ((i as u32 % columns) * cell_w + GUTTER / 2, (i as u32 / columns) * cell_h + GUTTER / 2);
+            for row in 0..image.height {
+                let from = (row * image.width * 4) as usize;
+                let to = (((y0 + row) * width + x0) * 4) as usize;
+                let len = (image.width * 4) as usize;
+                pixels[to..to + len].copy_from_slice(&image.rgba[from..from + len]);
+            }
+            rects.push([
+                (x0 as f32 + 0.5) / width as f32,
+                (y0 as f32 + 0.5) / height as f32,
+                (image.width as f32 - 1.0).max(0.0) / width as f32,
+                (image.height as f32 - 1.0).max(0.0) / height as f32,
+            ]);
+        }
+        let texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("Layer Atlas"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &pixels,
+        );
+        self.layer_atlases.insert(
+            key,
+            LayerAtlas {
+                key: atlas_key,
+                view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                rects,
+            },
+        );
     }
 
     fn create_line_bind_group(&self, device: &wgpu::Device, model: Mat4) -> wgpu::BindGroup {
@@ -769,6 +924,7 @@ impl Renderer3D {
             0.0,
             1.0,
             0.0,
+            None,
         )
     }
 
@@ -912,6 +1068,7 @@ impl Renderer3D {
     fn prepare_objects(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         scene: &Scene,
         variant: u8,
         eye: Vec3,
@@ -951,6 +1108,13 @@ impl Renderer3D {
                 } else {
                     0.0
                 };
+                if !obj.textures.is_empty() {
+                    self.refresh_layer_atlas(device, queue, cache_key, &obj.textures);
+                }
+                let layers = self.layer_atlases.get(&cache_key).filter(|_| !obj.textures.is_empty()).map(|atlas| {
+                    let (info, rows) = layer_uniforms(&obj.textures, &atlas.rects);
+                    (&atlas.view, info, rows)
+                });
                 let bg = self.create_object_bind_group(
                     device,
                     model,
@@ -964,6 +1128,7 @@ impl Renderer3D {
                     obj.emission_strength,
                     if ghost { 0.16 } else { 1.0 },
                     glow,
+                    layers,
                 );
                 if ghost {
                     draws.ghost.push((
@@ -1089,6 +1254,7 @@ impl Renderer3D {
             0.0,
             1.0,
             0.0,
+            None,
         ))
     }
 
@@ -1137,14 +1303,14 @@ impl Renderer3D {
             let before = scene.revision_view(rid, true);
             let after = scene.revision_view(rid, false);
             if let (Some(before), Some(after)) = (before, after) {
-                let left = self.prepare_objects(device, &before, 1, eye);
+                let left = self.prepare_objects(device, queue, &before, 1, eye);
                 passes.push((left, Some(scissor(0.0, s, self.depth_size))));
-                let right = self.prepare_objects(device, &after, 0, eye);
+                let right = self.prepare_objects(device, queue, &after, 0, eye);
                 passes.push((right, Some(scissor(s, 1.0, self.depth_size))));
             }
         }
         if passes.is_empty() {
-            let draws = self.prepare_objects(device, display.as_ref(), 0, eye);
+            let draws = self.prepare_objects(device, queue, display.as_ref(), 0, eye);
             passes.push((draws, None));
         }
         let scene = display.as_ref();

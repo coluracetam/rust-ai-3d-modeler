@@ -166,6 +166,8 @@ struct Source {
     colors: Vec<[f32; 3]>,
     tris: Vec<[u32; 3]>,
     scale: Vec3,
+    /// Image layers (titles, labels), in the part's local space.
+    layers: Vec<crate::texture::TextureLayer>,
 }
 
 fn part_scale(obj: &SceneObject) -> Vec3 {
@@ -198,7 +200,7 @@ impl Source {
                 }
             }
         }
-        Self { positions, colors, tris, scale }
+        Self { positions, colors, tris, scale, layers: obj.textures.clone() }
     }
 }
 
@@ -226,6 +228,16 @@ fn source_key(obj: &SceneObject) -> (u64, usize, usize) {
     }
     for v in obj.color.iter().chain(part_scale(obj).to_array().iter()) {
         mix(v.to_bits() as u64);
+    }
+    // Two books with different titles are different parts even on the same mesh.
+    for layer in &obj.textures {
+        mix(0x1a7e_0000 + ((layer.image.width as u64) << 32 | layer.image.height as u64));
+        for chunk in layer.image.rgba.chunks(8) {
+            mix(chunk.iter().fold(0u64, |word, &byte| word << 8 | byte as u64));
+        }
+        for v in [layer.origin, layer.u_axis, layer.v_axis].iter().flat_map(|v| v.to_array()).chain([layer.depth, layer.opacity]) {
+            mix(v.to_bits() as u64);
+        }
     }
     (h, mesh.positions.len(), mesh.faces.len())
 }
@@ -428,10 +440,24 @@ impl Source {
         };
         let [ca, cb, cc] = tri.map(|v| self.colors[v as usize]);
         let [a, b, c] = tri.map(|v| self.positions[v as usize]);
-        (
-            [0, 1, 2].map(|k| ca[k] * bary[0] + cb[k] * bary[1] + cc[k] * bary[2]),
-            (b - a).cross(c - a).length().sqrt(),
-        )
+        let mut color = [0, 1, 2].map(|k| ca[k] * bary[0] + cb[k] * bary[1] + cc[k] * bary[2]);
+        let mut size = (b - a).cross(c - a).length().sqrt();
+        if !self.layers.is_empty() {
+            // Layers live in local space; the source is in sized space (local times scale).
+            let [la, lb, lc] = [a, b, c].map(|v| v / self.scale);
+            let point = la * bary[0] + lb * bary[1] + lc * bary[2];
+            let local_normal = (lb - la).cross(lc - la).normalize_or_zero();
+            for layer in &self.layers {
+                if layer.uv(point, local_normal).is_some() {
+                    // An image is as detailed as its pixels, however few triangles carry it.
+                    let texel = ((layer.u_axis * self.scale).length() / layer.image.width as f32)
+                        .min((layer.v_axis * self.scale).length() / layer.image.height as f32);
+                    size = size.min(texel);
+                }
+            }
+            color = crate::texture::apply_layers(&self.layers, color, point, local_normal);
+        }
+        (color, size)
     }
 }
 

@@ -14,6 +14,23 @@ struct ObjectUniforms {
     // xyz = emission_color, w = emission_strength
     emission: vec4<f32>,
     inspection: vec4<f32>,
+    // x = number of image layers
+    layer_info: vec4<f32>,
+    layers: array<ImageLayer, 4>,
+};
+
+// An image projected onto the part from a rectangle in its local space (see texture.rs).
+struct ImageLayer {
+    // xyz = top-left corner, w = opacity
+    origin: vec4<f32>,
+    // xyz = top edge / its squared length, w = reach in front of and behind the image plane
+    u: vec4<f32>,
+    // xyz = left edge / its squared length
+    v: vec4<f32>,
+    // xyz = direction the image faces
+    normal: vec4<f32>,
+    // where the image sits in the atlas: xy = corner, zw = size (in 0..1)
+    rect: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -21,6 +38,12 @@ var<uniform> global: GlobalUniforms;
 
 @group(1) @binding(0)
 var<uniform> object: ObjectUniforms;
+
+@group(1) @binding(1)
+var layer_atlas: texture_2d<f32>;
+
+@group(1) @binding(2)
+var layer_sampler: sampler;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -34,6 +57,7 @@ struct VertexOutput {
     @location(1) world_normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) local_pos: vec3<f32>,
+    @location(4) local_normal: vec3<f32>,
 };
 
 @vertex
@@ -45,6 +69,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.clip_position = global.view_proj * world_p;
     out.world_normal = normalize((object.normal_mat * vec4<f32>(in.normal, 0.0)).xyz);
     out.color = in.color;
+    out.local_normal = in.normal;
     return out;
 }
 
@@ -217,7 +242,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let N = normalize(in.world_normal);
     let V = normalize(global.camera_pos.xyz - in.world_pos);
     let pattern_id = i32(round(object.params.w));
-    let surface_color = evaluate_procedural_pattern(
+    var surface_color = evaluate_procedural_pattern(
         pattern_id,
         in.color,
         object.tex_params.xyz,
@@ -225,6 +250,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         N,
         object.tex_params.w
     );
+    // Image layers, lowest first. Must match TextureLayer::sample in texture.rs.
+    let layer_count = i32(object.layer_info.x);
+    let local_n = normalize(in.local_normal);
+    for (var i = 0; i < layer_count; i = i + 1) {
+        let layer = object.layers[i];
+        let offset = in.local_pos - layer.origin.xyz;
+        let uv = vec2<f32>(dot(offset, layer.u.xyz), dot(offset, layer.v.xyz));
+        let texel = textureSampleLevel(
+            layer_atlas,
+            layer_sampler,
+            layer.rect.xy + clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * layer.rect.zw,
+            0.0
+        );
+        let covered = dot(local_n, layer.normal.xyz) >= 0.3
+            && abs(dot(offset, layer.normal.xyz)) <= layer.u.w
+            && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+        if (covered) {
+            surface_color = mix(surface_color, texel.rgb, texel.a * layer.origin.w);
+        }
+    }
     let emissive = object.emission.xyz * object.emission.w;
 
     if (mode == 1) {

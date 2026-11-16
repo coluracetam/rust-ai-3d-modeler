@@ -83,6 +83,15 @@ pub fn object_hash(object: &SceneObject) -> u64 {
         [object.roughness, object.metallic, object.texture_scale, object.emission_strength],
     );
     object.flat_shading.hash(&mut h);
+    for layer in &object.textures {
+        layer.name.hash(&mut h);
+        (layer.image.width, layer.image.height).hash(&mut h);
+        layer.image.rgba.hash(&mut h);
+        hash_floats(
+            &mut h,
+            [layer.origin, layer.u_axis, layer.v_axis].iter().flat_map(|v| v.to_array()).chain([layer.depth, layer.opacity]),
+        );
+    }
     format!("{:?}", object.pattern).hash(&mut h);
     hash_floats(&mut h, object.secondary_color);
     hash_floats(&mut h, object.emission_color);
