@@ -456,6 +456,35 @@ pub struct Scene {
     /// Names for the current selection's regions, keyed by (object id, lowest face index).
     #[serde(skip)]
     pub region_labels: std::collections::HashMap<(u64, usize), String>,
+    #[serde(skip)]
+    comment_cache: CommentCache,
+}
+
+/// Where a comment currently sits on the model, resolved from its stored targets.
+#[derive(Debug)]
+pub struct CommentGeometry {
+    pub needs_reattachment: bool,
+    /// World-space point the comment's badge is drawn at.
+    pub anchor: Vec3,
+    /// World anchor and surface normal of each target, in `SpatialComment::targets` order.
+    pub pins: Vec<(Vec3, Vec3)>,
+}
+
+/// Per-comment `CommentGeometry`, keyed by comment id with a stamp of what it was derived from.
+/// Resolving a comment walks every targeted face, and the viewport asks for it every frame.
+#[derive(Default)]
+struct CommentCache(std::sync::Mutex<std::collections::HashMap<u64, (u64, std::sync::Arc<CommentGeometry>)>>);
+
+impl Clone for CommentCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for CommentCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommentCache")
+    }
 }
 
 impl Default for Scene {
@@ -484,6 +513,7 @@ impl Default for Scene {
             pending_anchor: None,
             selection_volume: None,
             region_labels: Default::default(),
+            comment_cache: Default::default(),
         };
         // Start with a high-detail Sculpt/Voxel Sphere and a Reference Cube or single default sculptable sphere
         let grid = VoxelGrid::new_sphere(32, 3.2, 1.15);
@@ -531,6 +561,7 @@ impl Scene {
             pending_anchor: None,
             selection_volume: None,
             region_labels: Default::default(),
+            comment_cache: Default::default(),
         }
     }
 
@@ -663,8 +694,17 @@ impl Scene {
 
     pub fn target_faces(&self, target: &CommentTargetSection) -> Option<Vec<usize>> {
         let obj = self.objects.iter().find(|o| o.id == target.object_id)?;
+        Self::target_faces_on(obj, target).map(|faces| faces.into_owned())
+    }
+
+    /// Faces of `obj` that `target` refers to now; borrowed when the stored indices still apply.
+    fn target_faces_on<'a>(
+        obj: &SceneObject,
+        target: &'a CommentTargetSection,
+    ) -> Option<std::borrow::Cow<'a, [usize]>> {
+        use std::borrow::Cow;
         if target.selected_faces.is_empty() {
-            return Some(Vec::new());
+            return Some(Cow::Borrowed(&[]));
         }
         if target.topology_hash == Some(obj.mesh.topology_hash())
             && target
@@ -672,7 +712,7 @@ impl Scene {
                 .iter()
                 .all(|&i| i < obj.mesh.faces.len())
         {
-            return Some(target.selected_faces.clone());
+            return Some(Cow::Borrowed(&target.selected_faces));
         }
         if target.face_signatures.len() != target.selected_faces.len() {
             return None;
@@ -685,7 +725,106 @@ impl Scene {
             .face_signatures
             .iter()
             .map(|hash| map.get(hash).filter(|ids| ids.len() == 1).map(|ids| ids[0]))
-            .collect()
+            .collect::<Option<Vec<usize>>>()
+            .map(Cow::Owned)
+    }
+
+    /// Resolved position of `comment` on the current geometry, cached until the comment's
+    /// targets or any part's geometry or transform change. Selection changes do not affect it.
+    pub fn comment_geometry(&self, comment: &SpatialComment) -> std::sync::Arc<CommentGeometry> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let bits = |v: Vec3| v.to_array().map(f32::to_bits);
+        comment.is_general.hash(&mut h);
+        bits(comment.world_anchor).hash(&mut h);
+        bits(comment.surface_normal).hash(&mut h);
+        comment
+            .volume
+            .as_ref()
+            .map(|v| (bits(v.center), bits(v.half_extents)))
+            .hash(&mut h);
+        comment.targets.len().hash(&mut h);
+        for t in &comment.targets {
+            t.object_id.hash(&mut h);
+            t.topology_hash.hash(&mut h);
+            t.selected_faces.len().hash(&mut h);
+            t.selected_faces.first().hash(&mut h);
+            t.selected_faces.last().hash(&mut h);
+            t.face_signatures.len().hash(&mut h);
+            bits(t.local_anchor).hash(&mut h);
+            bits(t.world_anchor).hash(&mut h);
+        }
+        for o in &self.objects {
+            o.id.hash(&mut h);
+            o.mesh.geometry_stamp().hash(&mut h);
+            o.transform.matrix().to_cols_array().map(f32::to_bits).hash(&mut h);
+        }
+        let stamp = h.finish();
+
+        let mut cache = self.comment_cache.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((key, geometry)) = cache.get(&comment.id) {
+            if *key == stamp {
+                return geometry.clone();
+            }
+        }
+        let geometry = std::sync::Arc::new(self.compute_comment_geometry(comment));
+        if cache.len() > self.comments.len() + 8 {
+            cache.retain(|id, _| self.comments.iter().any(|c| c.id == *id));
+        }
+        cache.insert(comment.id, (stamp, geometry.clone()));
+        geometry
+    }
+
+    fn compute_comment_geometry(&self, comment: &SpatialComment) -> CommentGeometry {
+        let by_id: std::collections::HashMap<u64, &SceneObject> =
+            self.objects.iter().map(|o| (o.id, o)).collect();
+        let mut missing = false;
+        let mut points = Vec::new();
+        let mut pins = Vec::with_capacity(comment.targets.len());
+        for t in &comment.targets {
+            let resolved = by_id
+                .get(&t.object_id)
+                .and_then(|obj| Self::target_faces_on(obj, t).map(|faces| (*obj, faces)));
+            let Some((obj, faces)) = resolved else {
+                missing = true;
+                pins.push((t.world_anchor, t.surface_normal));
+                continue;
+            };
+            let model = obj.transform.matrix();
+            let (local, normal) = if faces.is_empty() {
+                (t.local_anchor, t.surface_normal)
+            } else {
+                let mut center = Vec3::ZERO;
+                let mut normal = Vec3::ZERO;
+                for &fi in faces.iter() {
+                    center += obj.mesh.face_center(fi);
+                    normal += obj.mesh.face_normal(fi);
+                }
+                let normal = model
+                    .inverse()
+                    .transpose()
+                    .transform_vector3(normal.normalize_or_zero())
+                    .normalize_or_zero();
+                (center / faces.len() as f32, normal)
+            };
+            let world = model.transform_point3(local);
+            points.push(world);
+            pins.push((world, normal));
+        }
+        let anchor = if let (true, Some(v)) = (points.is_empty(), &comment.volume) {
+            v.center
+        } else if points.is_empty() {
+            comment.world_anchor
+        } else {
+            points.iter().sum::<Vec3>() / points.len() as f32
+        };
+        CommentGeometry {
+            needs_reattachment: !comment.is_general
+                && comment.volume.is_none()
+                && (comment.targets.is_empty() || missing),
+            anchor,
+            pins,
+        }
     }
 
     pub fn refreshed_target(&self, target: &CommentTargetSection) -> Option<CommentTargetSection> {
@@ -731,13 +870,10 @@ impl Scene {
     }
 
     pub fn comment_needs_reattachment(&self, comment: &SpatialComment) -> bool {
+        // Cheap answers first; only a comment with face targets needs resolving.
         !comment.is_general
             && comment.volume.is_none()
-            && (comment.targets.is_empty()
-                || comment
-                    .targets
-                    .iter()
-                    .any(|t| self.target_faces(t).is_none()))
+            && (comment.targets.is_empty() || self.comment_geometry(comment).needs_reattachment)
     }
 
     pub fn reattach_comment(&mut self, id: u64, radius: f32) -> Result<(), String> {
@@ -765,28 +901,7 @@ impl Scene {
     }
 
     pub fn current_comment_anchor(&self, comment: &SpatialComment) -> Vec3 {
-        let points: Vec<Vec3> = comment
-            .targets
-            .iter()
-            .filter_map(|t| {
-                let obj = self.objects.iter().find(|o| o.id == t.object_id)?;
-                let faces = self.target_faces(t)?;
-                let local = if faces.is_empty() {
-                    t.local_anchor
-                } else {
-                    faces.iter().map(|&i| obj.mesh.face_center(i)).sum::<Vec3>()
-                        / faces.len() as f32
-                };
-                Some(obj.transform.matrix().transform_point3(local))
-            })
-            .collect();
-        if let (true, Some(v)) = (points.is_empty(), &comment.volume) {
-            v.center
-        } else if points.is_empty() {
-            comment.world_anchor
-        } else {
-            points.iter().sum::<Vec3>() / points.len() as f32
-        }
+        self.comment_geometry(comment).anchor
     }
 
     pub fn restore_targets(&mut self, targets: &[CommentTargetSection]) -> Result<(), String> {
