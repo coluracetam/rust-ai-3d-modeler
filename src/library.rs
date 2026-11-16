@@ -509,6 +509,8 @@ pub struct ExportOptions {
     pub scale: f32,
     /// Triangle budget per asset; `None` exports every triangle.
     pub max_triangles: Option<usize>,
+    /// Bake colours into a texture of this size instead of vertex colours.
+    pub bake_texture: Option<u32>,
 }
 
 /// Where an asset is written under `directory`: `section/subsection/name.glb`.
@@ -560,6 +562,7 @@ pub fn export_asset(
         center_base: false,
         max_triangles: options.max_triangles,
         godot,
+        bake_texture: options.bake_texture,
     };
     let parts: Vec<&SceneObject> = asset.objects.iter().collect();
     let report = crate::gltf::export_glb(&parts, &path, &gltf)?;
@@ -575,6 +578,8 @@ pub struct ExportPrefs {
     pub merge: bool,
     #[serde(default)]
     pub max_triangles: Option<usize>,
+    #[serde(default)]
+    pub bake_texture: Option<u32>,
 }
 
 pub fn load_export_prefs(root: &Path) -> Option<ExportPrefs> {
@@ -835,6 +840,7 @@ pub fn dispatch(
                 merge: args["merge"].as_bool(),
                 scale: args["scale"].as_f64().unwrap_or(1.0) as f32,
                 max_triangles: args["max_triangles"].as_u64().filter(|&b| b > 0).map(|b| b as usize),
+                bake_texture: crate::gltf::GltfOptions::default().with_args(args)?.bake_texture,
             };
             let assets: Vec<AssetInfo> = match text("asset") {
                 Some(reference) => vec![find_asset(&root, reference)?],

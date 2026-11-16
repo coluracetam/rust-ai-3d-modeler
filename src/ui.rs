@@ -200,9 +200,18 @@ pub struct ExportUi {
     pub collision: crate::gltf::Collision,
     /// Triangle budget as typed; empty exports every triangle.
     pub budget: String,
+    /// Bake colours into a texture instead of exporting vertex colours.
+    pub bake: bool,
+    /// Side of the baked texture; 0 means the default.
+    pub texture_size: u32,
 }
 
 impl ExportUi {
+    pub fn bake_texture(&self) -> Option<u32> {
+        let size = if self.texture_size == 0 { crate::bake::DEFAULT_SIZE } else { self.texture_size };
+        self.bake.then_some(size)
+    }
+
     pub fn max_triangles(&self) -> Option<usize> {
         self.budget.trim().replace([',', '_', ' '], "").parse().ok().filter(|&n: &usize| n > 0)
     }
@@ -2374,6 +2383,8 @@ fn load_export_choices(export: &mut ExportUi, root: &std::path::Path) {
         export.separate = !prefs.merge;
         export.collision = crate::gltf::Collision::from_name(&prefs.collision).unwrap_or_default();
         export.budget = prefs.max_triangles.map(|n| n.to_string()).unwrap_or_default();
+        export.bake = prefs.bake_texture.is_some();
+        export.texture_size = prefs.bake_texture.unwrap_or(0);
     }
 }
 
@@ -2401,6 +2412,20 @@ fn export_options(ui: &mut egui::Ui, export: &mut ExportUi, godot: bool, id: &st
         ui.label(RichText::new("Triangle budget").color(MUTED));
         text_field(ui, &mut export.budget, "all triangles", 110.0)
             .on_hover_text("Simplify dense parts so the model has about this many triangles, e.g. 20000. Leave empty to keep them all. The original is not changed.");
+    });
+    ui.horizontal(|ui| {
+        toggle(ui, &mut export.bake, "Bake colours into a texture")
+            .on_hover_text("Painted detail is kept in an image instead of the triangles, so it stays sharp at a small triangle budget. The model is simplified, faces that cannot be seen are left out, and one texture of at most the chosen size is stored inside the .glb.");
+        if export.bake {
+            let size = export.bake_texture().unwrap_or(crate::bake::DEFAULT_SIZE);
+            egui::ComboBox::from_id_salt((id, "texture"))
+                .selected_text(format!("{size} px"))
+                .show_ui(ui, |ui| {
+                    for choice in [1024, 2048, 4096] {
+                        ui.selectable_value(&mut export.texture_size, choice, format!("{choice} px"));
+                    }
+                });
+        }
     });
 }
 
@@ -2500,6 +2525,7 @@ fn library_export_form(
                 merge: Some(!export.separate),
                 scale: 1.0,
                 max_triangles: export.max_triangles(),
+                bake_texture: export.bake_texture(),
             };
             let path = std::path::Path::new(&directory);
             if let Err(e) = library::check_export_paths(assets.iter().copied(), path, options.target) {
@@ -2525,6 +2551,7 @@ fn library_export_form(
                     collision: options.collision.name().into(),
                     merge: !export.separate,
                     max_triangles: options.max_triangles,
+                    bake_texture: options.bake_texture,
                 },
             );
             state.status_message = format!(
@@ -5634,6 +5661,7 @@ fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
                             args["merge"] = json!(!export.separate);
                             args["collision"] = json!(export.collision.name());
                             args["max_triangles"] = json!(export.max_triangles().unwrap_or(0));
+                            args["bake_texture"] = json!(export.bake_texture().unwrap_or(0));
                         }
                         action(state, "export_model", args);
                         state.show_io_modal = false;

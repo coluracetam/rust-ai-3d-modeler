@@ -466,6 +466,8 @@ pub fn mcp_tool_definitions() -> Value {
                     "origin": { "type": "string", "enum": ["keep", "base"], "description": "'base' moves the model so the centre of its base is at the origin (a good pivot for placing props). Default keep." },
                     "scale": { "type": "number", "description": "Uniform scale (default 1; the app and Godot both work in metres)." },
                     "max_triangles": { "type": "integer", "description": "Triangle budget for the whole model. Dense parts are simplified to fit (the scene itself is not changed). The response reports triangles and source_triangles." },
+"bake_texture": { "type": "boolean", "description": "Bake the colours into one texture embedded in the .glb: parts are simplified by edge collapse to max_triangles (without a budget, only as far as the shape allows), faces that cannot be seen are dropped (between parts only with merge), and the result is written with UVs and a base colour texture instead of vertex colours. Use it for painted or detailed models: detail then survives a small triangle budget (e.g. max_triangles 20000). Identical parts share texture space. Shapes are never simplified past recognition, so a very small budget may not be reached (see warnings). The response reports textures, texture_size, texture_bytes and texels_per_metre." },
+                    "texture_size": { "type": "integer", "description": "Largest side of the baked texture in pixels: 1024, 2048 (default) or 4096. A smaller texture is written when it holds all the painted detail." },
                     "root_name": { "type": "string", "description": "Name of the root node (default: the file name)." },
                     "target": { "type": "string", "enum": ["godot", "blender"], "description": "Which importer to write for. Default: godot when the path is inside a Godot project, otherwise plain glTF (right for Blender)." },
                     "all": { "type": "boolean", "description": "Export every visible part (the default when no parts are chosen)." },
@@ -660,7 +662,9 @@ pub fn mcp_tool_definitions() -> Value {
                     "collision": { "type": "string", "enum": ["none", "box", "convex", "part_boxes", "mesh"], "description": "Godot only: collision nodes the importer turns into a StaticBody3D. Default none." },
                     "merge": { "type": "boolean", "description": "Join parts that share a material (default true for godot, false for blender)." },
                     "scale": { "type": "number", "description": "Uniform scale (default 1)." },
-                    "max_triangles": { "type": "integer", "description": "Triangle budget per asset; dense parts are simplified to fit. The stored asset is not changed." }
+                    "max_triangles": { "type": "integer", "description": "Triangle budget per asset; dense parts are simplified to fit. The stored asset is not changed." },
+                    "bake_texture": { "type": "boolean", "description": "Bake each asset's colours into one texture embedded in its .glb (UVs and a base colour texture instead of vertex colours), so painted detail survives a small max_triangles. Hidden faces are dropped." },
+                    "texture_size": { "type": "integer", "description": "Largest side of the baked texture in pixels: 1024, 2048 (default) or 4096. A smaller one is written when it holds all the detail." }
                 },
                 "required": ["directory"]
             }

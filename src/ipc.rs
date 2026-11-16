@@ -1599,6 +1599,9 @@ fn dispatch(
                     report.triangles,
                     report.materials
                 );
+                if report.textures > 0 {
+                    message.push_str(&format!(", {} px texture", report.texture_size));
+                }
                 if let Some((_, res)) = crate::gltf::godot_resource_path(path) {
                     data["godot_path"] = json!(res);
                     message.push_str(&format!(" · {res}"));

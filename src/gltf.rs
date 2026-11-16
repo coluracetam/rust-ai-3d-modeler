@@ -1,6 +1,7 @@
 //! Game-ready binary glTF 2.0 (`.glb`) export for Godot and Blender: named nodes, PBR
 //! materials, vertex colours, flat or smooth normals, optional merging by material and
-//! Godot collision hints.
+//! Godot collision hints. `bake_texture` swaps vertex colours for a low-poly mesh with UVs
+//! and one embedded colour texture (see `crate::bake`).
 //!
 //! Colours are written as they are: the viewport treats part and vertex colours as linear
 //! values, which is what glTF expects for `baseColorFactor` and `COLOR_0`.
@@ -82,6 +83,10 @@ pub struct GltfOptions {
     /// Write for Godot's importer: mark the single root (`GODOT_single_root`) and lead every
     /// vertex-coloured mesh with one flat triangle (see `Writer::mesh_primitives`).
     pub godot: bool,
+    /// Bake the colours into one texture of at most this many pixels a side: parts are simplified
+    /// by edge collapse, unwrapped and written with `TEXCOORD_0` instead of `COLOR_0`, so
+    /// painted detail survives a small triangle budget (see `crate::bake`).
+    pub bake_texture: Option<u32>,
 }
 
 impl GltfOptions {
@@ -112,6 +117,24 @@ impl GltfOptions {
             Some(t) if t == "blender" || t == "generic" => self.godot = false,
             Some(t) => return Err(format!("Unknown target '{t}'. Use godot or blender.")),
         }
+        // `bake_texture` is true / false or the size itself; `texture_size` sets the size.
+        let size = args["texture_size"].as_u64().map(|s| s.min(u32::MAX as u64) as u32);
+        match &args["bake_texture"] {
+            Value::Bool(false) => self.bake_texture = None,
+            Value::Bool(true) => {
+                self.bake_texture = Some(size.or(self.bake_texture).unwrap_or(crate::bake::DEFAULT_SIZE));
+            }
+            Value::Number(n) => {
+                let n = n.as_u64().ok_or("'bake_texture' must be true, false or a texture size")? as u32;
+                self.bake_texture = (n > 0).then_some(n);
+            }
+            Value::Null => {
+                if let (Some(size), Some(_)) = (size, self.bake_texture) {
+                    self.bake_texture = Some(size);
+                }
+            }
+            _ => return Err("'bake_texture' must be true, false or a texture size".into()),
+        }
         if let Some(name) = args["root_name"].as_str().map(str::trim).filter(|n| !n.is_empty()) {
             self.root_name = name.to_string();
         }
@@ -129,6 +152,7 @@ impl Default for GltfOptions {
             center_base: false,
             max_triangles: None,
             godot: false,
+            bake_texture: None,
         }
     }
 }
@@ -145,6 +169,13 @@ pub struct ExportReport {
     pub source_triangles: usize,
     /// World-space size of the exported model, after scaling.
     pub size: [f32; 3],
+    /// Baked textures embedded in the file (0 or 1) and their side in pixels.
+    pub textures: usize,
+    pub texture_size: u32,
+    /// Size of the embedded PNG.
+    pub texture_bytes: usize,
+    /// Texture pixels per metre on painted surfaces (0 when nothing is painted).
+    pub texels_per_metre: f32,
     pub warnings: Vec<String>,
 }
 
@@ -159,6 +190,10 @@ impl ExportReport {
             "collision_shapes": self.collision_shapes,
             "source_triangles": self.source_triangles,
             "size": self.size,
+            "textures": self.textures,
+            "texture_size": self.texture_size,
+            "texture_bytes": self.texture_bytes,
+            "texels_per_metre": self.texels_per_metre,
             "warnings": self.warnings,
         })
     }
@@ -170,6 +205,8 @@ struct Geometry {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 3]>,
+    /// Atlas coordinates; only baked geometry has them (and then no colours).
+    uvs: Vec<[f32; 2]>,
     indices: Vec<u32>,
 }
 
@@ -185,6 +222,7 @@ impl Geometry {
             normal_matrix.transform_vector3(n.into()).try_normalize().unwrap_or(Vec3::Y).to_array()
         }));
         self.colors.extend_from_slice(&other.colors);
+        self.uvs.extend_from_slice(&other.uvs);
         for tri in other.indices.chunks_exact(3) {
             // A mirrored part needs its triangles turned to stay outward-facing.
             let tri = if flip { [tri[0], tri[2], tri[1]] } else { [tri[0], tri[1], tri[2]] };
@@ -275,8 +313,10 @@ struct MaterialKey {
     roughness: i32,
     metallic: i32,
     emission: [i32; 3],
-    /// `None` = the colour comes from the vertices.
+    /// `None` = the colour comes from the vertices or the baked texture.
     color: Option<[i32; 3]>,
+    /// The base colour is the baked atlas.
+    textured: bool,
 }
 
 fn quantize(v: f32) -> i32 {
@@ -294,6 +334,7 @@ impl MaterialKey {
             metallic: rounded(obj.metallic),
             emission: obj.emission_color.map(|c| quantize(c.max(0.0) * strength)),
             color: color.map(|c| c.map(quantize)),
+            textured: false,
         }
     }
 }
@@ -311,16 +352,20 @@ struct Writer {
 }
 
 impl Writer {
+    /// `target` 0 is a view that is not vertex data (the embedded image).
     fn view(&mut self, bytes: &[u8], target: u32) -> usize {
         while self.bin.len() % 4 != 0 {
             self.bin.push(0);
         }
-        self.views.push(json!({
+        let mut view = json!({
             "buffer": 0,
             "byteOffset": self.bin.len(),
             "byteLength": bytes.len(),
-            "target": target,
-        }));
+        });
+        if target != 0 {
+            view["target"] = json!(target);
+        }
+        self.views.push(view);
         self.bin.extend_from_slice(bytes);
         self.views.len() - 1
     }
@@ -356,6 +401,9 @@ impl Writer {
                 "roughnessFactor": unq(key.roughness),
             },
         });
+        if key.textured {
+            material["pbrMetallicRoughness"]["baseColorTexture"] = json!({ "index": 0 });
+        }
         let emission = key.emission.map(unq);
         let peak = emission.iter().copied().fold(0.0_f32, f32::max);
         if peak > 0.0 {
@@ -396,6 +444,7 @@ impl Writer {
                 positions: corners.map(|c| geometry.positions[c]).to_vec(),
                 normals: corners.map(|c| geometry.normals[c]).to_vec(),
                 colors: vec![[1.0; 3]; 3],
+                uvs: Vec::new(),
                 indices: vec![0, 1, 2],
             };
             let material = self.material(MaterialKey { color: Some(average.map(quantize)), ..*key });
@@ -421,6 +470,16 @@ impl Writer {
             attributes["NORMAL"] = json!(self.vec3_accessor(&geometry.normals, false));
             if vertex_colors {
                 attributes["COLOR_0"] = json!(self.vec3_accessor(&geometry.colors, false));
+            }
+            if !geometry.uvs.is_empty() {
+                let view = self.view(bytemuck::cast_slice(&geometry.uvs), 34962);
+                self.accessors.push(json!({
+                    "bufferView": view,
+                    "componentType": 5126,
+                    "count": geometry.uvs.len(),
+                    "type": "VEC2",
+                }));
+                attributes["TEXCOORD_0"] = json!(self.accessors.len() - 1);
             }
             primitive["material"] = json!(material);
             self.report.vertices += geometry.positions.len();
@@ -480,7 +539,13 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
     // because clustering would only wreck their shape for a handful of triangles.
     const KEEP_BELOW: usize = 300;
     let mut simplified: Vec<SceneObject> = Vec::new();
-    if let Some(budget) = options.max_triangles.filter(|&b| b < source_triangles) {
+    // Baking simplifies by edge collapse itself and keeps the colours in a texture.
+    let baked = match options.bake_texture {
+        Some(size) => Some(crate::bake::bake(objects, options.max_triangles, size, options.merge)?),
+        None => None,
+    };
+    let budget = options.max_triangles.filter(|&b| b < source_triangles && baked.is_none());
+    if let Some(budget) = budget {
         let small: usize = objects.iter().map(|o| triangles(o)).filter(|&t| t < KEEP_BELOW).sum();
         let dense = (source_triangles - small).max(1);
         let ratio = (budget.saturating_sub(small) as f32 / dense as f32).clamp(0.02, 1.0);
@@ -499,7 +564,21 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         if simplified.is_empty() { objects.to_vec() } else { simplified.iter().collect() };
     let parts: Vec<(&SceneObject, Geometry)> = objects
         .iter()
-        .map(|obj| (*obj, part_geometry(obj)))
+        .enumerate()
+        .map(|(i, obj)| match &baked {
+            Some(baked) => {
+                let part = &baked.parts[i];
+                let geometry = Geometry {
+                    positions: part.positions.clone(),
+                    normals: part.normals.clone(),
+                    colors: Vec::new(),
+                    uvs: part.uvs.clone(),
+                    indices: part.indices.clone(),
+                };
+                (*obj, geometry)
+            }
+            None => (*obj, part_geometry(obj)),
+        })
         .filter(|(_, geometry)| !geometry.indices.is_empty())
         .collect();
     if parts.is_empty() {
@@ -535,9 +614,21 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
             parts: parts.len(),
             source_triangles,
             size: (max - min).to_array(),
+            textures: baked.is_some() as usize,
+            texture_size: baked.as_ref().map_or(0, |b| b.size),
+            texture_bytes: baked.as_ref().map_or(0, |b| b.png.len()),
+            texels_per_metre: baked.as_ref().map_or(0.0, |b| b.texels_per_unit * b.painted as u8 as f32 / options.scale),
             ..Default::default()
         },
     };
+    let textured = baked.is_some();
+    if let Some(baked) = baked.as_ref().filter(|b| b.detail < 0.75) {
+        w.report.warnings.push(format!(
+            "The {} px texture holds about {:.0}% of the resolution the painted detail has; use a larger texture_size or export the model in smaller pieces for sharper detail.",
+            baked.size,
+            baked.detail * 100.0
+        ));
+    }
     let patterned = parts.iter().filter(|(obj, _)| obj.pattern != ProceduralPattern::None).count();
     if patterned > 0 {
         w.report.warnings.push(format!(
@@ -553,7 +644,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         // One mesh; parts that share a material become one primitive (one draw call).
         let mut groups: Vec<(MaterialKey, Geometry)> = Vec::new();
         for (obj, geometry) in &parts {
-            let key = MaterialKey::of(obj, None, 0.1);
+            let key = MaterialKey { textured, ..MaterialKey::of(obj, None, 0.1) };
             let index = groups.iter().position(|(k, _)| *k == key).unwrap_or_else(|| {
                 groups.push((key, Geometry::default()));
                 groups.len() - 1
@@ -561,7 +652,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
             groups[index].1.append(geometry, placement * obj.transform.matrix());
         }
         let groups: Vec<(MaterialKey, &Geometry, bool)> =
-            groups.iter().map(|(key, geometry)| (*key, geometry, true)).collect();
+            groups.iter().map(|(key, geometry)| (*key, geometry, !textured)).collect();
         let primitives = w.mesh_primitives(&groups, options.godot);
         let mesh = w.mesh(&options.root_name, primitives);
         children.push(w.node(json!({ "name": format!("{} Mesh", options.root_name), "mesh": mesh })));
@@ -570,8 +661,9 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         let mut group_nodes: Vec<(String, Vec<usize>)> = Vec::new();
         for (obj, geometry) in &parts {
             let matrix = placement * obj.transform.matrix();
-            let uniform = geometry.uniform_color();
-            let key = MaterialKey::of(obj, uniform, 0.001);
+            let uniform = if textured { None } else { geometry.uniform_color() };
+            let key = MaterialKey { textured, ..MaterialKey::of(obj, uniform, 0.001) };
+            let colored = uniform.is_none() && !textured;
             let (group, name) = match obj.name.split_once('/') {
                 Some((group, name)) if !group.trim().is_empty() && !name.trim().is_empty() => {
                     (Some(group.trim()), name.trim())
@@ -581,13 +673,13 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
             let name = if name.is_empty() { "Part" } else { name };
             // Mirrored parts are baked: engines disagree on negative node scales.
             let node = if matrix.determinant() < 0.0 {
-                let mut baked = Geometry::default();
-                baked.append(geometry, matrix);
-                let primitives = w.mesh_primitives(&[(key, &baked, uniform.is_none())], options.godot);
+                let mut flipped = Geometry::default();
+                flipped.append(geometry, matrix);
+                let primitives = w.mesh_primitives(&[(key, &flipped, colored)], options.godot);
                 let mesh = w.mesh(name, primitives);
                 w.node(json!({ "name": name, "mesh": mesh }))
             } else {
-                let primitives = w.mesh_primitives(&[(key, geometry, uniform.is_none())], options.godot);
+                let primitives = w.mesh_primitives(&[(key, geometry, colored)], options.godot);
                 let mesh = w.mesh(name, primitives);
                 let mut node = json!({ "name": name, "mesh": mesh });
                 set_transform(&mut node, matrix);
@@ -619,6 +711,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
             }
             all.normals.clear();
             all.colors.clear();
+            all.uvs.clear();
             let name = if options.collision == Collision::Convex {
                 "Collision-convcolonly"
             } else {
@@ -659,6 +752,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         }
     }
 
+    let image_view = baked.as_ref().map(|baked| w.view(&baked.png, 0));
     while w.bin.len() % 4 != 0 {
         w.bin.push(0);
     }
@@ -673,6 +767,12 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         "bufferViews": w.views,
         "accessors": w.accessors,
     });
+    if let Some(view) = image_view {
+        // glTF base colour textures are sRGB-encoded; the bake writes them that way.
+        document["images"] = json!([{ "name": format!("{} colour", options.root_name), "bufferView": view, "mimeType": "image/png" }]);
+        document["samplers"] = json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071 }]);
+        document["textures"] = json!([{ "sampler": 0, "source": 0 }]);
+    }
     let mut extensions = Vec::new();
     if w.emissive_strength {
         extensions.push("KHR_materials_emissive_strength");
@@ -805,6 +905,7 @@ mod tests {
             center_base: true,
             max_triangles: None,
             godot: false,
+            bake_texture: None,
         };
         let (glb, report) = build_glb(&parts, &options).unwrap();
         let doc = document(&glb);
@@ -874,6 +975,174 @@ mod tests {
             ..Default::default()
         }).unwrap();
         assert_eq!(oversized_budget.triangles, full.triangles);
+    }
+
+    /// The binary chunk and a reader for float accessors.
+    fn floats(glb: &[u8], doc: &Value, accessor: u64, width: usize) -> Vec<Vec<f32>> {
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let bin = &glb[20 + json_len + 8..];
+        let accessor = &doc["accessors"][accessor as usize];
+        let view = &doc["bufferViews"][accessor["bufferView"].as_u64().unwrap() as usize];
+        let start = view["byteOffset"].as_u64().unwrap() as usize;
+        (0..accessor["count"].as_u64().unwrap() as usize)
+            .map(|i| {
+                (0..width)
+                    .map(|k| {
+                        let at = start + (i * width + k) * 4;
+                        f32::from_le_bytes(bin[at..at + 4].try_into().unwrap())
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn baked_export_has_uvs_a_texture_and_a_textured_material() {
+        let scene = crate::bake::tests::striped_block();
+        let parts: Vec<&SceneObject> = scene.objects.iter().collect();
+        let options = GltfOptions {
+            merge: true,
+            godot: true,
+            max_triangles: Some(100),
+            bake_texture: Some(256),
+            ..Default::default()
+        };
+        let (glb, report) = build_glb(&parts, &options).unwrap();
+        let doc = document(&glb);
+        assert!(report.source_triangles > 2000);
+        // The block is painted coarsely, so the texture comes out smaller than allowed.
+        assert_eq!((report.triangles, report.textures, report.texture_size), (12, 1, 128));
+        let size = report.texture_size;
+        assert!(report.texture_bytes > 0 && report.texels_per_metre > 20.0);
+
+        // One textured primitive: UVs instead of vertex colours and no Godot lead triangle.
+        let primitives = doc["meshes"][0]["primitives"].as_array().unwrap();
+        assert_eq!(primitives.len(), 1);
+        let attributes = &primitives[0]["attributes"];
+        assert!(attributes["COLOR_0"].is_null() && attributes["TEXCOORD_0"].is_u64());
+        let material = &doc["materials"][0]["pbrMetallicRoughness"];
+        assert_eq!(material["baseColorTexture"]["index"], 0);
+        assert_eq!(material["baseColorFactor"], json!([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(doc["textures"], json!([{ "sampler": 0, "source": 0 }]));
+        assert_eq!(doc["samplers"][0]["wrapS"], 33071);
+        assert_eq!(doc["images"][0]["mimeType"], "image/png");
+
+        // The embedded image is a PNG of the requested size.
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let bin = &glb[20 + json_len + 8..];
+        let view = &doc["bufferViews"][doc["images"][0]["bufferView"].as_u64().unwrap() as usize];
+        assert!(view["target"].is_null());
+        let start = view["byteOffset"].as_u64().unwrap() as usize;
+        let png = &bin[start..start + view["byteLength"].as_u64().unwrap() as usize];
+        let image = image::load_from_memory(png).unwrap().to_rgb8();
+        assert_eq!((image.width(), image.height()), (size, size));
+
+        // Looking a surface point up through its triangle's UVs gives the painted colour,
+        // sRGB-encoded.
+        let positions = floats(&glb, &doc, attributes["POSITION"].as_u64().unwrap(), 3);
+        let uvs = floats(&glb, &doc, attributes["TEXCOORD_0"].as_u64().unwrap(), 2);
+        assert_eq!(positions.len(), uvs.len());
+        assert_eq!(positions.len(), 24, "four corners per side: hard edges and chart seams");
+        let texel = |point: Vec3| {
+            let count = doc["accessors"][primitives[0]["indices"].as_u64().unwrap() as usize]["count"].as_u64().unwrap();
+            let index_view = &doc["bufferViews"]
+                [doc["accessors"][primitives[0]["indices"].as_u64().unwrap() as usize]["bufferView"].as_u64().unwrap() as usize];
+            let at = index_view["byteOffset"].as_u64().unwrap() as usize;
+            for t in 0..count as usize / 3 {
+                let corner = |k: usize| {
+                    let i = at + (t * 3 + k) * 4;
+                    u32::from_le_bytes(bin[i..i + 4].try_into().unwrap()) as usize
+                };
+                let [a, b, c] = [0, 1, 2].map(|k| Vec3::from_slice(&positions[corner(k)]));
+                let normal = (b - a).cross(c - a);
+                let p = point - a;
+                if p.dot(normal).abs() > 1e-4 {
+                    continue;
+                }
+                let (v0, v1) = (b - a, c - a);
+                let (d00, d01, d11) = (v0.dot(v0), v0.dot(v1), v1.dot(v1));
+                let (d20, d21) = (p.dot(v0), p.dot(v1));
+                let denom = d00 * d11 - d01 * d01;
+                let (v, w) = ((d11 * d20 - d01 * d21) / denom, (d00 * d21 - d01 * d20) / denom);
+                if v < 0.0 || w < 0.0 || v + w > 1.0 {
+                    continue;
+                }
+                let uv = |k: usize| glam::Vec2::from_slice(&uvs[corner(k)]);
+                let uv = uv(0) * (1.0 - v - w) + uv(1) * v + uv(2) * w;
+                return image.get_pixel((uv.x * size as f32) as u32, (uv.y * size as f32) as u32).0;
+            }
+            panic!("no triangle holds {point}");
+        };
+        assert_eq!(texel(Vec3::new(0.5, -0.4, 0.1)), [255, 0, 0]);
+        assert_eq!(texel(Vec3::new(0.5, -0.15, -0.2)), [0, 0, 255]);
+        // Linear 0.8 is 231 in sRGB.
+        assert_eq!(texel(Vec3::new(-0.5, 0.2, 0.3)), [231, 231, 231]);
+
+        // Unmerged parts keep their own node and material and share the texture.
+        let mut two = scene.clone();
+        let copy = two.objects[0].clone();
+        two.objects.push(copy);
+        two.objects[1].name = "Shiny".into();
+        two.objects[1].roughness = 0.1;
+        two.objects[1].transform.translation = Vec3::new(2.0, 0.0, 0.0);
+        let parts: Vec<&SceneObject> = two.objects.iter().collect();
+        let (glb, report) = build_glb(&parts, &GltfOptions { bake_texture: Some(128), ..Default::default() }).unwrap();
+        let doc = document(&glb);
+        assert_eq!((report.meshes, report.materials, report.textures, report.triangles), (2, 2, 1, 24));
+        assert_eq!(doc["images"].as_array().unwrap().len(), 1);
+        for material in doc["materials"].as_array().unwrap() {
+            assert_eq!(material["pbrMetallicRoughness"]["baseColorTexture"]["index"], 0);
+        }
+        assert!(doc["meshes"][1]["primitives"][0]["attributes"]["TEXCOORD_0"].is_u64());
+    }
+
+    #[test]
+    fn bake_arguments() {
+        let with = |args: Value| GltfOptions::default().with_args(&args).map(|o| o.bake_texture);
+        assert_eq!(with(json!({})), Ok(None));
+        assert_eq!(with(json!({ "bake_texture": true })), Ok(Some(2048)));
+        assert_eq!(with(json!({ "bake_texture": true, "texture_size": 1024 })), Ok(Some(1024)));
+        assert_eq!(with(json!({ "bake_texture": 4096 })), Ok(Some(4096)));
+        assert_eq!(with(json!({ "bake_texture": 0, "texture_size": 1024 })), Ok(None));
+        assert_eq!(with(json!({ "bake_texture": false })), Ok(None));
+        assert!(with(json!({ "bake_texture": "yes" })).is_err());
+        let scene = shelf();
+        let parts: Vec<&SceneObject> = scene.objects.iter().collect();
+        let error = build_glb(&parts, &GltfOptions { bake_texture: Some(7), ..Default::default() }).unwrap_err();
+        assert!(error.contains("texture size"), "{error}");
+    }
+
+    /// Measures a bake of a real project: `BAKE_SCENE=<project or scene json> cargo test
+    /// --release bake_a_real_scene -- --ignored --nocapture`. `BAKE_OUT` is the folder for
+    /// the `.glb` (default: the temp folder); `BAKE_TRIANGLES` (0 = no budget), `BAKE_SIZE`
+    /// and `BAKE_MERGE` (0 keeps parts separate) are the options.
+    #[test]
+    #[ignore]
+    fn bake_a_real_scene() {
+        let Ok(path) = std::env::var("BAKE_SCENE") else { return };
+        let number = |name: &str, default: usize| {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let out = std::env::var("BAKE_OUT").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let scene = crate::project::load(Path::new(&path)).unwrap().scene;
+        let parts: Vec<&SceneObject> = scene.objects.iter().filter(|o| o.visible).collect();
+        let options = GltfOptions {
+            root_name: "Baked".into(),
+            merge: number("BAKE_MERGE", 1) == 1,
+            godot: true,
+            max_triangles: Some(number("BAKE_TRIANGLES", 20_000)).filter(|&n| n > 0),
+            bake_texture: Some(number("BAKE_SIZE", 4096) as u32),
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let (glb, report) = build_glb(&parts, &options).unwrap();
+        println!(
+            "{} parts, {} -> {} triangles, {} vertices, {} px texture ({} bytes, {:.0} px/m), file {} bytes, {:.2} s",
+            report.parts, report.source_triangles, report.triangles, report.vertices, report.texture_size,
+            report.texture_bytes, report.texels_per_metre, glb.len(), start.elapsed().as_secs_f32()
+        );
+        println!("{:?}", report.warnings);
+        std::fs::write(out.join("baked.glb"), glb).unwrap();
     }
 
     #[test]

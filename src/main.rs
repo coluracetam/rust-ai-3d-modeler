@@ -2,6 +2,7 @@
 
 mod agent_tools;
 mod autosave;
+mod bake;
 mod box_select;
 pub mod codec;
 pub mod camera;
@@ -1007,6 +1008,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 | "mirror_object"
                 | "capture_viewport"
                 | "capture_studio"
+                | "export_model"
         ) || agent_tools::HEAVY.contains(&event.request.tool.as_str())
             || library::HEAVY.contains(&event.request.tool.as_str()))
             && self.background.is_none()
