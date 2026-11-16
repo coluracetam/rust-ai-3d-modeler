@@ -114,6 +114,8 @@ pub struct UiState {
     pub box_rect: Option<egui::Rect>,
     /// The 3D box is being dragged (a handle or a size field) this frame.
     pub volume_dragging: bool,
+    /// Box edits waiting for the drag to end before scheduling a save.
+    pub volume_drag_changed: bool,
     /// Comment targets for the current selection, keyed by `selection_stamp`. Collecting them
     /// walks every selected face, so it only happens when the selection actually changes.
     pub target_sections: Option<(u64, std::sync::Arc<Vec<crate::scene::CommentTargetSection>>)>,
@@ -212,6 +214,7 @@ impl Default for UiState {
             box_through: false,
             box_rect: None,
             volume_dragging: false,
+            volume_drag_changed: false,
             target_sections: None,
             face_path: false,
             collapsed_groups: HashSet::new(),
@@ -252,6 +255,15 @@ fn selection_stamp(scene: &Scene, selection_radius: f32) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     scene.selected_object.hash(&mut h);
     selection_radius.to_bits().hash(&mut h);
+    scene
+        .pending_anchor
+        .map(|(id, world, local, normal)| {
+            (
+                id,
+                [world, local, normal].map(|v| v.to_array().map(f32::to_bits)),
+            )
+        })
+        .hash(&mut h);
     for o in &scene.objects {
         o.id.hash(&mut h);
         o.name.hash(&mut h);
@@ -2171,6 +2183,7 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
         let has_faces = scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty());
         // A 3D box over empty space is a target of its own.
         let volume_only = scene.selection_volume.is_some() && !has_faces;
+        let has_target = has_faces || volume_only || scene.active_object().is_some();
         let sections = if volume_only {
             Default::default()
         } else {
@@ -2181,16 +2194,16 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if volume_only {
                     pill(ui, "3D box", ACCENT);
-                } else if sections.is_empty() {
+                } else if !has_target {
                     pill(ui, "Scene-wide", MUTED);
-                } else {
+                } else if !sections.is_empty() {
                     pill(ui, &plural(sections.len(), "region", "regions"), ACCENT);
                 }
             });
         });
         if volume_only {
             ui.label(small_muted("The box covers no geometry, so the comment is about that space: describe what should be added there."));
-        } else if sections.is_empty() {
+        } else if !has_target {
             ui.label(small_muted("Click a part in the viewport to comment on it, or write feedback for the whole scene."));
         } else {
             // One row per part, however many regions it contributes.
@@ -2299,7 +2312,7 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
                 .margin(egui::vec2(10.0, 8.0))
                 .hint_text(hint(if volume_only {
                     "What should be added or changed inside this box?"
-                } else if sections.is_empty() {
+                } else if !has_target {
                     "Describe a change to the whole scene…"
                 } else {
                     "What should change here? Describe the result you want…"
@@ -2403,13 +2416,13 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
             let verb = if state.auto_send { "Send" } else { "Add" };
             if primary(
                 ui,
-                &if sections.is_empty() && !volume_only { format!("{verb} scene comment") } else { format!("{verb} comment") },
+                &if has_target { format!("{verb} comment") } else { format!("{verb} scene comment") },
                 enabled,
             ) || (submit_key && enabled)
             {
-                post = Some(sections.is_empty() && !volume_only);
+                post = Some(!has_target);
             }
-            if (!sections.is_empty() || volume_only)
+            if has_target
                 && ui
                     .add_enabled(enabled, egui::Button::new("Scene-wide"))
                     .on_hover_text("Post as feedback for the whole scene instead")
@@ -3061,7 +3074,7 @@ fn draw_viewport(
         }
         if was_dragging_volume && !state.volume_dragging {
             // Drag finished: save once and let the comment panel catch up with the selection.
-            state.scene_dirty_for_disk = true;
+            state.scene_dirty_for_disk |= std::mem::take(&mut state.volume_drag_changed);
             ctx.request_repaint();
         }
         viewport_view_controls(ctx, rect, scene, camera, renderer, state);
@@ -3492,6 +3505,7 @@ fn viewport_volume(
         scene.selection_volume = Some(volume);
         scene.apply_volume_selection();
         update_pending_anchor_from_selection(scene);
+        state.volume_drag_changed = true;
     }
 }
 
@@ -3682,6 +3696,7 @@ fn viewport_context_bar(
                                         scene.apply_volume_selection();
                                         update_pending_anchor_from_selection(scene);
                                         // A dragged size field saves once, when the drag ends.
+                                        state.volume_drag_changed |= dragging;
                                         state.scene_dirty_for_disk |= !dragging;
                                     }
                                     state.volume_dragging |= dragging;
@@ -4585,5 +4600,30 @@ fn draw_new_project_dialog(ctx: &egui::Context, scene: &Scene, state: &mut UiSta
         });
     if !open || escape {
         state.confirm_new_project = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composer_refreshes_when_the_same_part_gets_a_new_anchor() {
+        let mut scene = Scene::empty();
+        scene.add_mesh_object("Part", crate::mesh::Mesh::cube(2.0), [0.5; 3]);
+        scene.selected_object = Some(0);
+        let id = scene.objects[0].id;
+
+        let mut state = UiState::default();
+        assert_eq!(
+            current_target_sections(&scene, &mut state)[0].world_anchor,
+            Vec3::ZERO
+        );
+
+        scene.pending_anchor = Some((id, Vec3::X, Vec3::X, Vec3::X));
+        assert_eq!(
+            current_target_sections(&scene, &mut state)[0].world_anchor,
+            Vec3::X
+        );
     }
 }

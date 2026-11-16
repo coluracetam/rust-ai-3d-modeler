@@ -189,6 +189,7 @@ impl ModelerApp {
             self.ui_state.hover_preview_faces.clear();
             self.ui_state.hover_preview_obj_id = None;
             self.ui_state.hover_preview_seed_face = None;
+            self.ui_state.target_sections = None;
             ui::update_pending_anchor_from_selection(&mut self.scene);
             self.saver.request();
         }
@@ -248,6 +249,9 @@ impl ModelerApp {
 
     /// Write everything before the window closes.
     fn flush_saves(&mut self) {
+        if self.ui_state.scene_dirty_for_disk || self.ui_state.volume_drag_changed {
+            self.saver.request();
+        }
         if let Err(e) = self.saver.flush(&mut self.scene, &self.camera) {
             log::error!("Final save failed: {e}");
             eprintln!("Final save failed: {e}");
@@ -1736,6 +1740,24 @@ mod tests {
     use crate::voxel::{
         SculptBrush, SculptSettings, VoxelBrushOp, VoxelGrid, apply_sculpt_stroke, voxel_remesh,
     };
+
+    #[test]
+    fn closing_during_a_volume_drag_saves_the_latest_box() {
+        let mut app = ModelerApp::with_scene(Scene::empty());
+        app.saver = autosave::SceneSaver::new(|scene, _| {
+            assert_eq!(scene.selection_volume.as_ref().unwrap().center, Vec3::X);
+            scene.project_name = "Saved".into();
+            Ok(())
+        });
+        app.scene.selection_volume = Some(crate::scene::SelectionVolume::new(Vec3::X, Vec3::ONE));
+        app.ui_state.volume_dragging = true;
+        app.ui_state.volume_drag_changed = true;
+        assert!(!app.saver.pending());
+
+        app.flush_saves();
+
+        assert_eq!(app.scene.project_name, "Saved");
+    }
 
     #[test]
     fn test_primitives_and_mesh_editing() {
