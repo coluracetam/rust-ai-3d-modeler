@@ -124,7 +124,7 @@ pub fn import_obj_str(content: &str) -> Result<Mesh, String> {
 
     let mut mesh = Mesh::new(positions, faces);
     if has_vertex_colors && colors.len() == mesh.positions.len() {
-        mesh.colors = colors;
+        mesh.colors = colors.into();
     }
     Ok(mesh)
 }

@@ -17,14 +17,10 @@ pub enum SmartSelectMode {
     SmartSurface,
     /// 1-click selects all faces of the clicked object layer.
     WholeLayer,
-    /// Click & drag spherical brush selection.
-    Brush,
     /// Drag a screen-space rectangle; every visible face inside it is selected.
     Box,
     /// Click single polygons; with Path on, a click fills the run of faces from the last pick.
     Face,
-    /// Drag a freehand outline; faces inside it are selected.
-    Lasso,
     /// A world-space 3D box with handles; everything inside it is selected from any angle.
     Volume,
 }
@@ -35,17 +31,15 @@ impl SmartSelectMode {
             Self::SubPart => "Part",
             Self::SmartSurface => "Surface",
             Self::WholeLayer => "Layer",
-            Self::Brush => "Brush",
             Self::Box => "Box",
             Self::Face => "Face",
-            Self::Lasso => "Lasso",
             Self::Volume => "3D box",
         }
     }
 
     /// Modes driven by dragging rather than by a hover-previewed click.
     pub fn is_drag(self) -> bool {
-        matches!(self, Self::Brush | Self::Box | Self::Lasso)
+        matches!(self, Self::Box)
     }
 }
 
@@ -118,8 +112,11 @@ pub struct UiState {
     pub box_through: bool,
     /// Rectangle being dragged by the box selector, in egui points.
     pub box_rect: Option<egui::Rect>,
-    /// Outline being dragged by the lasso selector, in egui points.
-    pub lasso_points: Vec<egui::Pos2>,
+    /// The 3D box is being dragged (a handle or a size field) this frame.
+    pub volume_dragging: bool,
+    /// Comment targets for the current selection, keyed by `selection_stamp`. Collecting them
+    /// walks every selected face, so it only happens when the selection actually changes.
+    pub target_sections: Option<(u64, std::sync::Arc<Vec<crate::scene::CommentTargetSection>>)>,
     /// Face mode: a click fills the shortest run of faces from the previous pick.
     pub face_path: bool,
     /// Outliner groups ("Group/Part" names) the user has folded.
@@ -214,7 +211,8 @@ impl Default for UiState {
             prev_select_mode: SmartSelectMode::SubPart,
             box_through: false,
             box_rect: None,
-            lasso_points: Vec::new(),
+            volume_dragging: false,
+            target_sections: None,
             face_path: false,
             collapsed_groups: HashSet::new(),
             frame_point: None,
@@ -245,6 +243,51 @@ impl UiState {
             || self.show_io_modal
             || self.lightbox.is_some()
             || self.palette_open
+    }
+}
+
+/// Fingerprint of everything `Scene::collect_current_target_sections` depends on.
+fn selection_stamp(scene: &Scene, selection_radius: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    scene.selected_object.hash(&mut h);
+    selection_radius.to_bits().hash(&mut h);
+    for o in &scene.objects {
+        o.id.hash(&mut h);
+        o.name.hash(&mut h);
+        o.mesh.version.hash(&mut h);
+        o.mesh.selected_faces.len().hash(&mut h);
+        o.transform.matrix().to_cols_array().map(f32::to_bits).hash(&mut h);
+    }
+    // Order-independent: the labels live in a hash map.
+    let labels = scene.region_labels.iter().fold(0u64, |acc, entry| {
+        let mut e = std::collections::hash_map::DefaultHasher::new();
+        entry.hash(&mut e);
+        acc.wrapping_add(e.finish())
+    });
+    labels.hash(&mut h);
+    h.finish()
+}
+
+/// Comment targets for the current selection, recomputed only when the selection changes.
+/// While the 3D box is being dragged the previous result is reused, so a drag over a dense
+/// scene is not slowed down by regrouping hundreds of thousands of faces every frame.
+fn current_target_sections(
+    scene: &Scene,
+    state: &mut UiState,
+) -> std::sync::Arc<Vec<crate::scene::CommentTargetSection>> {
+    if let (true, Some((_, sections))) = (state.volume_dragging, &state.target_sections) {
+        return sections.clone();
+    }
+    let stamp = selection_stamp(scene, state.selection_radius);
+    match &state.target_sections {
+        Some((key, sections)) if *key == stamp => sections.clone(),
+        _ => {
+            let sections =
+                std::sync::Arc::new(scene.collect_current_target_sections(state.selection_radius));
+            state.target_sections = Some((stamp, sections.clone()));
+            sections
+        }
     }
 }
 
@@ -2125,11 +2168,14 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
     // Composer
     card().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let sections = scene.collect_current_target_sections(state.selection_radius);
         let has_faces = scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty());
         // A 3D box over empty space is a target of its own.
         let volume_only = scene.selection_volume.is_some() && !has_faces;
-        let sections = if volume_only { Vec::new() } else { sections };
+        let sections = if volume_only {
+            Default::default()
+        } else {
+            current_target_sections(scene, state)
+        };
         ui.horizontal(|ui| {
             eyebrow(ui, "New comment");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2149,7 +2195,7 @@ fn comments_tab(ui: &mut egui::Ui, scene: &mut Scene, state: &mut UiState, compa
         } else {
             // One row per part, however many regions it contributes.
             let mut groups: Vec<(u64, String, usize, usize)> = Vec::new();
-            for t in &sections {
+            for t in sections.iter() {
                 match groups.iter_mut().find(|g| g.0 == t.object_id) {
                     Some(g) => {
                         g.2 += 1;
@@ -3007,10 +3053,16 @@ fn draw_viewport(
             *view_changed = true;
         }
 
+        let was_dragging_volume = std::mem::take(&mut state.volume_dragging);
         viewport_tool_strip(ctx, rect, scene, camera, state, comparing);
         viewport_context_bar(ctx, rect, scene, state, comparing);
         if !comparing && !state.fly_active {
             viewport_volume(ctx, ui, rect, scene, camera, state);
+        }
+        if was_dragging_volume && !state.volume_dragging {
+            // Drag finished: save once and let the comment panel catch up with the selection.
+            state.scene_dirty_for_disk = true;
+            ctx.request_repaint();
         }
         viewport_view_controls(ctx, rect, scene, camera, renderer, state);
         viewport_axis_gizmo(ctx, rect, camera);
@@ -3220,14 +3272,6 @@ fn draw_viewport(
             painter.rect_filled(r, 2.0, ACCENT.gamma_multiply(0.10));
             painter.rect_stroke(r, 2.0, egui::Stroke::new(1.5_f32, ACCENT), egui::StrokeKind::Inside);
         }
-        if state.lasso_points.len() >= 2 {
-            let mut outline = state.lasso_points.clone();
-            if outline.len() >= 3 {
-                outline.push(outline[0]);
-            }
-            painter.add(egui::Shape::line(outline.clone(), egui::Stroke::new(3.5_f32, Color32::from_black_alpha(110))));
-            painter.add(egui::Shape::line(outline, egui::Stroke::new(1.5_f32, ACCENT)));
-        }
         if state.fly_active {
             let c = rect.center();
             let stroke = egui::Stroke::new(1.5_f32, Color32::from_white_alpha(220));
@@ -3274,10 +3318,8 @@ fn draw_viewport(
                 SmartSelectMode::SubPart => "Click a connected piece to select it",
                 SmartSelectMode::SmartSurface => "Click a surface · the crease angle sets its edges",
                 SmartSelectMode::WholeLayer => "Click an object to select all of it",
-                SmartSelectMode::Brush => "Drag to paint · Ctrl+drag erases · [ ] radius",
                 SmartSelectMode::Box => "Drag boxes over each place to change · Shift adds · Ctrl removes · each separate patch becomes its own AI target",
                 SmartSelectMode::Face => "Click polygons one at a time · Ctrl+click removes · turn on Path to fill between two clicks",
-                SmartSelectMode::Lasso => "Draw around the faces to select · Shift adds · Ctrl removes",
                 SmartSelectMode::Volume => "Click a surface to place the 3D box · drag coloured handles to resize, the centre to move · it can sit in empty space",
             }
             .to_string()
@@ -3313,10 +3355,8 @@ fn mode_icon(mode: SmartSelectMode) -> &'static str {
         SmartSelectMode::SubPart => icon::CUBE,
         SmartSelectMode::SmartSurface => icon::POLYGON,
         SmartSelectMode::WholeLayer => icon::STACK,
-        SmartSelectMode::Brush => icon::PAINT_BRUSH,
         SmartSelectMode::Box => icon::SELECTION,
         SmartSelectMode::Face => icon::TRIANGLE,
-        SmartSelectMode::Lasso => icon::LASSO,
         SmartSelectMode::Volume => icon::BOUNDING_BOX,
     }
 }
@@ -3342,6 +3382,7 @@ fn viewport_volume(
     let Some(mut volume) = scene.selection_volume.clone() else {
         return;
     };
+    let placed = volume.clone();
     let viewport = Vec2::new(rect.width(), rect.height());
     let to_screen = |p: Vec3| {
         camera
@@ -3377,7 +3418,6 @@ fn viewport_volume(
         return;
     }
 
-    let mut changed = false;
     let pointer_ray = |p: egui::Pos2| {
         camera.screen_ray(Vec2::new(p.x - rect.left(), p.y - rect.top()), viewport)
     };
@@ -3416,13 +3456,13 @@ fn viewport_volume(
                 5.5,
                 &format!("Drag to resize along {}", ["X", "Y", "Z"][axis]),
             );
+            state.volume_dragging |= resp.dragged();
             if let (true, Some(p)) = (resp.dragged(), resp.interact_pointer_pos()) {
                 let mut dir = Vec3::ZERO;
                 dir[axis] = 1.0;
                 let t = pointer_ray(p).closest_t_on_axis(volume.center, dir);
                 if t.is_finite() {
                     volume.move_face(axis, positive, volume.center[axis] + t);
-                    changed = true;
                 }
             }
         }
@@ -3435,22 +3475,23 @@ fn viewport_volume(
             6.5,
             "Drag to move the box",
         );
+        state.volume_dragging |= resp.dragged();
         if let (true, Some(p)) = (resp.dragged(), resp.interact_pointer_pos()) {
             let ray = pointer_ray(p);
             if let Some(t) = ray.intersect_plane(volume.center, camera.forward()) {
                 let hit = ray.at(t);
                 if hit.is_finite() {
                     volume.center = hit;
-                    changed = true;
                 }
             }
         }
     }
-    if changed {
+    // A held handle reports a drag every frame; only redo the selection when the box moved.
+    // The project is saved once, when the drag ends (see `viewport`).
+    if volume != placed {
         scene.selection_volume = Some(volume);
         scene.apply_volume_selection();
         update_pending_anchor_from_selection(scene);
-        state.scene_dirty_for_disk = true;
     }
 }
 
@@ -3476,11 +3517,9 @@ fn viewport_tool_strip(
                             ("1", SmartSelectMode::SubPart, "Click selects one connected piece"),
                             ("2", SmartSelectMode::SmartSurface, "Click selects a surface bounded by sharp edges"),
                             ("3", SmartSelectMode::WholeLayer, "Click selects the entire object"),
-                            ("4", SmartSelectMode::Brush, "Drag to paint a selection; Ctrl+drag erases"),
-                            ("5", SmartSelectMode::Box, "Drag rectangles over the places to change; Shift adds, Ctrl removes  ·  Ctrl+C"),
-                            ("6", SmartSelectMode::Face, "Click single polygons; Path fills the faces between two clicks"),
-                            ("7", SmartSelectMode::Lasso, "Draw a freehand outline around the faces to select"),
-                            ("8", SmartSelectMode::Volume, "Place a 3D box and resize it; selects everything inside from any angle, and can mark empty space"),
+                            ("4", SmartSelectMode::Box, "Drag rectangles over the places to change; Shift adds, Ctrl removes  ·  Ctrl+C"),
+                            ("5", SmartSelectMode::Face, "Click single polygons; Path fills the faces between two clicks"),
+                            ("6", SmartSelectMode::Volume, "Place a 3D box and resize it; selects everything inside from any angle, and can mark empty space"),
                         ] {
                             let selected = state.select_mode == mode && !state.measure_active;
                             let resp = icon_button(ui, mode_icon(mode), "", selected, !comparing);
@@ -3587,18 +3626,10 @@ fn viewport_context_bar(
                                         state.hover_preview_seed_face = None;
                                     }
                                 }
-                                SmartSelectMode::Brush => {
-                                    vdivider(ui);
-                                    ui.label(small_muted("Radius"));
-                                    ui.spacing_mut().slider_width = 90.0;
-                                    ui.add(egui::Slider::new(&mut state.selection_radius, 0.05..=2.5))
-                                        .on_hover_text("Brush radius  ·  [ and ] adjust");
-                                    state.sculpt.radius = state.selection_radius;
-                                }
-                                SmartSelectMode::Box | SmartSelectMode::Lasso => {
+                                SmartSelectMode::Box => {
                                     vdivider(ui);
                                     toggle(ui, &mut state.box_through, "Through")
-                                        .on_hover_text("Also pick faces hidden behind other geometry inside the outline");
+                                        .on_hover_text("Also pick faces hidden behind other geometry inside the box");
                                 }
                                 SmartSelectMode::Face => {
                                     vdivider(ui);
@@ -3611,6 +3642,7 @@ fn viewport_context_bar(
                                     let units = scene.units.clone();
                                     let mut changed = false;
                                     let mut remove = false;
+                                    let mut dragging = false;
                                     if let Some(volume) = scene.selection_volume.as_mut() {
                                         ui.label(small_muted("Size"));
                                         for axis in 0..3 {
@@ -3622,6 +3654,7 @@ fn viewport_context_bar(
                                                     .max_decimals(2)
                                                     .prefix(["X ", "Y ", "Z "][axis]),
                                             );
+                                            dragging |= resp.dragged();
                                             if resp.on_hover_text(format!("Box size in {units}")).changed() {
                                                 volume.half_extents[axis] = (v / factor * 0.5)
                                                     .max(crate::scene::SelectionVolume::MIN_HALF);
@@ -3648,8 +3681,10 @@ fn viewport_context_bar(
                                     } else if changed {
                                         scene.apply_volume_selection();
                                         update_pending_anchor_from_selection(scene);
-                                        state.scene_dirty_for_disk = true;
+                                        // A dragged size field saves once, when the drag ends.
+                                        state.scene_dirty_for_disk |= !dragging;
                                     }
+                                    state.volume_dragging |= dragging;
                                 }
                                 _ => {}
                             }
@@ -3708,7 +3743,7 @@ fn viewport_selection_chip(
                                     .min_size(egui::vec2(28.0, 28.0)),
                             )
                             .on_hover_text(tip)
-                            .on_disabled_hover_text("Select faces (Part, Surface, Brush or Box) to grow or shrink")
+                            .on_disabled_hover_text("Select faces (Part, Surface, Face or Box) to grow or shrink")
                             .clicked()
                         };
                         if small(ui, icon::PLUS_CIRCLE, "Grow selection by one ring  ·  ]", has_faces) {
@@ -3983,11 +4018,9 @@ fn draw_command_palette(
         (icon::CUBE, "Select: Part".into(), "1", !comparing, Cmd::Mode(SmartSelectMode::SubPart)),
         (icon::POLYGON, "Select: Surface".into(), "2", !comparing, Cmd::Mode(SmartSelectMode::SmartSurface)),
         (icon::STACK, "Select: Layer (whole object)".into(), "3", !comparing, Cmd::Mode(SmartSelectMode::WholeLayer)),
-        (icon::PAINT_BRUSH, "Select: Brush".into(), "4", !comparing, Cmd::Mode(SmartSelectMode::Brush)),
-        (icon::SELECTION, "Select: Box".into(), "5", !comparing, Cmd::Mode(SmartSelectMode::Box)),
-        (icon::TRIANGLE, "Select: Face (single polygons)".into(), "6", !comparing, Cmd::Mode(SmartSelectMode::Face)),
-        (icon::LASSO, "Select: Lasso".into(), "7", !comparing, Cmd::Mode(SmartSelectMode::Lasso)),
-        (icon::BOUNDING_BOX, "Select: 3D box (volume)".into(), "8", !comparing, Cmd::Mode(SmartSelectMode::Volume)),
+        (icon::SELECTION, "Select: Box".into(), "4", !comparing, Cmd::Mode(SmartSelectMode::Box)),
+        (icon::TRIANGLE, "Select: Face (single polygons)".into(), "5", !comparing, Cmd::Mode(SmartSelectMode::Face)),
+        (icon::BOUNDING_BOX, "Select: 3D box (volume)".into(), "6", !comparing, Cmd::Mode(SmartSelectMode::Volume)),
         (icon::X_CIRCLE, "Clear selection".into(), "Esc", scene.has_any_selection(), Cmd::ClearSelection),
         (icon::CHAT_CIRCLE_TEXT, "Comment on selection".into(), "", !comparing, Cmd::Comment),
         (icon::PAPER_PLANE_TILT, format!("Send {} to the agent", plural(drafts, "draft", "drafts")), "", drafts > 0, Cmd::SendDrafts),
@@ -4378,8 +4411,8 @@ fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
                     (
                         "Select",
                         &[
-                            ("1  2  3  4  5", "Part · Surface · Layer · Brush · Box"),
-                            ("6  7  8", "Face · Lasso · 3D box"),
+                            ("1  2  3", "Part · Surface · Layer"),
+                            ("4  5  6", "Box · Face · 3D box"),
                             ("3D box", "Click a surface to place it, drag handles to resize"),
                             ("I", "Invert selection"),
                             ("Ctrl + C", "Toggle the box selector"),
@@ -4388,7 +4421,7 @@ fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
                             ("Shift + click", "Add to selection"),
                             ("Ctrl + click", "Remove from selection"),
                             ("A", "Select all faces of the active part"),
-                            ("]  /  [", "Grow / shrink selection (brush radius)"),
+                            ("]  /  [", "Grow / shrink selection"),
                             ("Esc  or  C", "Clear selection"),
                         ][..],
                     ),

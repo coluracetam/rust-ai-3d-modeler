@@ -91,7 +91,6 @@ pub struct ModelerApp {
     left_mouse_down: bool,
     middle_mouse_down: bool,
     right_mouse_down: bool,
-    stroke_active: bool,
     last_sculpt_local_hit: Option<Vec3>,
     hover_brush_world: Option<(Vec3, Vec3)>,
     /// Window-pixel start of an in-progress box selection drag.
@@ -132,7 +131,6 @@ impl ModelerApp {
             left_mouse_down: false,
             middle_mouse_down: false,
             right_mouse_down: false,
-            stroke_active: false,
             last_sculpt_local_hit: None,
             hover_brush_world: None,
             box_drag_start: None,
@@ -272,11 +270,8 @@ impl ModelerApp {
                 self.ui_state.status_message = "Measurement point placed".into();
                 return;
             }
-            if matches!(
-                self.ui_state.select_mode,
-                SmartSelectMode::Box | SmartSelectMode::Lasso
-            ) {
-                self.begin_drag_select();
+            if self.ui_state.select_mode == SmartSelectMode::Box {
+                self.box_drag_start = Some(self.cursor_pos);
                 return;
             }
             if self.ui_state.select_mode == SmartSelectMode::Volume {
@@ -293,7 +288,6 @@ impl ModelerApp {
             }
 
             self.scene.selected_object = Some(hit.object_idx);
-            self.stroke_active = true;
 
             let already_selected = self.scene.objects.get(hit.object_idx).map_or(false, |o| {
                 o.mesh.selected_faces.contains(&hit.local_hit.face_idx)
@@ -303,7 +297,6 @@ impl ModelerApp {
                 true
             } else if self.ui_state.multi_select
                 && !self.modifiers.shift_key()
-                && self.ui_state.select_mode != SmartSelectMode::Brush
                 && already_selected
             {
                 // In Multi-Select mode, clicking an already-selected sub-part or surface toggles it off!
@@ -316,12 +309,10 @@ impl ModelerApp {
 
             self.apply_section_selection_at_hit(&hit, additive, subtract);
             self.persist();
-        } else if matches!(
-            self.ui_state.select_mode,
-            SmartSelectMode::Box | SmartSelectMode::Lasso
-        ) && !self.ui_state.measure_active
+        } else if self.ui_state.select_mode == SmartSelectMode::Box
+            && !self.ui_state.measure_active
         {
-            self.begin_drag_select();
+            self.box_drag_start = Some(self.cursor_pos);
         } else if self.ui_state.select_mode == SmartSelectMode::Volume {
             // Clicking empty space keeps the box; drag its handles or click a surface to move it.
         } else if !self.modifiers.shift_key()
@@ -332,22 +323,6 @@ impl ModelerApp {
             self.scene.selection_volume = None;
             self.scene.selected_object = None;
             self.persist();
-        }
-    }
-
-    /// Start a box or lasso drag at the cursor.
-    fn begin_drag_select(&mut self) {
-        self.box_drag_start = Some(self.cursor_pos);
-        self.ui_state.lasso_points.clear();
-        if self.ui_state.select_mode == SmartSelectMode::Lasso {
-            let scale = self
-                .gpu
-                .as_ref()
-                .map(|g| g.egui_ctx.pixels_per_point())
-                .unwrap_or(1.0);
-            self.ui_state
-                .lasso_points
-                .push(egui::pos2(self.cursor_pos.x / scale, self.cursor_pos.y / scale));
         }
     }
 
@@ -388,7 +363,6 @@ impl ModelerApp {
     ) {
         let select_mode = self.ui_state.select_mode;
         let crease_deg = self.ui_state.crease_angle_deg;
-        let radius = self.ui_state.selection_radius;
         let face_path = self.ui_state.face_path;
         let last_pick = self.ui_state.last_face_pick;
         let mut new_pick = last_pick;
@@ -413,7 +387,7 @@ impl ModelerApp {
                         obj.mesh.select_all(EditElementMode::Face);
                     }
                 }
-                SmartSelectMode::Box | SmartSelectMode::Lasso | SmartSelectMode::Volume => {}
+                SmartSelectMode::Box | SmartSelectMode::Volume => {}
                 SmartSelectMode::Face => {
                     // With Path on, a click fills the shortest run of faces from the last pick.
                     let from = last_pick.filter(|(id, f)| {
@@ -435,21 +409,6 @@ impl ModelerApp {
                         subtract && !path_fill,
                     );
                     new_pick = (!subtract || path_fill).then_some((obj.id, seed_face));
-                }
-                SmartSelectMode::Brush => {
-                    let avg_scale = ((obj.transform.scale.x.abs()
-                        + obj.transform.scale.y.abs()
-                        + obj.transform.scale.z.abs())
-                        / 3.0)
-                        .max(0.01);
-                    let local_radius = radius / avg_scale;
-                    obj.mesh.select_faces_in_sphere(
-                        hit.local_hit.point,
-                        local_radius,
-                        Some(seed_face),
-                        additive,
-                        subtract,
-                    );
                 }
             }
 
@@ -522,10 +481,7 @@ impl ModelerApp {
                 .compute_smart_surface(seed_face, self.ui_state.crease_angle_deg),
             SmartSelectMode::WholeLayer => (0..obj.mesh.faces.len()).collect(),
             SmartSelectMode::Face => std::iter::once(seed_face).collect(),
-            SmartSelectMode::Brush
-            | SmartSelectMode::Box
-            | SmartSelectMode::Lasso
-            | SmartSelectMode::Volume => std::collections::HashSet::new(),
+            SmartSelectMode::Box | SmartSelectMode::Volume => std::collections::HashSet::new(),
         };
     }
 
@@ -557,22 +513,10 @@ impl ModelerApp {
                 .as_ref()
                 .map(|g| g.egui_ctx.pixels_per_point())
                 .unwrap_or(1.0);
-            if self.ui_state.select_mode == SmartSelectMode::Lasso {
-                let p = egui::pos2(new_pos.x / scale, new_pos.y / scale);
-                if self
-                    .ui_state
-                    .lasso_points
-                    .last()
-                    .is_none_or(|last| last.distance(p) > 2.5)
-                {
-                    self.ui_state.lasso_points.push(p);
-                }
-            } else {
-                self.ui_state.box_rect = Some(egui::Rect::from_two_pos(
-                    egui::pos2(start.x / scale, start.y / scale),
-                    egui::pos2(new_pos.x / scale, new_pos.y / scale),
-                ));
-            }
+            self.ui_state.box_rect = Some(egui::Rect::from_two_pos(
+                egui::pos2(start.x / scale, start.y / scale),
+                egui::pos2(new_pos.x / scale, new_pos.y / scale),
+            ));
             self.hover_brush_world = None;
             self.update_hover_preview(None);
             return;
@@ -582,7 +526,7 @@ impl ModelerApp {
         self.pointer_dirty = true;
     }
 
-    /// Per-frame pointer work: hover preview, brush painting, and fly-mode look.
+    /// Per-frame pointer work: hover preview and fly-mode look.
     fn process_pointer(&mut self) {
         if self.ui_state.fly_active {
             let look = std::mem::take(&mut self.fly_look_delta);
@@ -608,16 +552,7 @@ impl ModelerApp {
             return;
         }
 
-        // 2. Continuous Section Paint Selection while dragging in Brush mode (or Shift/Ctrl drag)
-        if self.left_mouse_down
-            && self.stroke_active
-            && self.ui_state.select_mode == SmartSelectMode::Brush
-        {
-            if let Some(hit) = self.scene.raycast_active(&ray) {
-                let subtract = self.modifiers.control_key();
-                self.apply_section_selection_at_hit(&hit, true, subtract);
-            }
-        } else if let Some(hit) = self.scene.raycast(&ray) {
+        if let Some(hit) = self.scene.raycast(&ray) {
             self.hover_brush_world = Some((hit.world_point, hit.world_normal));
             self.update_hover_preview(Some(&hit));
         } else {
@@ -641,7 +576,6 @@ impl ModelerApp {
         }
         if code == KeyCode::Escape && self.box_drag_start.take().is_some() {
             self.ui_state.box_rect = None;
-            self.ui_state.lasso_points.clear();
             self.ui_state.status_message = "Selection drag cancelled".into();
             return;
         }
@@ -669,23 +603,15 @@ impl ModelerApp {
                 self.ui_state.hover_preview_seed_face = None;
             }
             KeyCode::Digit4 => {
-                self.ui_state.select_mode = SmartSelectMode::Brush;
-                self.ui_state.hover_preview_seed_face = None;
-            }
-            KeyCode::Digit5 => {
                 if self.ui_state.select_mode != SmartSelectMode::Box {
                     self.toggle_box_select();
                 }
             }
-            KeyCode::Digit6 => {
+            KeyCode::Digit5 => {
                 self.ui_state.select_mode = SmartSelectMode::Face;
                 self.ui_state.hover_preview_seed_face = None;
             }
-            KeyCode::Digit7 => {
-                self.ui_state.select_mode = SmartSelectMode::Lasso;
-                self.update_hover_preview(None);
-            }
-            KeyCode::Digit8 => {
+            KeyCode::Digit6 => {
                 self.ui_state.select_mode = SmartSelectMode::Volume;
                 self.update_hover_preview(None);
                 self.ui_state.status_message =
@@ -711,11 +637,9 @@ impl ModelerApp {
                 self.ui_state.select_mode = match self.ui_state.select_mode {
                     SmartSelectMode::SubPart => SmartSelectMode::SmartSurface,
                     SmartSelectMode::SmartSurface => SmartSelectMode::WholeLayer,
-                    SmartSelectMode::WholeLayer => SmartSelectMode::Brush,
-                    SmartSelectMode::Brush => SmartSelectMode::Box,
+                    SmartSelectMode::WholeLayer => SmartSelectMode::Box,
                     SmartSelectMode::Box => SmartSelectMode::Face,
-                    SmartSelectMode::Face => SmartSelectMode::Lasso,
-                    SmartSelectMode::Lasso => SmartSelectMode::Volume,
+                    SmartSelectMode::Face => SmartSelectMode::Volume,
                     SmartSelectMode::Volume => SmartSelectMode::SubPart,
                 };
                 self.ui_state.hover_preview_seed_face = None;
@@ -748,10 +672,6 @@ impl ModelerApp {
                 if shrunk {
                     update_pending_anchor_from_selection(&mut self.scene);
                     self.persist();
-                } else if self.ui_state.select_mode == SmartSelectMode::Brush {
-                    self.ui_state.selection_radius =
-                        (self.ui_state.selection_radius - 0.05).max(0.05);
-                    self.ui_state.sculpt.radius = self.ui_state.selection_radius;
                 }
             }
             KeyCode::BracketRight => {
@@ -764,10 +684,6 @@ impl ModelerApp {
                 if grown {
                     update_pending_anchor_from_selection(&mut self.scene);
                     self.persist();
-                } else if self.ui_state.select_mode == SmartSelectMode::Brush {
-                    self.ui_state.selection_radius =
-                        (self.ui_state.selection_radius + 0.05).min(2.50);
-                    self.ui_state.sculpt.radius = self.ui_state.selection_radius;
                 }
             }
             _ => {}
@@ -818,31 +734,16 @@ impl ModelerApp {
             box_select::BoxOp::Replace
         };
         let viewport = self.viewport_size();
-        let lasso: Vec<Vec2> = std::mem::take(&mut self.ui_state.lasso_points)
-            .iter()
-            .map(|p| Vec2::new(p.x * scale, p.y * scale) - origin)
-            .collect();
-        let tool = if lasso.len() >= 3 { "Lasso" } else { "Box" };
-        let outcome = if lasso.len() >= 3 {
-            box_select::apply_lasso_selection(
-                &mut self.scene,
-                &self.camera,
-                viewport,
-                &lasso,
-                self.ui_state.box_through,
-                op,
-            )
-        } else {
-            box_select::apply_box_selection(
-                &mut self.scene,
-                &self.camera,
-                viewport,
-                start - origin,
-                self.cursor_pos - origin,
-                self.ui_state.box_through,
-                op,
-            )
-        };
+        let tool = "Box";
+        let outcome = box_select::apply_box_selection(
+            &mut self.scene,
+            &self.camera,
+            viewport,
+            start - origin,
+            self.cursor_pos - origin,
+            self.ui_state.box_through,
+            op,
+        );
         if outcome.selected_faces > 0 {
             update_pending_anchor_from_selection(&mut self.scene);
         }
@@ -903,7 +804,6 @@ impl ModelerApp {
         self.left_mouse_down = false;
         self.middle_mouse_down = false;
         self.right_mouse_down = false;
-        self.stroke_active = false;
         self.ui_state.fly_active = on;
         if on {
             self.camera.orthographic = false;
@@ -1001,7 +901,6 @@ impl ModelerApp {
                         self.handle_viewport_left_press();
                         // A box press in fly mode selects the face under the crosshair.
                         self.finish_box_select();
-                        self.stroke_active = false;
                     }
                     MouseButton::Right if pressed => self.set_fly(false),
                     _ => {}
@@ -1444,11 +1343,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                             self.handle_viewport_left_press();
                         } else if !pressed {
                             self.finish_box_select();
-                            if self.stroke_active {
-                                self.persist();
-                            }
                             self.gizmo.end_drag();
-                            self.stroke_active = false;
                             self.last_sculpt_local_hit = None;
                         }
                     }
@@ -1625,12 +1520,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                             label: Some("Main Frame Encoder"),
                         });
 
-                let brush_cursor = if self.ui_state.select_mode == SmartSelectMode::Brush {
-                    self.hover_brush_world
-                        .map(|(p, n)| (p, n, self.ui_state.selection_radius))
-                } else {
-                    self.hover_brush_world.map(|(p, n)| (p, n, 0.12))
-                };
+                let brush_cursor = self.hover_brush_world.map(|(p, n)| (p, n, 0.12));
 
                 let hover_preview = self
                     .ui_state
