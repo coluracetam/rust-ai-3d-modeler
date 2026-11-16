@@ -173,6 +173,22 @@ fn asset_info(dir: &Path, section: &str, subsection: &str, name: &str) -> AssetI
     }
 }
 
+fn asset_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.file_name();
+            let name = file.to_str()?.strip_suffix(ASSET_EXT)?;
+            (entry.path().is_file() && !name.is_empty() && !name.starts_with('.'))
+                .then(|| name.to_string())
+        })
+        .collect();
+    names.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
+    names
+}
+
 /// Every section, subsection and asset, sorted by name. A missing library is an empty one.
 pub fn list(root: &Path) -> Vec<Section> {
     sorted_dirs(root)
@@ -180,25 +196,12 @@ pub fn list(root: &Path) -> Vec<Section> {
         .map(|(section, section_dir)| Section {
             subsections: sorted_dirs(&section_dir)
                 .into_iter()
-                .map(|(subsection, dir)| {
-                    let mut names: Vec<String> = fs::read_dir(&dir)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .filter_map(|e| {
-                            let file = e.file_name().to_str()?.to_string();
-                            Some(file.strip_suffix(ASSET_EXT)?.to_string())
-                        })
-                        .filter(|name| !name.is_empty() && !name.starts_with('.'))
-                        .collect();
-                    names.sort_by_key(|n| n.to_lowercase());
-                    Subsection {
-                        assets: names
-                            .iter()
-                            .map(|name| asset_info(&dir, &section, &subsection, name))
-                            .collect(),
-                        name: subsection,
-                    }
+                .map(|(subsection, dir)| Subsection {
+                    assets: asset_names(&dir)
+                        .iter()
+                        .map(|name| asset_info(&dir, &section, &subsection, name))
+                        .collect(),
+                    name: subsection,
                 })
                 .collect(),
             name: section,
@@ -264,7 +267,7 @@ pub fn delete_section(root: &Path, section: &str, subsection: Option<&str>) -> R
 pub fn find_asset(root: &Path, reference: &str) -> Result<AssetInfo, String> {
     let parts: Vec<&str> = reference.split('/').map(str::trim).collect();
     let all = || list(root).into_iter().flat_map(|s| s.subsections).flat_map(|s| s.assets);
-    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
     let found: Vec<AssetInfo> = match parts.as_slice() {
         [section, subsection, name] => all()
             .filter(|a| same(&a.section, section) && same(&a.subsection, subsection) && same(&a.name, name))
@@ -272,6 +275,13 @@ pub fn find_asset(root: &Path, reference: &str) -> Result<AssetInfo, String> {
         [name] => all().filter(|a| same(&a.name, name)).collect(),
         _ => return Err("Name the asset as 'Section/Subsection/Name'".into()),
     };
+    if let [section, subsection, name] = parts.as_slice() {
+        if let Some(exact) = found.iter().find(|a| {
+            a.section == *section && a.subsection == *subsection && a.name == *name
+        }) {
+            return Ok(exact.clone());
+        }
+    }
     match found.len() {
         0 => Err(format!("No library asset named '{reference}'")),
         1 => Ok(found.into_iter().next().unwrap()),
@@ -322,12 +332,21 @@ pub fn save_asset(root: &Path, scene: &Scene, indices: &[usize], options: SaveOp
     }
     let dir = create_section(root, &section, Some(&subsection))?;
     let (section, subsection) = folder_names(&dir, section, subsection);
-    let path = dir.join(format!("{name}{ASSET_EXT}"));
-    if path.exists() && !options.overwrite {
-        return Err(format!(
+    let folded_name = name.to_lowercase();
+    let matching: Vec<String> = asset_names(&dir)
+        .into_iter()
+        .filter(|existing| existing.to_lowercase() == folded_name)
+        .collect();
+    let name = match matching.as_slice() {
+        [] => name,
+        _ if !options.overwrite => return Err(format!(
             "'{section}/{subsection}/{name}' already exists; pick another name or overwrite it"
-        ));
-    }
+        )),
+        [existing] => existing.clone(),
+        _ if matching.contains(&name) => name,
+        _ => return Err("Several assets match that name. Enter the exact name to replace it.".into()),
+    };
+    let path = dir.join(format!("{name}{ASSET_EXT}"));
     let meta = AssetMeta {
         description: options.description.trim().to_string(),
         tags: options.tags,
@@ -359,6 +378,8 @@ pub fn load_asset(info: &AssetInfo) -> Result<Asset, String> {
     if asset.format_version != 1 {
         return Err("Unsupported asset version".into());
     }
+    // The library filename is authoritative after an asset is renamed or moved.
+    asset.name.clone_from(&info.name);
     // Reuse the project checks (finite positions, face indices, voxel grids, transforms).
     let mut check = Scene::empty();
     for (i, object) in asset.objects.iter_mut().enumerate() {
@@ -439,7 +460,11 @@ pub fn move_asset(root: &Path, info: &AssetInfo, section: &str, subsection: &str
     if target == Path::new(&info.path) {
         return Ok(info.clone());
     }
-    if target.exists() {
+    let folded_name = name.to_lowercase();
+    if target.exists() || asset_names(&dir).iter().any(|existing| {
+        existing.to_lowercase() == folded_name
+            && dir.join(format!("{existing}{ASSET_EXT}")) != Path::new(&info.path)
+    }) {
         return Err(format!("'{section}/{subsection}/{name}' already exists"));
     }
     let _ = fs::remove_file(dir.join(format!("{name}{THUMB_EXT}")));
@@ -767,6 +792,12 @@ mod tests {
         assert_eq!((info.parts, info.faces), (2, 12));
         assert_eq!(info.reference(), "Furniture/Chairs/Oak chair");
         assert!(save_asset(&root, &scene, &[0, 1], options("furniture", "CHAIRS", "Oak chair")).is_err());
+        assert!(save_asset(&root, &scene, &[0, 1], options("furniture", "CHAIRS", "OAK CHAIR")).is_err());
+        let replaced = save_asset(&root, &scene, &[0, 1], SaveOptions {
+            overwrite: true,
+            ..options("Furniture", "Chairs", "OAK CHAIR")
+        }).unwrap();
+        assert_eq!(replaced.reference(), info.reference());
         let lamp = save_asset(&root, &scene, &[2], options("furniture", "Lighting", "Lamp")).unwrap();
         assert_eq!(lamp.reference(), "Furniture/Lighting/Lamp");
 
@@ -813,7 +844,10 @@ mod tests {
         let moved = move_asset(&root, &info, "Lighting", "Table", "Desk lamp").unwrap();
         assert_eq!(moved.reference(), "Lighting/Table/Desk lamp");
         assert!(find_asset(&root, "Lamp").is_err());
-        assert_eq!(load_asset(&moved).unwrap().objects.len(), 1);
+        let renamed = load_asset(&moved).unwrap();
+        let mut target = Scene::empty();
+        let indices = insert_asset(&mut target, &renamed, Vec3::ZERO, 0.0, 1.0);
+        assert_eq!(target.objects[indices[0]].name, "Desk lamp");
         delete_section(&root, "Props", None).unwrap();
 
         delete_asset(&root, &moved).unwrap();

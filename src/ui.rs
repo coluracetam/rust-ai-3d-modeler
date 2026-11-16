@@ -2277,7 +2277,7 @@ fn library_save_form(
         let typed_sub = state.library.subsection.trim().to_lowercase();
         let exists = section
             .and_then(|s| s.subsections.iter().find(|sub| sub.name.to_lowercase() == typed_sub))
-            .is_some_and(|sub| sub.assets.iter().any(|a| a.name == name));
+            .is_some_and(|sub| sub.assets.iter().any(|a| a.name.to_lowercase() == name.to_lowercase()));
         let ready = !parts.is_empty()
             && !name.is_empty()
             && !typed_section.is_empty()
