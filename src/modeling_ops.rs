@@ -6,7 +6,7 @@ use glam::{Mat4, Quat, Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
 fn finish(mut mesh: Mesh, color: [f32; 3]) -> Mesh {
-    mesh.colors = vec![color; mesh.positions.len()];
+    mesh.colors = vec![color; mesh.positions.len()].into();
     mesh.recalculate_normals();
     mesh.bump_version();
     mesh
@@ -260,9 +260,9 @@ pub fn weld(mesh: &mut Mesh, tolerance: f32) -> usize {
             faces.push(f);
         }
     }
-    mesh.positions = positions;
-    mesh.colors = colors;
-    mesh.faces = faces;
+    mesh.positions = positions.into();
+    mesh.colors = colors.into();
+    mesh.faces = faces.into();
     mesh.selected_faces = selected;
     mesh.selected_vertices.clear();
     mesh.selected_edges.clear();
@@ -478,7 +478,7 @@ fn catmull_clark_once(mesh: &mut Mesh) {
     }
     mesh.positions = positions;
     mesh.colors = colors.into_iter().map(|c| c.to_array()).collect();
-    mesh.faces = faces;
+    mesh.faces = faces.into();
 }
 
 /// Reduce detail by merging vertices that fall in the same grid cell.
@@ -553,7 +553,7 @@ fn cluster(mesh: &mut Mesh, cell: f32) {
     }
     mesh.positions = sums.iter().map(|s| s.0 / s.2).collect();
     mesh.colors = sums.iter().map(|s| (s.1 / s.2).to_array()).collect();
-    mesh.faces = faces;
+    mesh.faces = faces.into();
     mesh.selected_faces.clear();
     mesh.selected_vertices.clear();
     mesh.selected_edges.clear();
@@ -825,9 +825,10 @@ pub fn paint_faces(mesh: &mut Mesh, faces: &HashSet<usize>, vertex_color: [f32; 
             let vi = mesh.faces[fi][slot];
             let target = if used_outside.contains(&vi) {
                 *split.entry(vi).or_insert_with(|| {
-                    mesh.positions.push(mesh.positions[vi]);
-                    mesh.normals.push(mesh.normals[vi]);
-                    mesh.colors.push(mesh.colors[vi]);
+                    let (p, n, c) = (mesh.positions[vi], mesh.normals[vi], mesh.colors[vi]);
+                    mesh.positions.push(p);
+                    mesh.normals.push(n);
+                    mesh.colors.push(c);
                     mesh.positions.len() - 1
                 })
             } else {

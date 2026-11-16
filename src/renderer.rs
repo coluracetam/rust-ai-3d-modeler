@@ -40,6 +40,8 @@ struct MeshCacheKey {
     flat_shading: bool,
     is_selected: bool,
     is_edit_mode: bool,
+    /// The full wireframe is only built while it is shown; it is costly on dense meshes.
+    wire: bool,
 }
 
 struct CachedGpuMesh {
@@ -770,6 +772,142 @@ impl Renderer3D {
         )
     }
 
+    /// Rebuild the cached GPU buffers of every visible part whose mesh, selection or look changed.
+    ///
+    /// Vertex data is built on worker threads: one selection change over a dense scene (a 3D box
+    /// drag, a box select) can dirty dozens of parts in a single frame.
+    fn refresh_mesh_cache(
+        &mut self,
+        device: &wgpu::Device,
+        scene: &Scene,
+        variant: u8,
+        is_edit_mode: bool,
+        want_wire: bool,
+    ) {
+        let mut stale = Vec::new();
+        for (i, obj) in scene.objects.iter().enumerate() {
+            if !obj.visible {
+                continue;
+            }
+            let is_selected = scene.selected_object == Some(i);
+            let key = MeshCacheKey {
+                mesh_version: obj.mesh.version,
+                color_bits: [
+                    obj.color[0].to_bits(),
+                    obj.color[1].to_bits(),
+                    obj.color[2].to_bits(),
+                ],
+                flat_shading: obj.flat_shading,
+                is_selected,
+                is_edit_mode: !obj.mesh.selected_faces.is_empty() || (is_selected && is_edit_mode),
+                wire: want_wire,
+            };
+            let cache_key = (obj.id, variant);
+            if self
+                .mesh_cache
+                .get(&cache_key)
+                .is_none_or(|cached| cached.key != key)
+            {
+                stale.push((cache_key, key, obj));
+            }
+        }
+        if stale.is_empty() {
+            return;
+        }
+
+        type Built = [Vec<GpuVertex>; 3];
+        let build = |&(_, key, obj): &(DrawKey, MeshCacheKey, &crate::scene::SceneObject)| -> Built {
+            let tris = obj.mesh.build_gpu_triangles(obj.color, obj.flat_shading);
+            let wire_col = if key.is_selected {
+                [0.40, 0.89, 0.76]
+            } else {
+                [0.32, 0.35, 0.40]
+            };
+            let lines = if key.wire {
+                obj.mesh
+                    .build_wireframe_lines(Mat4::IDENTITY, wire_col, key.is_edit_mode)
+            } else {
+                Vec::new()
+            };
+            let outline = if obj.mesh.selected_faces.is_empty() {
+                Vec::new()
+            } else {
+                obj.mesh.build_selection_outline([0.55, 1.0, 0.88])
+            };
+            [tris, lines, outline]
+        };
+        let make = |label: &str, verts: &[GpuVertex]| {
+            (!verts.is_empty()).then(|| {
+                (
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: bytemuck::cast_slice(verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                    verts.len() as u32,
+                )
+            })
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+
+        // Batches bound how much vertex data is held in memory before it is uploaded.
+        const BATCH_FACES: usize = 400_000;
+        let mut rest = &stale[..];
+        while !rest.is_empty() {
+            let mut faces = 0;
+            let len = rest
+                .iter()
+                .take_while(|(_, _, obj)| {
+                    let fits = faces < BATCH_FACES;
+                    faces += obj.mesh.faces.len();
+                    fits
+                })
+                .count();
+            let (batch, tail) = rest.split_at(len);
+            rest = tail;
+            let workers = threads.min(batch.len());
+            let built: Vec<Built> = if workers <= 1 {
+                batch.iter().map(&build).collect()
+            } else {
+                // Workers take the next part off a shared counter, so one dense part does not
+                // hold up a whole chunk.
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let mut done: Vec<(usize, Built)> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..workers)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                let mut out = Vec::new();
+                                loop {
+                                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let Some(item) = batch.get(i) else { break };
+                                    out.push((i, build(item)));
+                                }
+                                out
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                        .collect()
+                });
+                done.sort_unstable_by_key(|(i, _)| *i);
+                done.into_iter().map(|(_, b)| b).collect()
+            };
+            for (&(cache_key, key, _), [tris, lines, outline]) in batch.iter().zip(&built) {
+                self.mesh_cache.insert(
+                    cache_key,
+                    CachedGpuMesh {
+                        key,
+                        tri_buffer: make("Cached Mesh Tri VB", tris),
+                        wire_buffer: make("Cached Mesh Wire VB", lines),
+                        outline_buffer: make("Cached Selection Outline VB", outline),
+                    },
+                );
+            }
+        }
+    }
+
     /// Upload/refresh cached GPU buffers and build per-object draw lists for `scene`.
     fn prepare_objects(
         &mut self,
@@ -792,6 +930,9 @@ impl Renderer3D {
             ViewportShading::SculptClay => 1.0,
             ViewportShading::WireframeOnly => 2.0,
         };
+        let want_wire =
+            self.shading == ViewportShading::WireframeOnly || self.show_wireframe_overlay;
+        self.refresh_mesh_cache(device, scene, variant, is_edit_mode, want_wire);
         for (i, obj) in scene.objects.iter().enumerate() {
             if !obj.visible {
                 continue;
@@ -799,59 +940,7 @@ impl Renderer3D {
             let is_selected = scene.selected_object == Some(i);
             let has_face_sel =
                 !obj.mesh.selected_faces.is_empty() || (is_selected && is_edit_mode);
-            let key = MeshCacheKey {
-                mesh_version: obj.mesh.version,
-                color_bits: [
-                    obj.color[0].to_bits(),
-                    obj.color[1].to_bits(),
-                    obj.color[2].to_bits(),
-                ],
-                flat_shading: obj.flat_shading,
-                is_selected,
-                is_edit_mode: has_face_sel,
-            };
             let cache_key = (obj.id, variant);
-            if self
-                .mesh_cache
-                .get(&cache_key)
-                .is_none_or(|cached| cached.key != key)
-            {
-                let make = |label: &str, verts: &[GpuVertex]| {
-                    (!verts.is_empty()).then(|| {
-                        (
-                            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some(label),
-                                contents: bytemuck::cast_slice(verts),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            }),
-                            verts.len() as u32,
-                        )
-                    })
-                };
-                let tris = obj.mesh.build_gpu_triangles(obj.color, obj.flat_shading);
-                let wire_col = if is_selected {
-                    [0.40, 0.89, 0.76]
-                } else {
-                    [0.32, 0.35, 0.40]
-                };
-                let lines = obj
-                    .mesh
-                    .build_wireframe_lines(Mat4::IDENTITY, wire_col, has_face_sel);
-                let outline = if obj.mesh.selected_faces.is_empty() {
-                    Vec::new()
-                } else {
-                    obj.mesh.build_selection_outline([0.55, 1.0, 0.88])
-                };
-                self.mesh_cache.insert(
-                    cache_key,
-                    CachedGpuMesh {
-                        key,
-                        tri_buffer: make("Cached Mesh Tri VB", &tris),
-                        wire_buffer: make("Cached Mesh Wire VB", &lines),
-                        outline_buffer: make("Cached Selection Outline VB", &outline),
-                    },
-                );
-            }
 
             let model = obj.transform.matrix();
             let ghost = self.ghost_unselected && any_selection && !is_selected && !has_face_sel;
@@ -886,8 +975,6 @@ impl Renderer3D {
                     draws.solid.push((cache_key, bg));
                 }
             }
-            let want_wire =
-                self.shading == ViewportShading::WireframeOnly || self.show_wireframe_overlay;
             if want_wire || !obj.mesh.selected_faces.is_empty() {
                 draws.wire.push((
                     cache_key,

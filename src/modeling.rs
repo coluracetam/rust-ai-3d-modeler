@@ -36,7 +36,7 @@ fn flip_faces(mesh: &mut Mesh) {
 }
 
 fn finish(mut mesh: Mesh, color: [f32; 3]) -> Mesh {
-    mesh.colors = vec![color; mesh.positions.len()];
+    mesh.colors = vec![color; mesh.positions.len()].into();
     mesh.recalculate_normals();
     mesh
 }
@@ -190,7 +190,7 @@ pub fn append(mesh: &mut Mesh, other: &Mesh) {
     let base = mesh.positions.len();
     mesh.positions.extend_from_slice(&other.positions);
     mesh.normals.extend_from_slice(&other.normals);
-    let mut colors = other.colors.clone();
+    let mut colors = other.colors.to_vec();
     colors.resize(other.positions.len(), [0.8, 0.8, 0.8]);
     mesh.colors.resize(base, [0.8, 0.8, 0.8]);
     mesh.colors.extend(colors);
@@ -202,7 +202,7 @@ pub fn append(mesh: &mut Mesh, other: &Mesh) {
 pub fn transformed(mesh: &Mesh, m: Mat4) -> Mesh {
     let mut out = Mesh::new(
         mesh.positions.iter().map(|p| m.transform_point3(*p)).collect(),
-        mesh.faces.clone(),
+        mesh.faces.to_vec(),
     );
     out.colors = mesh.colors.clone();
     if m.determinant() < 0.0 {
@@ -749,7 +749,7 @@ pub fn boolean(
                     let mut joined = target.clone();
                     let mut placed = transformed(tool, target_m.inverse() * tool_m);
                     if tool.colors.len() < tool.positions.len() {
-                        placed.colors = vec![tool_color; placed.positions.len()];
+                        placed.colors = vec![tool_color; placed.positions.len()].into();
                     }
                     joined.selected_faces.clear();
                     append(&mut joined, &placed);
@@ -812,7 +812,7 @@ pub fn boolean(
         }
     }
     let mut mesh = Mesh::new(positions, faces);
-    mesh.colors = colors;
+    mesh.colors = colors.into();
     mesh.recalculate_normals();
     Ok(mesh)
 }

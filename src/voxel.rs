@@ -294,7 +294,7 @@ pub fn subdivide_edges_in_sphere(
     };
 
     // Triangulate and split faces within the sphere that have long edges
-    let old_faces = std::mem::take(&mut mesh.faces);
+    let old_faces = std::mem::take(&mut *mesh.faces);
     for face in old_faces {
         if face.len() < 3 {
             continue;
@@ -336,7 +336,7 @@ pub fn subdivide_edges_in_sphere(
         }
     }
 
-    mesh.faces = new_faces;
+    mesh.faces = new_faces.into();
 }
 
 // =============================================================================
@@ -708,7 +708,7 @@ impl VoxelGrid {
         }
 
         let mut mesh = Mesh::new(positions, faces);
-        mesh.colors = colors;
+        mesh.colors = colors.into();
         mesh.recalculate_normals();
         mesh
     }
@@ -813,7 +813,7 @@ impl VoxelGrid {
         }
 
         let mut mesh = Mesh::new(positions, faces);
-        mesh.colors = colors;
+        mesh.colors = colors.into();
         mesh.recalculate_normals();
         mesh
     }

@@ -67,12 +67,11 @@ Included out-of-the-box in [`assets/scenes/clockwork_astral_cathedral_scene.json
 ## ✨ Key Features
 
 ### 1. 💬 AI-Driven Spatial Comment & Multi-Selection Workflow
-- **5 Smart Selection Modes** (Top Bar & Shortcuts `1`–`5` / `Tab`):
+- **Smart Selection Modes** (Viewport tool strip & Shortcuts `1`–`6` / `Tab`):
   - **`🧩 Sub-Part (1)`** *(Default)*: **1-click selects the entire connected 3D piece** under the cursor (e.g., a single tree, gear, column, flying buttress, crystal, step, or airship inside a multi-part layer). Uses 2mm spatial vertex welding (`Mesh::quantize_pos`) so faceted meshes with split vertices select cleanly as a single 3D piece.
   - **`📐 Smart Surface (2)`**: **1-click flood-fills a contiguous wall, roof slope, step top, or smooth surface** bounded by sharp edges (`Crease: 5°..85°` slider).
   - **`📦 Whole Layer (3)`**: **1-click selects all faces of the clicked object layer**.
-  - **`🖌 Paint Brush (4)`**: Click and drag across faces using an adjustable 3D sphere radius.
-  - **`Box (5 or Ctrl+C)`**: Drag a rectangle to select every *visible* face inside it (occlusion and the section plane are respected; enable **Select through** to include hidden faces). Drag more boxes to mark several places at once — with Multi-select on or Shift held each box adds, Ctrl+drag removes. Every separate patch becomes its own comment target, so the AI agent gets one anchor and bounding box per place. `Ctrl+C` toggles back to the previous mode.
+  - **`Box (4 or Ctrl+C)`**: Drag a rectangle to select every *visible* face inside it (occlusion and the section plane are respected; enable **Select through** to include hidden faces). Drag more boxes to mark several places at once — with Multi-select on or Shift held each box adds, Ctrl+drag removes. Every separate patch becomes its own comment target, so the AI agent gets one anchor and bounding box per place. `Ctrl+C` toggles back to the previous mode.
 - **Free-Fly Navigation (`` ` `` or the viewport's **Fly** button)**: Game-style noclip camera for moving through large scenes. The cursor is captured; the mouse looks around, `W A S D` / arrows move, `Q` / `E` (or `Space`) go down/up, `Shift` is fast, `Ctrl` slow, and the scroll wheel sets the speed. Click selects whatever is under the crosshair with the current selection mode. `Esc`, `` ` `` or right-click leaves fly mode, and the orbit pivot moves to the surface you were looking at.
 - **Live 3D Hover Preview**: Hovering over any part in `Sub-Part`, `Smart Surface`, or `Whole Layer` mode lights up the candidate selection in **electric cyan wireframe** before you click.
 - **Multi-Selection for a Single Comment (`➕ Multi-Select`)**:

@@ -75,17 +75,108 @@ pub fn ray_box_entry(ray: &Ray, min: Vec3, max: Vec3) -> Option<f32> {
     }
 }
 
+/// Copy-on-write storage for the large geometry arrays of a `Mesh`.
+///
+/// Reads go straight through; the first mutable access after a clone copies the data. This
+/// makes cloning a scene (autosave snapshots, undo entries, revisions) cost a reference count
+/// per array instead of a deep copy of millions of faces.
+#[derive(Default)]
+pub struct Shared<T>(Arc<T>);
+
+impl<T> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<T: PartialEq> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Shared<T>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <&'a T as IntoIterator>::Item;
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        (&*self.0).into_iter()
+    }
+}
+
+impl<'a, T: Clone> IntoIterator for &'a mut Shared<T>
+where
+    &'a mut T: IntoIterator,
+{
+    type Item = <&'a mut T as IntoIterator>::Item;
+    type IntoIter = <&'a mut T as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::make_mut(&mut self.0).into_iter()
+    }
+}
+
+impl<A> FromIterator<A> for Shared<Vec<A>> {
+    fn from_iter<I: IntoIterator<Item = A>>(iter: I) -> Self {
+        Self::new(iter.into_iter().collect())
+    }
+}
+
+fn de_vec3s<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Shared<Vec<Vec3>>, D::Error> {
+    crate::codec::vec3s::deserialize(d).map(Shared::new)
+}
+
+fn de_rgbs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Shared<Vec<[f32; 3]>>, D::Error> {
+    crate::codec::rgbs::deserialize(d).map(Shared::new)
+}
+
+fn de_faces<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Shared<Vec<Vec<usize>>>, D::Error> {
+    crate::codec::faces::deserialize(d).map(Shared::new)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mesh {
-    #[serde(with = "crate::codec::vec3s")]
-    pub positions: Vec<Vec3>,
-    #[serde(with = "crate::codec::vec3s")]
-    pub normals: Vec<Vec3>,
-    #[serde(with = "crate::codec::rgbs")]
-    pub colors: Vec<[f32; 3]>,
+    #[serde(serialize_with = "crate::codec::vec3s::serialize", deserialize_with = "de_vec3s")]
+    pub positions: Shared<Vec<Vec3>>,
+    #[serde(serialize_with = "crate::codec::vec3s::serialize", deserialize_with = "de_vec3s")]
+    pub normals: Shared<Vec<Vec3>>,
+    #[serde(serialize_with = "crate::codec::rgbs::serialize", deserialize_with = "de_rgbs")]
+    pub colors: Shared<Vec<[f32; 3]>>,
     /// Each face is a polygon (typically 3 or 4 vertex indices in counter-clockwise order).
-    #[serde(with = "crate::codec::faces")]
-    pub faces: Vec<Vec<usize>>,
+    #[serde(serialize_with = "crate::codec::faces::serialize", deserialize_with = "de_faces")]
+    pub faces: Shared<Vec<Vec<usize>>>,
 
     #[serde(skip)]
     pub selected_vertices: HashSet<usize>,
@@ -190,10 +281,10 @@ impl Mesh {
     pub fn new(positions: Vec<Vec3>, faces: Vec<Vec<usize>>) -> Self {
         let count = positions.len();
         let mut mesh = Self {
-            positions,
-            normals: vec![Vec3::Y; count],
-            colors: vec![[1.0, 1.0, 1.0]; count],
-            faces,
+            positions: positions.into(),
+            normals: vec![Vec3::Y; count].into(),
+            colors: vec![[1.0, 1.0, 1.0]; count].into(),
+            faces: faces.into(),
             selected_vertices: HashSet::new(),
             selected_edges: HashSet::new(),
             selected_faces: HashSet::new(),
@@ -246,39 +337,64 @@ impl Mesh {
     }
 
     /// Connected islands within the selected subset, including split imported vertices.
+    /// Islands are ordered by their lowest face index; each island is sorted.
     pub fn selected_components(&self) -> Vec<Vec<usize>> {
-        let mut adjacency: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
-        let mut remaining: HashSet<_> = self
+        let mut faces: Vec<usize> = self
             .selected_faces
             .iter()
             .copied()
             .filter(|&i| i < self.faces.len())
             .collect();
-        for &fi in &remaining {
-            for &vi in &self.faces[fi] {
-                adjacency
-                    .entry(Self::quantize_pos(self.positions[vi]))
-                    .or_default()
-                    .push(fi);
+        faces.sort_unstable();
+
+        // Union-find over welded vertices; each vertex index is quantized and hashed only once.
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                parent[x as usize] = parent[parent[x as usize] as usize];
+                x = parent[x as usize];
             }
+            x
         }
-        let mut result = Vec::new();
-        while let Some(&seed) = remaining.iter().min() {
-            remaining.remove(&seed);
-            let mut group = vec![seed];
-            let mut cursor = 0;
-            while cursor < group.len() {
-                for &vi in &self.faces[group[cursor]] {
-                    for &fi in &adjacency[&Self::quantize_pos(self.positions[vi])] {
-                        if remaining.remove(&fi) {
-                            group.push(fi);
+        const UNSEEN: u32 = u32::MAX;
+        let mut weld = vec![UNSEEN; self.positions.len()];
+        let mut ids: HashMap<(i32, i32, i32), u32> = HashMap::new();
+        let mut parent: Vec<u32> = Vec::new();
+        for &fi in &faces {
+            let mut first = None;
+            for &vi in &self.faces[fi] {
+                if weld[vi] == UNSEEN {
+                    let next = parent.len() as u32;
+                    let id = *ids.entry(Self::quantize_pos(self.positions[vi])).or_insert(next);
+                    if id == next {
+                        parent.push(next);
+                    }
+                    weld[vi] = id;
+                }
+                match first {
+                    None => first = Some(weld[vi]),
+                    Some(f) => {
+                        let (ra, rb) = (find(&mut parent, f), find(&mut parent, weld[vi]));
+                        if ra != rb {
+                            parent[rb as usize] = ra;
                         }
                     }
                 }
-                cursor += 1;
             }
-            group.sort_unstable();
-            result.push(group);
+        }
+
+        let mut group_of_root = vec![usize::MAX; parent.len()];
+        let mut result: Vec<Vec<usize>> = Vec::new();
+        for &fi in &faces {
+            let Some(&vi) = self.faces[fi].first() else {
+                result.push(vec![fi]);
+                continue;
+            };
+            let root = find(&mut parent, weld[vi]) as usize;
+            if group_of_root[root] == usize::MAX {
+                group_of_root[root] = result.len();
+                result.push(Vec::new());
+            }
+            result[group_of_root[root]].push(fi);
         }
         result
     }
@@ -1197,7 +1313,7 @@ impl Mesh {
             }
         }
 
-        self.faces = new_faces;
+        self.faces = new_faces.into();
         self.selected_faces = new_selected_faces;
         self.recalculate_normals();
         true
@@ -1404,7 +1520,7 @@ impl Mesh {
     // =========================================================================
 
     pub fn reset_vertex_colors(&mut self, color: [f32; 3]) {
-        self.colors = vec![color; self.positions.len()];
+        self.colors = vec![color; self.positions.len()].into();
         self.bump_version();
     }
 
@@ -1604,29 +1720,40 @@ impl Mesh {
 
     /// Border edges of the selected face region (welded by position), in local space.
     pub fn build_selection_outline(&self, color: [f32; 3]) -> Vec<GpuVertex> {
-        let mut directed: HashMap<((i32, i32, i32), (i32, i32, i32)), (usize, usize)> =
-            HashMap::new();
+        // Rebuilt whenever the selection changes, so each vertex is welded (hashed) only once
+        // and edges are matched by sorting rather than through a second hash map.
+        const UNSEEN: u32 = u32::MAX;
+        let mut weld = vec![UNSEEN; self.positions.len()];
+        let mut ids: HashMap<(i32, i32, i32), u32> = HashMap::new();
+        // (welded a -> welded b, a, b) for every directed edge of the selected faces.
+        let mut edges: Vec<(u64, u32, u32)> = Vec::new();
         for &fi in &self.selected_faces {
             let Some(face) = self.faces.get(fi) else { continue };
             for i in 0..face.len() {
                 let (a, b) = (face[i], face[(i + 1) % face.len()]);
-                let (qa, qb) = (
-                    Self::quantize_pos(self.positions[a]),
-                    Self::quantize_pos(self.positions[b]),
-                );
-                if qa != qb {
-                    directed.insert((qa, qb), (a, b));
+                for v in [a, b] {
+                    if weld[v] == UNSEEN {
+                        let next = ids.len() as u32;
+                        weld[v] = *ids.entry(Self::quantize_pos(self.positions[v])).or_insert(next);
+                    }
+                }
+                if weld[a] != weld[b] {
+                    edges.push((((weld[a] as u64) << 32) | weld[b] as u64, a as u32, b as u32));
                 }
             }
         }
+        edges.sort_unstable_by_key(|e| e.0);
+        edges.dedup_by_key(|e| e.0);
         let mut lines = Vec::new();
-        for (&(qa, qb), &(a, b)) in &directed {
-            if directed.contains_key(&(qb, qa)) {
+        for &(key, a, b) in &edges {
+            // An edge whose reverse is also present lies inside the region.
+            let reverse = key.rotate_left(32);
+            if edges.binary_search_by_key(&reverse, |e| e.0).is_ok() {
                 continue;
             }
             for v in [a, b] {
                 lines.push(GpuVertex {
-                    position: self.positions[v].to_array(),
+                    position: self.positions[v as usize].to_array(),
                     normal: [0.0, 1.0, 0.0],
                     color,
                 });

@@ -972,6 +972,45 @@ impl Scene {
         self.region_labels.clear();
     }
 
+    /// Faces of `obj` whose centre lies inside the world box `min`..`max`, in ascending order.
+    fn object_faces_in_box(obj: &SceneObject, min: Vec3, max: Vec3) -> Vec<usize> {
+        if !obj.visible {
+            return Vec::new();
+        }
+        let model = obj.transform.matrix();
+        let (lo, hi) = obj.mesh.bounds();
+        let mut wmin = Vec3::splat(f32::MAX);
+        let mut wmax = Vec3::splat(f32::MIN);
+        for i in 0..8 {
+            let c = Vec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            );
+            let w = model.transform_point3(c);
+            wmin = wmin.min(w);
+            wmax = wmax.max(w);
+        }
+        // Parts whose bounds miss the box entirely.
+        if wmin.cmpgt(max).any() || wmax.cmplt(min).any() {
+            return Vec::new();
+        }
+        let faces = &obj.mesh.faces;
+        // Parts wholly inside the box need no per-face test.
+        if wmin.cmpge(min).all() && wmax.cmple(max).all() {
+            return (0..faces.len()).filter(|&fi| faces[fi].len() >= 3).collect();
+        }
+        (0..faces.len())
+            .filter(|&fi| {
+                if faces[fi].len() < 3 {
+                    return false;
+                }
+                let c = model.transform_point3(obj.mesh.face_center(fi));
+                c.cmpge(min).all() && c.cmple(max).all()
+            })
+            .collect()
+    }
+
     /// Faces of every visible part whose centre lies inside `volume`, per object index.
     pub fn faces_in_volume(
         &self,
@@ -980,30 +1019,9 @@ impl Scene {
         let (min, max) = (volume.min(), volume.max());
         let mut hits = std::collections::HashMap::new();
         for (oi, obj) in self.objects.iter().enumerate() {
-            if !obj.visible {
-                continue;
-            }
-            let model = obj.transform.matrix();
-            // Skip parts whose bounds miss the box entirely.
-            let (lo, hi) = obj.mesh.bounds();
-            let mut wmin = Vec3::splat(f32::MAX);
-            let mut wmax = Vec3::splat(f32::MIN);
-            for i in 0..8 {
-                let c = Vec3::new(
-                    if i & 1 == 0 { lo.x } else { hi.x },
-                    if i & 2 == 0 { lo.y } else { hi.y },
-                    if i & 4 == 0 { lo.z } else { hi.z },
-                );
-                let w = model.transform_point3(c);
-                wmin = wmin.min(w);
-                wmax = wmax.max(w);
-            }
-            if wmin.cmpgt(max).any() || wmax.cmplt(min).any() {
-                continue;
-            }
-            let faces = obj.mesh.faces_in_world_box(model, min, max);
+            let faces = Self::object_faces_in_box(obj, min, max);
             if !faces.is_empty() {
-                hits.insert(oi, faces);
+                hits.insert(oi, faces.into_iter().collect());
             }
         }
         hits
@@ -1011,29 +1029,43 @@ impl Scene {
 
     /// Make the face selection exactly the faces inside the 3D box selector.
     /// Returns (faces, parts) selected.
+    ///
+    /// Runs on every frame of a handle drag, so parts whose selection does not change are left
+    /// alone: touching a mesh's selection invalidates its GPU buffers and cached adjacency.
     pub fn apply_volume_selection(&mut self) -> (usize, usize) {
         let Some(volume) = self.selection_volume.clone() else {
             return (0, 0);
         };
-        let hits = self.faces_in_volume(&volume);
-        for obj in &mut self.objects {
-            if !obj.mesh.selected_faces.is_empty() {
-                obj.mesh.clear_selection();
-            }
-        }
+        let (min, max) = (volume.min(), volume.max());
         self.region_labels.clear();
         let mut faces = 0;
+        let mut parts = 0;
         let mut best: Option<(usize, usize)> = None;
-        for (&oi, set) in &hits {
-            faces += set.len();
-            self.objects[oi].mesh.apply_face_set_selection(set, true, false);
-            if best.is_none_or(|(n, _)| set.len() > n) {
-                best = Some((set.len(), oi));
+        for (oi, obj) in self.objects.iter_mut().enumerate() {
+            let inside = Self::object_faces_in_box(obj, min, max);
+            let current = &obj.mesh.selected_faces;
+            // A part that is already selected whole and still wholly inside needs no lookups.
+            let whole = inside.len() == obj.mesh.faces.len();
+            if inside.len() != current.len()
+                || (!whole && !inside.iter().all(|fi| current.contains(fi)))
+            {
+                obj.mesh.selected_vertices.clear();
+                obj.mesh.selected_edges.clear();
+                obj.mesh.selected_faces = inside.iter().copied().collect();
+                obj.mesh.bump_version();
+            }
+            if inside.is_empty() {
+                continue;
+            }
+            faces += inside.len();
+            parts += 1;
+            if best.is_none_or(|(n, _)| inside.len() > n) {
+                best = Some((inside.len(), oi));
             }
         }
         self.selected_object = best.map(|(_, oi)| oi);
         self.pending_anchor = None;
-        (faces, hits.len())
+        (faces, parts)
     }
 
     /// Targets of a comment as they stand now: refreshed indices where the stored faces can
@@ -1124,8 +1156,13 @@ impl Scene {
         let mut sections = Vec::new();
 
         for obj in &self.objects {
+            if obj.mesh.selected_faces.is_empty() {
+                continue;
+            }
             let model = obj.transform.matrix();
             let normal_mat = model.inverse().transpose();
+            // Hashes the whole mesh, so once per part rather than once per region.
+            let topology_hash = Some(obj.mesh.topology_hash());
             for selected_faces in obj.mesh.selected_components() {
                 let mut min = Vec3::splat(f32::MAX);
                 let mut max = Vec3::splat(f32::MIN);
@@ -1146,7 +1183,7 @@ impl Scene {
                         .and_then(|&f| self.region_labels.get(&(obj.id, f)))
                         .cloned()
                         .unwrap_or_default(),
-                    topology_hash: Some(obj.mesh.topology_hash()),
+                    topology_hash,
                     face_signatures: selected_faces
                         .iter()
                         .map(|&i| obj.mesh.face_signature(i))

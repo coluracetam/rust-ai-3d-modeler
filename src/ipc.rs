@@ -265,6 +265,8 @@ fn reset_project_ui(ui_state: &mut UiState) {
     ui_state.hover_preview_faces.clear();
     ui_state.hover_preview_obj_id = None;
     ui_state.hover_preview_seed_face = None;
+    ui_state.volume_dragging = false;
+    ui_state.volume_drag_changed = false;
     ui_state.clip_enabled = false;
     ui_state.measure_active = false;
     ui_state.measure_points.clear();
@@ -314,6 +316,8 @@ pub fn execute_ipc_command(
         show_grid,
     );
     if !is_read_only(&req.tool) {
+        // Some commands replace meshes or edit them without bumping their versions.
+        ui_state.target_sections = None;
         ui_state.activity.push(format!(
             "{} · {} · {:.2}s",
             req.tool,
