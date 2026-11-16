@@ -1,5 +1,5 @@
 use crate::camera::Ray;
-use crate::mesh::{EditElementMode, Mesh, RayHit};
+use crate::mesh::{EditElementMode, Mesh, RayHit, Shared};
 use crate::voxel::VoxelGrid;
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -385,7 +385,7 @@ pub struct SpatialComment {
     pub local_bounds_min: Vec3,
     pub local_bounds_max: Vec3,
     #[serde(default)]
-    pub targets: Vec<CommentTargetSection>,
+    pub targets: Shared<Vec<CommentTargetSection>>,
     /// World-space box marking the region. When present the comment follows the box, so it
     /// never needs reattachment and may cover empty space.
     #[serde(default)]
@@ -717,15 +717,8 @@ impl Scene {
         if target.face_signatures.len() != target.selected_faces.len() {
             return None;
         }
-        let mut map = std::collections::HashMap::<u64, Vec<usize>>::new();
-        for i in 0..obj.mesh.faces.len() {
-            map.entry(obj.mesh.face_signature(i)).or_default().push(i);
-        }
-        target
-            .face_signatures
-            .iter()
-            .map(|hash| map.get(hash).filter(|ids| ids.len() == 1).map(|ids| ids[0]))
-            .collect::<Option<Vec<usize>>>()
+        obj.mesh
+            .remap_face_signatures(&target.face_signatures)
             .map(Cow::Owned)
     }
 
@@ -737,23 +730,8 @@ impl Scene {
         let bits = |v: Vec3| v.to_array().map(f32::to_bits);
         comment.is_general.hash(&mut h);
         bits(comment.world_anchor).hash(&mut h);
-        bits(comment.surface_normal).hash(&mut h);
-        comment
-            .volume
-            .as_ref()
-            .map(|v| (bits(v.center), bits(v.half_extents)))
-            .hash(&mut h);
-        comment.targets.len().hash(&mut h);
-        for t in &comment.targets {
-            t.object_id.hash(&mut h);
-            t.topology_hash.hash(&mut h);
-            t.selected_faces.len().hash(&mut h);
-            t.selected_faces.first().hash(&mut h);
-            t.selected_faces.last().hash(&mut h);
-            t.face_signatures.len().hash(&mut h);
-            bits(t.local_anchor).hash(&mut h);
-            bits(t.world_anchor).hash(&mut h);
-        }
+        comment.volume.as_ref().map(|v| bits(v.center)).hash(&mut h);
+        comment.targets.generation().hash(&mut h);
         for o in &self.objects {
             o.id.hash(&mut h);
             o.mesh.geometry_stamp().hash(&mut h);
@@ -779,7 +757,8 @@ impl Scene {
         let by_id: std::collections::HashMap<u64, &SceneObject> =
             self.objects.iter().map(|o| (o.id, o)).collect();
         let mut missing = false;
-        let mut points = Vec::new();
+        let mut anchor_sum = Vec3::ZERO;
+        let mut resolved_count = 0;
         let mut pins = Vec::with_capacity(comment.targets.len());
         for t in &comment.targets {
             let resolved = by_id
@@ -808,15 +787,14 @@ impl Scene {
                 (center / faces.len() as f32, normal)
             };
             let world = model.transform_point3(local);
-            points.push(world);
+            anchor_sum += world;
+            resolved_count += 1;
             pins.push((world, normal));
         }
-        let anchor = if let (true, Some(v)) = (points.is_empty(), &comment.volume) {
-            v.center
-        } else if points.is_empty() {
-            comment.world_anchor
+        let anchor = if resolved_count == 0 {
+            comment.volume.as_ref().map_or(comment.world_anchor, |v| v.center)
         } else {
-            points.iter().sum::<Vec3>() / points.len() as f32
+            anchor_sum / resolved_count as f32
         };
         CommentGeometry {
             needs_reattachment: !comment.is_general
@@ -896,12 +874,16 @@ impl Scene {
         c.selected_faces = first.selected_faces.clone();
         c.local_bounds_min = first.local_bounds_min;
         c.local_bounds_max = first.local_bounds_max;
-        c.targets = targets;
+        c.targets = targets.into();
         Ok(())
     }
 
     pub fn current_comment_anchor(&self, comment: &SpatialComment) -> Vec3 {
-        self.comment_geometry(comment).anchor
+        if comment.targets.is_empty() {
+            comment.volume.as_ref().map_or(comment.world_anchor, |v| v.center)
+        } else {
+            self.comment_geometry(comment).anchor
+        }
     }
 
     pub fn restore_targets(&mut self, targets: &[CommentTargetSection]) -> Result<(), String> {
@@ -1066,7 +1048,7 @@ impl Scene {
         })
     }
 
-    /// Forget cached adjacency/bounds after commands that may edit geometry in place.
+    /// Discard derived mesh data after a command invalidates the renderer cache.
     pub fn invalidate_mesh_caches(&self) {
         for obj in &self.objects {
             obj.mesh.invalidate_caches();
@@ -1207,7 +1189,7 @@ impl Scene {
                 }
                 out
             }
-            (None, None) => comment.targets.clone(),
+            (None, None) => comment.targets.to_vec(),
         }
     }
 
@@ -1401,7 +1383,7 @@ impl Scene {
                 selected_faces: Vec::new(),
                 local_bounds_min: volume.min(),
                 local_bounds_max: volume.max(),
-                targets: Vec::new(),
+                targets: Shared::default(),
                 volume: Some(volume),
                 comment: comment_text.into(),
                 resolved: false,
@@ -1463,7 +1445,7 @@ impl Scene {
             selected_faces: first.selected_faces.clone(),
             local_bounds_min: first.local_bounds_min,
             local_bounds_max: first.local_bounds_max,
-            targets,
+            targets: targets.into(),
             volume: self.selection_volume.clone(),
             comment: comment_text.into(),
             resolved: false,
@@ -1496,7 +1478,7 @@ impl Scene {
             selected_faces: Vec::new(),
             local_bounds_min: Vec3::ZERO,
             local_bounds_max: Vec3::ZERO,
-            targets: Vec::new(),
+            targets: Shared::default(),
             volume: None,
             comment: comment_text.into(),
             resolved: false,

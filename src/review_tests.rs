@@ -79,6 +79,53 @@ fn comment_remaps_reordered_faces_and_rejects_remeshing() {
 }
 
 #[test]
+fn cached_topology_detects_a_face_reorder_without_a_version_bump() {
+    let mut scene = scene();
+    let comment = scene
+        .add_comment_for_selection("Track this face", 0.3)
+        .unwrap();
+    let anchor = scene.current_comment_anchor(&comment);
+
+    scene.objects[0].mesh.faces.swap(0, 5);
+
+    assert_eq!(scene.target_faces(&comment.targets[0]), Some(vec![0]));
+    assert_eq!(scene.current_comment_anchor(&comment), anchor);
+
+    let mesh = &mut scene.objects[0].mesh;
+    let duplicate = mesh.faces[0].clone();
+    mesh.faces[2] = duplicate;
+    assert!(scene.comment_needs_reattachment(&comment));
+}
+
+#[test]
+fn comment_geometry_cache_tracks_target_edits_and_ignores_selection() {
+    let mut scene = scene();
+    let mut comment = scene
+        .add_comment_for_selection("Track this face", 0.3)
+        .unwrap();
+    let mesh = &mut scene.objects[0].mesh;
+    mesh.faces.swap(0, 5);
+    let expected_anchor = mesh.face_center(1);
+    let new_signature = mesh.face_signature(1);
+    let original = scene.comment_geometry(&comment);
+
+    scene.objects[0].mesh.clear_selection();
+    assert!(std::sync::Arc::ptr_eq(
+        &original,
+        &scene.comment_geometry(&comment)
+    ));
+
+    comment.targets[0].face_signatures[0] = new_signature;
+    let updated = scene.comment_geometry(&comment);
+    assert_eq!(updated.anchor, expected_anchor);
+    assert!(!updated.needs_reattachment);
+    assert_eq!(
+        scene.current_comment_anchor(&scene.comments[0]),
+        original.anchor
+    );
+}
+
+#[test]
 fn comment_anchor_follows_transform_and_deformation() {
     let mut scene = scene();
     let comment = scene.add_comment_for_selection("Track me", 0.3).unwrap();

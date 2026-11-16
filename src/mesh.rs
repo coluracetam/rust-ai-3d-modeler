@@ -35,17 +35,17 @@ const RAY_CHUNK: usize = 64;
 
 /// Derived lookup structures, built lazily and reused until the mesh changes.
 struct MeshDerived {
-    key: (u64, usize, usize),
+    key: (u64, u64),
     vert_faces: OnceLock<HashMap<QPt, Vec<usize>>>,
     edge_faces: OnceLock<HashMap<(QPt, QPt), Vec<usize>>>,
     bounds: OnceLock<(Vec3, Vec3)>,
     topology_hash: OnceLock<u64>,
+    faces_by_signature: OnceLock<HashMap<u64, Option<usize>>>,
     /// Bounding box of every `RAY_CHUNK` consecutive faces.
     chunks: OnceLock<Vec<(Vec3, Vec3)>>,
 }
 
-/// Per-mesh cache. Cloning yields an empty cache, so a copy edited elsewhere never inherits
-/// stale data; call `Mesh::invalidate_caches` after editing geometry in place.
+/// Per-mesh cache keyed by geometry generations. Cloning yields an empty cache.
 #[derive(Default)]
 pub struct MeshCache(Mutex<Option<Arc<MeshDerived>>>);
 
@@ -105,6 +105,18 @@ impl<T> Shared<T> {
 impl<T: Default> Default for Shared<T> {
     fn default() -> Self {
         Self::new(T::default())
+    }
+}
+
+impl<T: Serialize> Serialize for Shared<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Shared<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::new)
     }
 }
 
@@ -213,7 +225,7 @@ pub struct Mesh {
 
 impl Mesh {
     fn derived(&self) -> Arc<MeshDerived> {
-        let key = (self.version, self.positions.len(), self.faces.len());
+        let key = self.geometry_stamp();
         let mut slot = self.cache.0.lock().unwrap_or_else(|e| e.into_inner());
         match &*slot {
             Some(d) if d.key == key => d.clone(),
@@ -224,6 +236,7 @@ impl Mesh {
                     edge_faces: OnceLock::new(),
                     bounds: OnceLock::new(),
                     topology_hash: OnceLock::new(),
+                    faces_by_signature: OnceLock::new(),
                     chunks: OnceLock::new(),
                 });
                 *slot = Some(d.clone());
@@ -232,7 +245,7 @@ impl Mesh {
         }
     }
 
-    /// Drop cached adjacency/bounds after editing geometry without `bump_version`.
+    /// Drop the derived data explicitly.
     pub fn invalidate_caches(&self) {
         *self.cache.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -367,6 +380,22 @@ impl Mesh {
             }
         }
         hash
+    }
+
+    /// Remap face signatures to their current indices if each match is unique.
+    pub fn remap_face_signatures(&self, signatures: &[u64]) -> Option<Vec<usize>> {
+        let derived = self.derived();
+        let faces = derived.faces_by_signature.get_or_init(|| {
+            let mut faces = HashMap::with_capacity(self.faces.len());
+            for index in 0..self.faces.len() {
+                faces
+                    .entry(self.face_signature(index))
+                    .and_modify(|face| *face = None)
+                    .or_insert(Some(index));
+            }
+            faces
+        });
+        signatures.iter().map(|signature| *faces.get(signature)?).collect()
     }
 
     /// Connected islands within the selected subset, including split imported vertices.
