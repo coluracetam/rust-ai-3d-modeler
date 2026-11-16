@@ -2,6 +2,7 @@
 
 mod agent_tools;
 mod autosave;
+mod bake;
 mod box_select;
 pub mod codec;
 pub mod camera;
@@ -77,6 +78,62 @@ struct BackgroundOperation {
     selected_id: Option<u64>,
 }
 
+impl BackgroundOperation {
+    fn start(
+        event: IpcEvent,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        history: &UndoHistory,
+        ui_state: &mut UiState,
+        gpu: Option<&GpuContext>,
+    ) -> Self {
+        let IpcEvent { request, reply_tx } = event;
+        let selected_id = scene.active_object().map(|o| o.id);
+        let (mut scene, mut camera, mut history) = (scene.clone(), camera.clone(), history.clone());
+        let mut state = ui_state.clone();
+        let mut shading = gpu.map_or(ViewportShading::StudioLit, |g| g.renderer_3d.shading);
+        let mut wire = gpu.is_some_and(|g| g.renderer_3d.show_wireframe_overlay);
+        let mut grid = gpu.is_none_or(|g| g.renderer_3d.show_grid);
+        let (tx, receiver) = mpsc::channel();
+        let started = std::time::Instant::now();
+        let tool = request.tool.clone();
+        ui_state.busy_operation = Some(ui::BusyOperation {
+            name: tool.replace('_', " "),
+            started,
+            can_cancel: !ipc::is_export(&tool),
+        });
+        std::thread::spawn(move || {
+            let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_ipc_command(
+                    &request,
+                    &mut scene,
+                    &mut camera,
+                    &mut history,
+                    &mut state,
+                    &mut shading,
+                    &mut wire,
+                    &mut grid,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                IpcResponse::error("Background operation failed; live geometry preserved")
+            });
+            let _ = tx.send(BackgroundResult {
+                response,
+                scene,
+                history,
+            });
+        });
+        Self {
+            receiver,
+            reply: reply_tx,
+            tool,
+            started,
+            selected_id,
+        }
+    }
+}
+
 pub struct ModelerApp {
     gpu: Option<GpuContext>,
     background: Option<BackgroundOperation>,
@@ -147,6 +204,10 @@ impl ModelerApp {
 
 impl ModelerApp {
     fn cancel_operation(&mut self) -> IpcResponse {
+        // An export writes files from the worker. Dropping its reply cannot undo those writes.
+        if self.background.as_ref().is_some_and(|op| ipc::is_export(&op.tool)) {
+            return IpcResponse::error("Wait for the export to finish");
+        }
         if let Some(operation) = self.background.take() {
             let _ = operation
                 .reply
@@ -169,7 +230,8 @@ impl ModelerApp {
         };
         let operation = self.background.take().unwrap();
         self.ui_state.busy_operation = None;
-        if result.response.ok && !ipc::is_read_only(&operation.tool) {
+        let scene_changed = result.response.ok && !ipc::is_read_only(&operation.tool);
+        if scene_changed {
             // Keep feedback and inspection changes made while geometry was computed.
             let current_id = self.scene.active_object().map(|o| o.id);
             let selected_id = if current_id == operation.selected_id {
@@ -208,9 +270,13 @@ impl ModelerApp {
         if !result.response.ok {
             self.ui_state.last_error = Some(result.response.message.clone());
         }
-        self.scene.invalidate_mesh_caches();
+        if scene_changed {
+            self.scene.invalidate_mesh_caches();
+        }
         if let Some(gpu) = &mut self.gpu {
-            gpu.renderer_3d.invalidate_cache();
+            if scene_changed {
+                gpu.renderer_3d.invalidate_cache();
+            }
             gpu.window.request_redraw();
         }
         let _ = operation.reply.send(result.response);
@@ -987,7 +1053,7 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
         }
         if self.background.is_some() && !ipc::allowed_during_operation(&event.request.tool) {
             let _ = event.reply_tx.send(IpcResponse::error(
-                "An operation is running; wait or cancel it first",
+                "Wait for the current operation to finish",
             ));
             return;
         }
@@ -1007,62 +1073,19 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 | "mirror_object"
                 | "capture_viewport"
                 | "capture_studio"
-        ) || agent_tools::HEAVY.contains(&event.request.tool.as_str())
+        ) || ipc::is_export(&event.request.tool)
+            || agent_tools::HEAVY.contains(&event.request.tool.as_str())
             || library::HEAVY.contains(&event.request.tool.as_str()))
             && self.background.is_none()
         {
-            let request = event.request.clone();
-            let mut scene = self.scene.clone();
-            let mut camera = self.camera.clone();
-            let mut history = self.history.clone();
-            let mut state = self.ui_state.clone();
-            let mut shading = self
-                .gpu
-                .as_ref()
-                .map(|g| g.renderer_3d.shading)
-                .unwrap_or(ViewportShading::StudioLit);
-            let mut wire = self
-                .gpu
-                .as_ref()
-                .map(|g| g.renderer_3d.show_wireframe_overlay)
-                .unwrap_or(false);
-            let mut grid = self
-                .gpu
-                .as_ref()
-                .map(|g| g.renderer_3d.show_grid)
-                .unwrap_or(true);
-            let (tx, receiver) = mpsc::channel();
-            let started = std::time::Instant::now();
-            self.ui_state.busy_operation = Some((request.tool.replace('_', " "), started));
-            self.background = Some(BackgroundOperation {
-                receiver,
-                reply: event.reply_tx,
-                tool: request.tool.clone(),
-                started,
-                selected_id: self.scene.active_object().map(|o| o.id),
-            });
-            std::thread::spawn(move || {
-                let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_ipc_command(
-                        &request,
-                        &mut scene,
-                        &mut camera,
-                        &mut history,
-                        &mut state,
-                        &mut shading,
-                        &mut wire,
-                        &mut grid,
-                    )
-                }))
-                .unwrap_or_else(|_| {
-                    IpcResponse::error("Background operation failed; live geometry preserved")
-                });
-                let _ = tx.send(BackgroundResult {
-                    response,
-                    scene,
-                    history,
-                });
-            });
+            self.background = Some(BackgroundOperation::start(
+                event,
+                &self.scene,
+                &self.camera,
+                &self.history,
+                &mut self.ui_state,
+                self.gpu.as_ref(),
+            ));
             if let Some(gpu) = &self.gpu {
                 gpu.window.request_redraw();
             }
@@ -1463,19 +1486,29 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
 
                 for request in std::mem::take(&mut self.ui_state.actions) {
                     if request.tool == "cancel_operation" {
-                        if let Some(operation) = self.background.take() {
-                            let _ = operation
-                                .reply
-                                .send(IpcResponse::error("Operation cancelled; result discarded"));
+                        if self.background.as_ref().is_some_and(|op| !ipc::is_export(&op.tool)) {
+                            let operation = self.background.take().unwrap();
+                            let _ = operation.reply.send(IpcResponse::error("Operation cancelled; result discarded"));
+                            self.ui_state.busy_operation = None;
+                            self.ui_state.status_message = "Operation cancelled · live geometry preserved".into();
                         }
-                        self.ui_state.busy_operation = None;
-                        self.ui_state.status_message =
-                            "Operation cancelled · live geometry preserved".into();
                         continue;
                     }
                     if self.background.is_some() && !ipc::allowed_during_operation(&request.tool) {
                         self.ui_state.last_error =
-                            Some("Wait for the current operation, or cancel it first".into());
+                            Some("Wait for the current operation to finish".into());
+                        continue;
+                    }
+                    if ipc::is_export(&request.tool) {
+                        let (reply_tx, _) = mpsc::channel();
+                        self.background = Some(BackgroundOperation::start(
+                            IpcEvent { request, reply_tx },
+                            &self.scene,
+                            &self.camera,
+                            &self.history,
+                            &mut self.ui_state,
+                            Some(gpu),
+                        ));
                         continue;
                     }
                     let response = execute_ipc_command(

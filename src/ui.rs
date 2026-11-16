@@ -50,8 +50,15 @@ pub const FILTER_ACCEPTED: usize = 2;
 pub const FILTER_ALL: usize = 3;
 
 #[derive(Clone)]
+pub struct BusyOperation {
+    pub name: String,
+    pub started: std::time::Instant,
+    pub can_cancel: bool,
+}
+
+#[derive(Clone)]
 pub struct UiState {
-    pub busy_operation: Option<(String, std::time::Instant)>,
+    pub busy_operation: Option<BusyOperation>,
     pub actions: Vec<crate::ipc::IpcRequest>,
     pub last_error: Option<String>,
     pub last_agent_activity: Option<std::time::Instant>,
@@ -200,9 +207,18 @@ pub struct ExportUi {
     pub collision: crate::gltf::Collision,
     /// Triangle budget as typed; empty exports every triangle.
     pub budget: String,
+    /// Bake colours into a texture instead of exporting vertex colours.
+    pub bake: bool,
+    /// Side of the baked texture; 0 means the default.
+    pub texture_size: u32,
 }
 
 impl ExportUi {
+    pub fn bake_texture(&self) -> Option<u32> {
+        let size = if self.texture_size == 0 { crate::bake::DEFAULT_SIZE } else { self.texture_size };
+        self.bake.then_some(size)
+    }
+
     pub fn max_triangles(&self) -> Option<usize> {
         self.budget.trim().replace([',', '_', ' '], "").parse().ok().filter(|&n: &usize| n > 0)
     }
@@ -1547,7 +1563,7 @@ fn agent_presence(scene: &Scene, state: &UiState) -> (String, Color32, bool) {
         .revisions
         .iter()
         .any(|r| r.status == RevisionStatus::ReadyForReview);
-    if let Some((name, _)) = &state.busy_operation {
+    if let Some(BusyOperation { name, .. }) = &state.busy_operation {
         return (format!("Agent · {name}"), ACCENT, true);
     }
     if let Some(r) = in_progress {
@@ -1591,7 +1607,7 @@ fn draw_status_bar(ctx: &egui::Context, scene: &Scene, state: &UiState) {
                     ui.separator();
                     ui.label(RichText::new(format!("{} {} not sent", icon::PAPER_PLANE_TILT, plural(drafts, "comment", "comments"))).small().color(WARN));
                 }
-                if let Some((name, started)) = &state.busy_operation {
+                if let Some(BusyOperation { name, started, .. }) = &state.busy_operation {
                     ui.separator();
                     ui.spinner();
                     ui.label(
@@ -2374,6 +2390,8 @@ fn load_export_choices(export: &mut ExportUi, root: &std::path::Path) {
         export.separate = !prefs.merge;
         export.collision = crate::gltf::Collision::from_name(&prefs.collision).unwrap_or_default();
         export.budget = prefs.max_triangles.map(|n| n.to_string()).unwrap_or_default();
+        export.bake = prefs.bake_texture.is_some();
+        export.texture_size = prefs.bake_texture.unwrap_or(0);
     }
 }
 
@@ -2399,8 +2417,23 @@ fn export_options(ui: &mut egui::Ui, export: &mut ExportUi, godot: bool, id: &st
     }
     ui.horizontal(|ui| {
         ui.label(RichText::new("Triangle budget").color(MUTED));
-        text_field(ui, &mut export.budget, "all triangles", 110.0)
-            .on_hover_text("Simplify dense parts so the model has about this many triangles, e.g. 20000. Leave empty to keep them all. The original is not changed.");
+        let placeholder = if export.bake { "auto" } else { "all triangles" };
+        text_field(ui, &mut export.budget, placeholder, 110.0)
+            .on_hover_text("Set a triangle budget, for example 20000. With baking enabled, leaving this empty simplifies the mesh while preserving its shape.");
+    });
+    ui.horizontal(|ui| {
+        toggle(ui, &mut export.bake, "Bake colours into a texture")
+            .on_hover_text("Painted detail is kept in an image instead of the triangles, so it stays sharp at a small triangle budget. The model is simplified, faces that cannot be seen are left out, and one texture of at most the chosen size is stored inside the .glb.");
+        if export.bake {
+            let size = export.bake_texture().unwrap_or(crate::bake::DEFAULT_SIZE);
+            egui::ComboBox::from_id_salt((id, "texture"))
+                .selected_text(format!("{size} px"))
+                .show_ui(ui, |ui| {
+                    for choice in [1024, 2048, 4096] {
+                        ui.selectable_value(&mut export.texture_size, choice, format!("{choice} px"));
+                    }
+                });
+        }
     });
 }
 
@@ -2482,7 +2515,7 @@ fn library_export_form(
         } else {
             "One .glb per asset in Section/Subsection folders."
         }));
-        let ready = !assets.is_empty() && !directory.is_empty();
+        let ready = !assets.is_empty() && !directory.is_empty() && state.busy_operation.is_none();
         let mut run = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
@@ -2500,22 +2533,12 @@ fn library_export_form(
                 merge: Some(!export.separate),
                 scale: 1.0,
                 max_triangles: export.max_triangles(),
+                bake_texture: export.bake_texture(),
             };
             let path = std::path::Path::new(&directory);
             if let Err(e) = library::check_export_paths(assets.iter().copied(), path, options.target) {
                 state.last_error = Some(e);
                 return;
-            }
-            let (mut done, mut triangles, mut failed, mut note) = (0, 0, Vec::new(), None);
-            for asset in &assets {
-                match library::export_asset(asset, path, &options) {
-                    Ok((_, report)) => {
-                        done += 1;
-                        triangles += report.triangles;
-                        note = note.or(report.warnings.into_iter().next());
-                    }
-                    Err(e) => failed.push(format!("{}: {e}", asset.name)),
-                }
             }
             library::save_export_prefs(
                 root,
@@ -2525,19 +2548,21 @@ fn library_export_form(
                     collision: options.collision.name().into(),
                     merge: !export.separate,
                     max_triangles: options.max_triangles,
+                    bake_texture: options.bake_texture,
                 },
             );
-            state.status_message = format!(
-                "Exported {} ({} triangles) to {directory}{}",
-                plural(done, "asset", "assets"),
-                compact_count(triangles),
-                note.map(|n| format!(" · {n}")).unwrap_or_default()
-            );
-            if failed.is_empty() {
-                state.library.export_scope = None;
-            } else {
-                state.last_error = Some(format!("Could not export {}", failed.join("; ")));
-            }
+            let references: Vec<String> = assets.iter().map(|asset| asset.reference()).collect();
+            action(state, "library_export", serde_json::json!({
+                "assets": references,
+                "directory": directory,
+                "target": options.target.name(),
+                "collision": options.collision.name(),
+                "merge": options.merge,
+                "max_triangles": options.max_triangles,
+                "bake_texture": options.bake_texture.is_some(),
+                "texture_size": options.bake_texture,
+            }));
+            state.library.export_scope = None;
         }
     });
 }
@@ -3340,7 +3365,7 @@ fn draw_review_panel(
                 ],
             );
             ui.add_space(4.0);
-            if let Some((name, started)) = state.busy_operation.clone() {
+            if let Some(BusyOperation { name, started, can_cancel }) = state.busy_operation.clone() {
                 card()
                     .stroke(egui::Stroke::new(1.0_f32, INFO.gamma_multiply(0.5)))
                     .show(ui, |ui| {
@@ -3353,8 +3378,8 @@ fn draw_review_panel(
                                 started.elapsed().as_secs_f32()
                             )));
                         });
-                        if ui
-                            .button("Cancel operation")
+                        if can_cancel
+                            && ui.button("Cancel operation")
                             .on_hover_text(
                                 "Discard this operation's result; your live scene stays unchanged",
                             )
@@ -5627,13 +5652,16 @@ fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
                 }
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
-                    if primary(ui, "Export scene", valid) || (enter && valid) {
+                    let ready = valid && state.busy_operation.is_none();
+                    if primary(ui, "Export scene", ready) || (enter && ready) {
                         let export = &state.library.export;
                         let mut args = json!({ "path": path });
                         if ext == "glb" {
                             args["merge"] = json!(!export.separate);
                             args["collision"] = json!(export.collision.name());
                             args["max_triangles"] = json!(export.max_triangles().unwrap_or(0));
+                            args["bake_texture"] = json!(export.bake);
+                            args["texture_size"] = json!(export.bake_texture());
                         }
                         action(state, "export_model", args);
                         state.show_io_modal = false;

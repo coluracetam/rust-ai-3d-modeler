@@ -229,8 +229,12 @@ pub fn summarize_scene(
     })
 }
 
+pub fn is_export(tool: &str) -> bool {
+    matches!(tool, "export_model" | "library_export")
+}
+
 pub fn allowed_during_operation(tool: &str) -> bool {
-    is_read_only(tool)
+    (is_read_only(tool) && !is_export(tool))
         || matches!(
             tool,
             "update_comment" | "reattach_comment" | "delete_comment" | "save_project"
@@ -290,6 +294,7 @@ pub fn is_read_only(tool: &str) -> bool {
             | "capture_viewport"
             | "capture_studio"
             | "get_feedback_state"
+            | "export_model"
             | "wait_for_feedback"
     ) || crate::agent_tools::READ_ONLY.contains(&tool)
         || crate::library::READ_ONLY.contains(&tool)
@@ -368,7 +373,7 @@ fn dispatch(
         );
     }
     if scene.preview_revision.is_some()
-        && !is_read_only(&req.tool)
+        && (!is_read_only(&req.tool) || req.tool == "export_model")
         && !matches!(
             req.tool.as_str(),
             "accept_revision"
@@ -1599,9 +1604,15 @@ fn dispatch(
                     report.triangles,
                     report.materials
                 );
+                if report.textures > 0 {
+                    message.push_str(&format!(", {} px texture", report.texture_size));
+                }
                 if let Some((_, res)) = crate::gltf::godot_resource_path(path) {
                     data["godot_path"] = json!(res);
                     message.push_str(&format!(" · {res}"));
+                }
+                if let Some(warning) = report.warnings.first() {
+                    message.push_str(&format!(" · {warning}"));
                 }
                 ui_state.status_message = message.clone();
                 return IpcResponse::success(message, data);

@@ -405,6 +405,33 @@ fn cancelled_background_result_cannot_change_live_geometry() {
 }
 
 #[test]
+fn background_export_keeps_inspection_changes() {
+    let mut app = crate::ModelerApp::with_scene(scene());
+    let snapshot = app.scene.clone();
+    let (tx, receiver) = std::sync::mpsc::channel();
+    let (reply, reply_rx) = std::sync::mpsc::channel();
+    app.background = Some(crate::BackgroundOperation {
+        receiver,
+        reply,
+        tool: "export_model".into(),
+        started: std::time::Instant::now(),
+        selected_id: app.scene.active_object().map(|object| object.id),
+    });
+    app.scene.objects[0].mesh.selected_faces.insert(0);
+    assert!(!app.cancel_operation().ok);
+    assert!(!crate::ipc::allowed_during_operation("export_model"));
+    assert!(!crate::ipc::allowed_during_operation("library_export"));
+    tx.send(crate::BackgroundResult {
+        response: crate::ipc::IpcResponse::success("Exported model", json!({})),
+        scene: snapshot,
+        history: UndoHistory::default(),
+    }).unwrap();
+    app.poll_operation();
+    assert!(reply_rx.recv().unwrap().ok);
+    assert!(app.scene.objects[0].mesh.selected_faces.contains(&0));
+}
+
+#[test]
 fn shared_project_resolves_screenshots_relative_to_its_directory() {
     let dir = std::env::temp_dir().join(format!("spatial-relative-project-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("images")).unwrap();

@@ -10,6 +10,7 @@ use crate::scene::{Scene, SceneObject};
 use glam::{EulerRot, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -509,6 +510,8 @@ pub struct ExportOptions {
     pub scale: f32,
     /// Triangle budget per asset; `None` exports every triangle.
     pub max_triangles: Option<usize>,
+    /// Bake colours into a texture of this size instead of vertex colours.
+    pub bake_texture: Option<u32>,
 }
 
 /// Where an asset is written under `directory`: `section/subsection/name.glb`.
@@ -560,6 +563,7 @@ pub fn export_asset(
         center_base: false,
         max_triangles: options.max_triangles,
         godot,
+        bake_texture: options.bake_texture,
     };
     let parts: Vec<&SceneObject> = asset.objects.iter().collect();
     let report = crate::gltf::export_glb(&parts, &path, &gltf)?;
@@ -575,6 +579,8 @@ pub struct ExportPrefs {
     pub merge: bool,
     #[serde(default)]
     pub max_triangles: Option<usize>,
+    #[serde(default)]
+    pub bake_texture: Option<u32>,
 }
 
 pub fn load_export_prefs(root: &Path) -> Option<ExportPrefs> {
@@ -835,16 +841,34 @@ pub fn dispatch(
                 merge: args["merge"].as_bool(),
                 scale: args["scale"].as_f64().unwrap_or(1.0) as f32,
                 max_triangles: args["max_triangles"].as_u64().filter(|&b| b > 0).map(|b| b as usize),
+                bake_texture: crate::gltf::parse_bake_texture(args, None)?,
             };
-            let assets: Vec<AssetInfo> = match text("asset") {
-                Some(reference) => vec![find_asset(&root, reference)?],
-                None => list(&root)
+            let assets: Vec<AssetInfo> = match (&args["assets"], text("asset")) {
+                (Value::Array(references), None) => {
+                    let by_reference: HashMap<_, _> = list(&root)
+                        .into_iter()
+                        .flat_map(|section| section.subsections)
+                        .flat_map(|subsection| subsection.assets)
+                        .map(|asset| (asset.reference(), asset))
+                        .collect();
+                    references
+                        .iter()
+                        .map(|reference| {
+                            let reference = reference.as_str().ok_or("Asset references must be strings")?;
+                            by_reference.get(reference).cloned()
+                                .ok_or_else(|| format!("No library asset named '{reference}'"))
+                        })
+                        .collect::<Result<_, _>>()?
+                }
+                (Value::Null, Some(reference)) => vec![find_asset(&root, reference)?],
+                (Value::Null, None) => list(&root)
                     .into_iter()
                     .filter(|s| text("section").is_none_or(|only| s.name.eq_ignore_ascii_case(only)))
                     .flat_map(|s| s.subsections)
                     .filter(|s| text("subsection").is_none_or(|only| s.name.eq_ignore_ascii_case(only)))
                     .flat_map(|s| s.assets)
                     .collect(),
+                _ => return Err("Specify either asset or an array of assets".into()),
             };
             if assets.is_empty() {
                 return Err("No library assets match that export".into());
@@ -852,6 +876,7 @@ pub fn dispatch(
             check_export_paths(&assets, &directory, options.target)?;
             let mut exported = Vec::new();
             let mut failed = Vec::new();
+            let mut errors = Vec::new();
             for info in &assets {
                 match export_asset(info, &directory, &options) {
                     Ok((path, report)) => {
@@ -863,11 +888,15 @@ pub fn dispatch(
                         }
                         exported.push(entry);
                     }
-                    Err(e) => failed.push(json!({ "asset": info.reference(), "error": e })),
+                    Err(error) => {
+                        let reference = info.reference();
+                        errors.push(format!("{reference}: {error}"));
+                        failed.push(json!({ "asset": reference, "error": error }));
+                    }
                 }
             }
             if exported.is_empty() {
-                return Err(format!("Nothing was exported: {}", failed[0]["error"].as_str().unwrap_or("")));
+                return Err(format!("Nothing was exported. {}", errors.join(" · ")));
             }
             let project = crate::gltf::godot_resource_path(&directory.join("x")).map(|(project, _)| project);
             let mut message = format!(
@@ -877,10 +906,13 @@ pub fn dispatch(
                 directory.display()
             );
             if !failed.is_empty() {
-                message.push_str(&format!(" · {} failed", failed.len()));
+                message.push_str(&format!(" · {}", errors.join(" · ")));
             }
             if options.target == ExportTarget::Godot && project.is_none() {
                 message.push_str(" · this folder is not inside a Godot project (no project.godot above it)");
+            }
+            if let Some(warning) = exported.iter().find_map(|entry| entry["warnings"][0].as_str()) {
+                message.push_str(&format!(" · {warning}"));
             }
             Ok(IpcResponse::success(
                 message,
@@ -1101,6 +1133,14 @@ mod tests {
         assert_eq!(back.faces.len(), 24, "two cubes come back as triangles");
         assert!(back.colors.contains(&[0.6, 0.4, 0.2]));
         assert!(back.colors.contains(&[0.5, 0.3, 0.2]));
+        let baked = run(&mut scene, "library_export", json!({
+            "directory": out.join("baked"),
+            "assets": ["Furniture/General/Oak chair"],
+            "bake_texture": true,
+            "texture_size": 128,
+        }));
+        assert!(baked.ok, "{}", baked.message);
+        assert_eq!(baked.data["exported"][0]["textures"], 1);
         assert!(!run(&mut scene, "library_export", json!({ "directory": out, "section": "Nope" })).ok);
         let exported = run(&mut scene, "export_model", json!({ "path": out.join("scene.glb"), "group": "Chair", "merge": true }));
         assert!(exported.ok, "{}", exported.message);
