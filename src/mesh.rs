@@ -39,6 +39,7 @@ struct MeshDerived {
     vert_faces: OnceLock<HashMap<QPt, Vec<usize>>>,
     edge_faces: OnceLock<HashMap<(QPt, QPt), Vec<usize>>>,
     bounds: OnceLock<(Vec3, Vec3)>,
+    topology_hash: OnceLock<u64>,
     /// Bounding box of every `RAY_CHUNK` consecutive faces.
     chunks: OnceLock<Vec<(Vec3, Vec3)>>,
 }
@@ -80,18 +81,36 @@ pub fn ray_box_entry(ray: &Ray, min: Vec3, max: Vec3) -> Option<f32> {
 /// Reads go straight through; the first mutable access after a clone copies the data. This
 /// makes cloning a scene (autosave snapshots, undo entries, revisions) cost a reference count
 /// per array instead of a deep copy of millions of faces.
-#[derive(Default)]
-pub struct Shared<T>(Arc<T>);
+///
+/// Every mutable access also gives the array a new `generation`, so callers can tell cheaply
+/// whether geometry changed, including in-place edits that never call `Mesh::bump_version`.
+pub struct Shared<T>(Arc<T>, u64);
+
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
-        Self(Arc::new(value))
+        Self(Arc::new(value), next_generation())
+    }
+
+    /// Changes whenever the contents may have changed; clones keep it until they are edited.
+    pub fn generation(&self) -> u64 {
+        self.1
+    }
+}
+
+impl<T: Default> Default for Shared<T> {
+    fn default() -> Self {
+        Self::new(T::default())
     }
 }
 
 impl<T> Clone for Shared<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1)
     }
 }
 
@@ -110,6 +129,7 @@ impl<T> std::ops::Deref for Shared<T> {
 
 impl<T: Clone> std::ops::DerefMut for Shared<T> {
     fn deref_mut(&mut self) -> &mut T {
+        self.1 = next_generation();
         Arc::make_mut(&mut self.0)
     }
 }
@@ -144,6 +164,7 @@ where
     type Item = <&'a mut T as IntoIterator>::Item;
     type IntoIter = <&'a mut T as IntoIterator>::IntoIter;
     fn into_iter(self) -> Self::IntoIter {
+        self.1 = next_generation();
         Arc::make_mut(&mut self.0).into_iter()
     }
 }
@@ -202,6 +223,7 @@ impl Mesh {
                     vert_faces: OnceLock::new(),
                     edge_faces: OnceLock::new(),
                     bounds: OnceLock::new(),
+                    topology_hash: OnceLock::new(),
                     chunks: OnceLock::new(),
                 });
                 *slot = Some(d.clone());
@@ -295,6 +317,12 @@ impl Mesh {
         mesh
     }
 
+    /// Identifies the current vertex positions and faces. Unlike `version` it ignores selection
+    /// changes, and it also catches in-place edits made without `bump_version`.
+    pub fn geometry_stamp(&self) -> (u64, u64) {
+        (self.positions.generation(), self.faces.generation())
+    }
+
     #[inline]
     pub fn bump_version(&mut self) {
         static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10);
@@ -303,6 +331,11 @@ impl Mesh {
 
     /// Stable topology identity, independent of selection and rendering caches.
     pub fn topology_hash(&self) -> u64 {
+        // Comment targets compare this on every lookup, so it is cached with the other derived data.
+        *self.derived().topology_hash.get_or_init(|| self.compute_topology_hash())
+    }
+
+    fn compute_topology_hash(&self) -> u64 {
         let mut hash = 14695981039346656037u64;
         for n in std::iter::once(self.positions.len()).chain(
             self.faces
