@@ -2918,8 +2918,6 @@ fn revisions_tab(
                                 ui.horizontal(|ui| {
                                     if primary(ui, "Revert & send notes", !state.request_notes.trim().is_empty()) {
                                         action(state, "request_changes", json!({"revision_id": rid, "notes": state.request_notes.trim()}));
-                                        state.request_changes_for = None;
-                                        state.request_notes.clear();
                                         *view_changed = true;
                                     }
                                     if ui.button("Cancel").clicked() {
