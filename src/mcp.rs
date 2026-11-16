@@ -595,14 +595,20 @@ pub fn mcp_tool_definitions() -> Value {
             }
         },
         {
+            "name": "library_show",
+            "description": "Open the full asset library view in the GUI so the user can browse the previews.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "library_save_asset",
-            "description": "Save scene parts to the asset library as one reusable asset. Parts come from object_ids, names or group; with none of those, the current selection is saved. The asset's base centre becomes its origin. The scene is not changed.",
+            "description": "Save scene parts to the asset library as one reusable asset. Pass all: true to save the whole model (every visible part) as a single asset, or choose parts with object_ids, names or group; with none of those, the current selection is saved. The asset's base centre becomes its origin. The scene is not changed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Asset name, e.g. 'Oak chair'." },
                     "section": { "type": "string", "description": "Library section, e.g. 'Furniture'. Created if missing." },
                     "subsection": { "type": "string", "description": "Subsection inside the section, e.g. 'Chairs' (default 'General'). Created if missing." },
+                    "all": { "type": "boolean", "description": "Save the whole model: every visible part, as one asset." },
                     "object_ids": { "type": "array", "items": { "type": "integer" }, "description": "Parts to save, by id." },
                     "names": { "type": "array", "items": { "type": "string" }, "description": "Parts to save, by name." },
                     "group": { "type": "string", "description": "Save every part named 'Group/…', e.g. 'Chair'." },

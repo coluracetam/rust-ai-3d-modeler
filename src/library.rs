@@ -22,6 +22,7 @@ const TRASH_DIR: &str = ".trash";
 /// Tools that never change the scene (they only touch library files).
 pub const READ_ONLY: &[&str] = &[
     "library_list",
+    "library_show",
     "library_save_asset",
     "library_create_section",
     "library_delete_asset",
@@ -379,7 +380,7 @@ pub fn render_thumbnail(info: &AssetInfo) -> Result<String, String> {
     let mut scene = Scene::empty();
     scene.objects = asset.objects;
     let bounds = bounds_of(&scene.objects).ok_or("Asset has no geometry")?;
-    let (width, height) = (320, 240);
+    let (width, height) = (480, 360);
     let mut camera = OrbitCamera {
         aspect: width as f32 / height as f32,
         yaw: 0.7,
@@ -497,11 +498,18 @@ pub fn insert_asset(scene: &mut Scene, asset: &Asset, position: Vec3, yaw_deg: f
     indices
 }
 
-/// Parts named by `object_ids`, `names` or `group` (a `Group/Part` prefix); with none of those,
-/// the current selection (the active part plus every part with selected faces).
+/// Parts named by `all` (the whole model), `object_ids`, `names` or `group` (a `Group/Part`
+/// prefix); with none of those, the current selection.
 pub fn parts_from_args(scene: &Scene, args: &Value) -> Result<Vec<usize>, String> {
     let mut indices = Vec::new();
     let mut explicit = false;
+    if args["all"].as_bool().unwrap_or(false) {
+        explicit = true;
+        indices = visible_parts(scene);
+        if indices.is_empty() {
+            return Err("The scene has no visible parts to save".into());
+        }
+    }
     for id in args["object_ids"].as_array().into_iter().flatten() {
         explicit = true;
         let id = id.as_u64().ok_or("object_ids must be a list of part ids")?;
@@ -543,9 +551,16 @@ pub fn parts_from_args(scene: &Scene, args: &Value) -> Result<Vec<usize>, String
     indices.sort_unstable();
     indices.dedup();
     if indices.is_empty() {
-        return Err("Select the parts to save, or pass object_ids, names or group".into());
+        return Err("Select the parts to save, or pass all, object_ids, names or group".into());
     }
     Ok(indices)
+}
+
+/// The whole model: every visible part that has geometry.
+pub fn visible_parts(scene: &Scene) -> Vec<usize> {
+    (0..scene.objects.len())
+        .filter(|&i| scene.objects[i].visible && !scene.objects[i].mesh.faces.is_empty())
+        .collect()
 }
 
 /// The active part plus every part with selected faces.
@@ -562,7 +577,12 @@ fn info_json(info: &AssetInfo) -> Value {
 }
 
 /// Library tools. `None` means the tool is not one of these.
-pub fn dispatch(req: &IpcRequest, scene: &mut Scene, history: &mut UndoHistory) -> Option<IpcResponse> {
+pub fn dispatch(
+    req: &IpcRequest,
+    scene: &mut Scene,
+    history: &mut UndoHistory,
+    ui_state: &mut crate::ui::UiState,
+) -> Option<IpcResponse> {
     let args = &req.args;
     let root = root();
     let text = |key: &str| args[key].as_str().map(str::trim).filter(|s| !s.is_empty());
@@ -603,6 +623,11 @@ pub fn dispatch(req: &IpcRequest, scene: &mut Scene, history: &mut UndoHistory) 
                 format!("{count} asset(s) in {} section(s)", sections.len()),
                 json!({ "library_path": root.to_string_lossy(), "sections": tree }),
             ))
+        }
+        "library_show" => {
+            ui_state.library.open = true;
+            ui_state.library.scanned = None;
+            Ok(IpcResponse::success("Opened the asset library view", json!({})))
         }
         "library_save_asset" => {
             let indices = parts_from_args(scene, args)?;
@@ -704,6 +729,10 @@ pub fn dispatch(req: &IpcRequest, scene: &mut Scene, history: &mut UndoHistory) 
     }
 }
 
+/// Tests that point `RUST_MODELER_LIBRARY` at a temporary folder hold this while they run.
+#[cfg(test)]
+pub static TEST_ROOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,7 +827,7 @@ mod tests {
     #[test]
     fn tools_save_insert_and_undo() {
         let root = temp_root("tools");
-        // Only this test reads the variable.
+        let _guard = TEST_ROOT.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RUST_MODELER_LIBRARY", &root) };
         let mut scene = chair_scene();
         let mut camera = OrbitCamera::default();
@@ -850,6 +879,9 @@ mod tests {
         let mut scene = chair_scene();
         assert_eq!(parts_from_args(&scene, &json!({ "group": "Chair" })).unwrap(), [0, 1]);
         assert_eq!(parts_from_args(&scene, &json!({ "names": ["lamp"] })).unwrap(), [2]);
+        scene.objects[1].visible = false;
+        assert_eq!(parts_from_args(&scene, &json!({ "all": true })).unwrap(), [0, 2]);
+        scene.objects[1].visible = true;
         // Active part (the lamp, added last) plus the seat with a selected face.
         assert_eq!(parts_from_args(&scene, &json!({})).unwrap(), [0, 2]);
         assert!(parts_from_args(&scene, &json!({ "object_ids": [99] })).is_err());

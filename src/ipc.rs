@@ -2047,7 +2047,7 @@ fn dispatch(
             show_wireframe,
             show_grid,
         )
-        .or_else(|| crate::library::dispatch(req, scene, history))
+        .or_else(|| crate::library::dispatch(req, scene, history, ui_state))
         .unwrap_or_else(|| IpcResponse::error(format!("Unknown MCP tool '{other}'"))),
     }
 }
