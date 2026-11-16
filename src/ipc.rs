@@ -1832,6 +1832,10 @@ fn dispatch(
             let before = scene.clone();
             match scene.request_revision_changes(id, notes) {
                 Ok(()) => {
+                    if ui_state.request_changes_for == Some(id) {
+                        ui_state.request_changes_for = None;
+                        ui_state.request_notes.clear();
+                    }
                     history.record("Request changes", &before);
                     IpcResponse::success(
                         "Revision reverted; the comment is open again with your notes",
