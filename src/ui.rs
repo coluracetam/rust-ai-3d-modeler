@@ -154,6 +154,28 @@ pub struct UiState {
     pub focus_composer: bool,
     /// Path being typed to attach an image (None = field hidden).
     pub attach_path: Option<String>,
+    /// Asset library tab.
+    pub library: LibraryUi,
+}
+
+/// State of the asset library tab. The listing is shared so cloning `UiState` stays cheap.
+#[derive(Clone, Default)]
+pub struct LibraryUi {
+    pub sections: std::sync::Arc<Vec<crate::library::Section>>,
+    /// When the library folder was last read; `None` forces a rescan.
+    pub scanned: Option<std::time::Instant>,
+    pub search: String,
+    /// Folded folders: "Section" or "Section/Subsection".
+    pub collapsed: HashSet<String>,
+    /// The "save selection as asset" form is open.
+    pub save_open: bool,
+    pub asset_name: String,
+    pub section: String,
+    pub subsection: String,
+    /// Folder being named: the parent section (None = a new section) and the typed name.
+    pub new_folder: Option<(Option<String>, String)>,
+    /// Asset whose delete button was pressed once; a second press within a few seconds deletes.
+    pub confirm_delete: Option<(String, std::time::Instant)>,
 }
 
 impl Default for UiState {
@@ -235,6 +257,7 @@ impl Default for UiState {
             compare_split: None,
             focus_composer: false,
             attach_path: None,
+            library: LibraryUi::default(),
         }
     }
 }
@@ -1586,17 +1609,23 @@ fn draw_scene_panel(
                 ui.label(small_muted(plural(scene.objects.len(), "part", "parts")));
             });
             ui.add_space(2.0);
+            // Four tabs do not fit the panel with labels, so only the open tab shows its name.
+            let tab = state.scene_tab;
+            let label = |i: usize, glyph: &str, text: &str| {
+                if tab == i { icon_text(glyph, text) } else { glyph.to_string() }
+            };
             segmented(
                 ui,
                 &mut state.scene_tab,
                 &[
-                    (0, icon_text(icon::TREE_STRUCTURE, "Parts"), "Browse, show and hide parts"),
+                    (0, label(0, icon::TREE_STRUCTURE, "Parts"), "Parts · browse, show and hide parts"),
                     (
                         1,
-                        icon_text(icon::SLIDERS, "Inspect"),
-                        "Section plane, ghosting and measurement",
+                        label(1, icon::SLIDERS, "Inspect"),
+                        "Inspect · section plane, ghosting and measurement",
                     ),
-                    (2, icon_text(icon::BOOKMARK_SIMPLE, "Saved"), "Saved selections and camera views"),
+                    (2, label(2, icon::BOOKMARK_SIMPLE, "Saved"), "Saved · selections and camera views"),
+                    (3, label(3, icon::BOOKS, "Library"), "Library · reusable assets shared by every project"),
                 ],
             );
             ui.add_space(4.0);
@@ -1604,6 +1633,7 @@ fn draw_scene_panel(
             match state.scene_tab {
                 0 => scene_parts_tab(ui, scene, camera, state, comparing),
                 1 => scene_inspect_tab(ui, scene, renderer, state),
+                3 => scene_library_tab(ui, scene, camera, state, comparing),
                 _ => {
                     egui::ScrollArea::vertical()
                         .id_salt("saved_scroll")
@@ -1940,6 +1970,553 @@ fn scene_parts_tab(
             frame_selection(scene, camera);
         }
     }
+}
+
+/// Text field with a menu of existing names to pick from.
+fn name_with_choices(ui: &mut egui::Ui, value: &mut String, placeholder: &str, choices: &[String]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let width = (ui.available_width() - 56.0).max(60.0);
+        text_field(ui, value, placeholder, width);
+        ui.add_enabled_ui(!choices.is_empty(), |ui| {
+            ui.menu_button(icon::CARET_DOWN, |ui| {
+                for choice in choices {
+                    if ui.button(choice).clicked() {
+                        *value = choice.clone();
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Pick an existing one")
+            .on_disabled_hover_text("Nothing to pick yet; type a new name");
+        });
+    });
+}
+
+/// Small glyph buttons painted at the right edge of a library row. Returns the pressed one.
+fn row_buttons(
+    ui: &egui::Ui,
+    row: &egui::Response,
+    buttons: &[(&str, &str, Color32)],
+) -> (Option<usize>, f32) {
+    let rect = row.rect;
+    let mut pressed = None;
+    let mut left = rect.right() - 2.0;
+    for (i, (glyph, tip, color)) in buttons.iter().enumerate().rev() {
+        let button = egui::Rect::from_min_max(
+            egui::pos2(left - 26.0, rect.center().y - 13.0),
+            egui::pos2(left, rect.center().y + 13.0),
+        );
+        left -= 26.0;
+        let r = ui
+            .interact(button, row.id.with(("button", i)), egui::Sense::click())
+            .on_hover_text(*tip);
+        if r.hovered() {
+            ui.painter().rect_filled(button, 6, Color32::from_rgb(40, 50, 66));
+        }
+        ui.painter().text(
+            button.center(),
+            egui::Align2::CENTER_CENTER,
+            *glyph,
+            FontId::proportional(15.0),
+            if r.hovered() && *color == SUBTLE { TEXT } else { *color },
+        );
+        if r.clicked() {
+            pressed = Some(i);
+        }
+    }
+    (pressed, left)
+}
+
+/// Collapsible section / subsection heading. Returns (heading clicked, pressed button).
+fn folder_row(
+    ui: &mut egui::Ui,
+    indent: f32,
+    collapsed: bool,
+    name: &str,
+    count: usize,
+    buttons: &[(&str, &str, Color32)],
+) -> (bool, Option<usize>) {
+    let (rect, row) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
+    if row.hovered() {
+        ui.painter().rect_filled(rect, 6, HOVER_ROW);
+    }
+    let (pressed, right) = row_buttons(ui, &row, buttons);
+    let p = ui.painter().with_clip_rect(rect);
+    let x = rect.left() + 6.0 + indent;
+    p.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        if collapsed { icon::CARET_RIGHT } else { icon::CARET_DOWN },
+        FontId::proportional(12.0),
+        MUTED,
+    );
+    p.text(
+        egui::pos2(x + 18.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        if collapsed { icon::FOLDER } else { icon::FOLDER_OPEN },
+        FontId::proportional(15.0),
+        if indent > 0.0 { SUBTLE } else { MUTED },
+    );
+    let count_text = p.text(
+        egui::pos2(right - 6.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        count.to_string(),
+        FontId::proportional(11.5),
+        SUBTLE,
+    );
+    p.with_clip_rect(egui::Rect::from_min_max(rect.min, egui::pos2(count_text.left() - 6.0, rect.bottom())))
+        .text(
+            egui::pos2(x + 40.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            name,
+            if indent > 0.0 { FontId::proportional(13.0) } else { medium_font(13.5) },
+            TEXT,
+        );
+    (row.clicked() && pressed.is_none(), pressed)
+}
+
+/// Inline "name a new folder" row. `Some(true)` = create, `Some(false)` = cancel.
+fn new_folder_row(ui: &mut egui::Ui, draft: &mut String, placeholder: &str) -> Option<bool> {
+    let mut result = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let width = (ui.available_width() - 110.0).max(60.0);
+        let field = text_field(ui, draft, placeholder, width);
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let ready = !draft.trim().is_empty();
+        if (tool_button(ui, "Create", ready, "Create it", "Type a name first") || (enter && ready))
+            && ready
+        {
+            result = Some(true);
+        }
+        if quiet_button(ui, "×", "Cancel") {
+            result = Some(false);
+        }
+    });
+    result
+}
+
+fn library_thumbnail(
+    ctx: &egui::Context,
+    state: &mut UiState,
+    asset: &crate::library::AssetInfo,
+) -> Option<egui::TextureHandle> {
+    let path = asset.thumbnail.as_ref()?;
+    // Saving an asset again changes `modified`, so a replaced thumbnail is reloaded.
+    let key = format!("{path}#{}", asset.modified);
+    state
+        .screenshot_cache
+        .entry(key.clone())
+        .or_insert_with(|| {
+            let image = image::open(path).map_err(|e| e.to_string())?.into_rgba8();
+            let pixels = egui::ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                image.as_raw(),
+            );
+            Ok(ctx.load_texture(key, pixels, egui::TextureOptions::LINEAR))
+        })
+        .clone()
+        .ok()
+}
+
+fn scene_library_tab(
+    ui: &mut egui::Ui,
+    scene: &Scene,
+    camera: &OrbitCamera,
+    state: &mut UiState,
+    comparing: bool,
+) {
+    use crate::library;
+    let root = library::root();
+    // Agents and other windows can change the library, so reread it while the tab is open.
+    if state.library.scanned.is_none_or(|t| t.elapsed().as_secs_f32() > 2.0) {
+        state.library.sections = std::sync::Arc::new(library::list(&root));
+        state.library.scanned = Some(std::time::Instant::now());
+    }
+    let sections = state.library.sections.clone();
+    let selected = library::selected_parts(scene);
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let w = (ui.available_width() - 36.0).max(60.0);
+        ui.allocate_ui(egui::vec2(w, 32.0), |ui| {
+            search_field(ui, &mut state.library.search, "Search assets…");
+        });
+        if icon_button(ui, icon::FOLDER_PLUS, "New section", false, true).clicked() {
+            state.library.new_folder = Some((None, String::new()));
+        }
+    });
+
+    if let Some((None, draft)) = &mut state.library.new_folder {
+        match new_folder_row(ui, draft, "Section name") {
+            Some(true) => {
+                match library::create_section(&root, draft, None) {
+                    Ok(_) => state.library.new_folder = None,
+                    Err(e) => state.last_error = Some(e),
+                }
+                state.library.scanned = None;
+            }
+            Some(false) => state.library.new_folder = None,
+            None => {}
+        }
+    }
+
+    if !state.library.save_open {
+        let label = if selected.is_empty() {
+            icon_text(icon::PLUS, "Save selection as asset")
+        } else {
+            icon_text(icon::PLUS, &format!("Save {} as asset", plural(selected.len(), "part", "parts")))
+        };
+        if ui
+            .add_enabled(
+                !selected.is_empty(),
+                egui::Button::new(label).min_size(egui::vec2(ui.available_width(), 0.0)),
+            )
+            .on_hover_text("Keep the selected parts in the library to reuse them in any project")
+            .on_disabled_hover_text("Select the parts you want to keep, then save them here")
+            .clicked()
+        {
+            // Suggest the shared "Group/…" name, or the part's own name.
+            let names: Vec<&str> = selected.iter().map(|&i| scene.objects[i].name.as_str()).collect();
+            let group = names[0].split_once('/').map(|(g, _)| g.trim()).filter(|g| !g.is_empty());
+            let shared = group.filter(|g| {
+                names.iter().all(|n| n.split_once('/').is_some_and(|(other, _)| other.trim() == *g))
+            });
+            state.library.asset_name = match (shared, names.len()) {
+                (Some(group), _) => group.to_string(),
+                (None, 1) => names[0].rsplit('/').next().unwrap_or(names[0]).trim().to_string(),
+                _ => String::new(),
+            };
+            if state.library.section.is_empty() {
+                if let Some(first) = sections.first() {
+                    state.library.section = first.name.clone();
+                    state.library.subsection =
+                        first.subsections.first().map(|s| s.name.clone()).unwrap_or_default();
+                }
+            }
+            state.library.save_open = true;
+        }
+    } else {
+        card().show(ui, |ui| {
+            eyebrow(ui, &format!("Save {} as asset", plural(selected.len(), "part", "parts")));
+            let width = ui.available_width();
+            text_field(ui, &mut state.library.asset_name, "Asset name", width - 18.0);
+            let section_names: Vec<String> = sections.iter().map(|s| s.name.clone()).collect();
+            name_with_choices(ui, &mut state.library.section, "Section, e.g. Furniture", &section_names);
+            let typed_section = state.library.section.trim().to_lowercase();
+            let section = sections.iter().find(|s| s.name.to_lowercase() == typed_section);
+            let sub_names: Vec<String> = section
+                .map(|s| s.subsections.iter().map(|sub| sub.name.clone()).collect())
+                .unwrap_or_default();
+            name_with_choices(ui, &mut state.library.subsection, "Subsection, e.g. Chairs", &sub_names);
+
+            let name = state.library.asset_name.trim().to_string();
+            let typed_sub = state.library.subsection.trim().to_lowercase();
+            let exists = section
+                .and_then(|s| s.subsections.iter().find(|sub| sub.name.to_lowercase() == typed_sub))
+                .is_some_and(|sub| sub.assets.iter().any(|a| a.name == name));
+            let ready = !selected.is_empty()
+                && !name.is_empty()
+                && !typed_section.is_empty()
+                && !typed_sub.is_empty();
+            if exists {
+                ui.label(RichText::new("An asset with this name is already there.").size(12.0).color(WARN));
+            }
+            ui.horizontal(|ui| {
+                let disabled_tip = if selected.is_empty() {
+                    "Select the parts to save"
+                } else {
+                    "Fill in the name, section and subsection"
+                };
+                let save = if exists {
+                    tool_button(ui, "Replace it", ready, "Overwrite the asset in the library", disabled_tip)
+                } else {
+                    primary(ui, "Save to library", ready)
+                };
+                if quiet_button(ui, "Cancel", "") {
+                    state.library.save_open = false;
+                }
+                if save {
+                    library_save(&root, scene, &selected, state, exists);
+                }
+            });
+        });
+    }
+    ui.add_space(2.0);
+
+    let search = state.library.search.trim().to_lowercase();
+    let matches = |a: &library::AssetInfo| {
+        search.is_empty()
+            || a.name.to_lowercase().contains(&search)
+            || a.description.to_lowercase().contains(&search)
+            || a.tags.iter().any(|t| t.to_lowercase().contains(&search))
+    };
+    let insert_at = match scene.pending_anchor {
+        // A picked surface point is where the user is looking at; otherwise the view centre.
+        Some((_, world, _, _)) if scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty()) => world,
+        _ => camera.target,
+    };
+    let mut shown = 0;
+    let mut rescan = false;
+    egui::ScrollArea::vertical()
+        .id_salt("library_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for section in sections.iter() {
+                let total: usize = section
+                    .subsections
+                    .iter()
+                    .map(|s| s.assets.iter().filter(|a| matches(a)).count())
+                    .sum();
+                if !search.is_empty() && total == 0 {
+                    continue;
+                }
+                let empty = section.subsections.iter().all(|s| s.assets.is_empty());
+                let folded = search.is_empty() && state.library.collapsed.contains(&section.name);
+                let mut buttons = vec![(icon::FOLDER_PLUS, "New subsection", SUBTLE)];
+                if empty {
+                    buttons.push((icon::TRASH, "Delete this empty section", SUBTLE));
+                }
+                let (clicked, pressed) = folder_row(ui, 0.0, folded, &section.name, total, &buttons);
+                if clicked && !state.library.collapsed.remove(&section.name) {
+                    state.library.collapsed.insert(section.name.clone());
+                }
+                match pressed {
+                    Some(0) => {
+                        state.library.collapsed.remove(&section.name);
+                        state.library.new_folder = Some((Some(section.name.clone()), String::new()));
+                    }
+                    Some(_) => {
+                        if let Err(e) = library::delete_section(&root, &section.name, None) {
+                            state.last_error = Some(e);
+                        }
+                        rescan = true;
+                    }
+                    None => {}
+                }
+                if folded {
+                    continue;
+                }
+                if let Some((Some(parent), draft)) = &mut state.library.new_folder {
+                    if *parent == section.name {
+                        match new_folder_row(ui, draft, "Subsection name") {
+                            Some(true) => {
+                                match library::create_section(&root, &section.name, Some(draft)) {
+                                    Ok(_) => state.library.new_folder = None,
+                                    Err(e) => state.last_error = Some(e),
+                                }
+                                rescan = true;
+                            }
+                            Some(false) => state.library.new_folder = None,
+                            None => {}
+                        }
+                    }
+                }
+                if section.subsections.is_empty() && search.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(30.0);
+                        ui.label(small_muted("No subsections yet."));
+                    });
+                }
+                for sub in &section.subsections {
+                    let assets: Vec<&library::AssetInfo> = sub.assets.iter().filter(|a| matches(a)).collect();
+                    if !search.is_empty() && assets.is_empty() {
+                        continue;
+                    }
+                    let key = format!("{}/{}", section.name, sub.name);
+                    let folded = search.is_empty() && state.library.collapsed.contains(&key);
+                    let buttons: &[(&str, &str, Color32)] = if sub.assets.is_empty() {
+                        &[(icon::TRASH, "Delete this empty subsection", SUBTLE)]
+                    } else {
+                        &[]
+                    };
+                    let (clicked, pressed) = folder_row(ui, 16.0, folded, &sub.name, assets.len(), buttons);
+                    if clicked && !state.library.collapsed.remove(&key) {
+                        state.library.collapsed.insert(key);
+                    }
+                    if pressed.is_some() {
+                        if let Err(e) = library::delete_section(&root, &section.name, Some(&sub.name)) {
+                            state.last_error = Some(e);
+                        }
+                        rescan = true;
+                    }
+                    if folded {
+                        continue;
+                    }
+                    for asset in assets {
+                        shown += 1;
+                        rescan |= library_asset_row(ui, state, &root, asset, insert_at, comparing);
+                    }
+                }
+            }
+            if shown == 0 && sections.is_empty() {
+                ui.add_space(12.0);
+                ui.label(small_muted(
+                    "Your library is empty. Select parts and save them as an asset, or ask your agent to build some. Assets stay available in every project.",
+                ));
+            } else if shown == 0 && !search.is_empty() {
+                ui.add_space(12.0);
+                ui.label(small_muted("No assets match your search."));
+            }
+            ui.add_space(10.0);
+            let path = root.to_string_lossy();
+            truncated(ui, small_muted(format!("Stored in {path}")), &path);
+        });
+    if rescan {
+        state.library.scanned = None;
+    }
+}
+
+fn library_save(
+    root: &std::path::Path,
+    scene: &Scene,
+    parts: &[usize],
+    state: &mut UiState,
+    overwrite: bool,
+) {
+    use crate::library;
+    let saved = library::save_asset(
+        root,
+        scene,
+        parts,
+        library::SaveOptions {
+            section: &state.library.section,
+            subsection: &state.library.subsection,
+            name: &state.library.asset_name,
+            description: "",
+            tags: Vec::new(),
+            overwrite,
+        },
+    );
+    match saved {
+        Ok(info) => {
+            // Without a GPU adapter the asset simply has no picture.
+            let _ = library::render_thumbnail(&info);
+            state.status_message = format!("Saved '{}' to the library", info.reference());
+            state.library.section = info.section;
+            state.library.subsection = info.subsection;
+            state.library.save_open = false;
+            state.library.scanned = None;
+        }
+        Err(e) => state.last_error = Some(e),
+    }
+}
+
+/// One asset: thumbnail, name, counts, and add / delete buttons. Returns true when the
+/// library changed.
+fn library_asset_row(
+    ui: &mut egui::Ui,
+    state: &mut UiState,
+    root: &std::path::Path,
+    asset: &crate::library::AssetInfo,
+    insert_at: Vec3,
+    comparing: bool,
+) -> bool {
+    use serde_json::json;
+    let reference = asset.reference();
+    let armed = state
+        .library
+        .confirm_delete
+        .as_ref()
+        .is_some_and(|(r, at)| *r == reference && at.elapsed().as_secs_f32() < 4.0);
+    let (rect, row) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::click());
+    if row.hovered() {
+        ui.painter().rect_filled(rect, 6, HOVER_ROW);
+    }
+    let add_tip = if comparing {
+        "Return to the live scene to add assets"
+    } else {
+        "Add to the scene"
+    };
+    let delete = if armed {
+        (icon::TRASH, "Click again to move this asset to the library trash", DANGER)
+    } else {
+        (icon::TRASH, "Delete from the library", SUBTLE)
+    };
+    let (pressed, right) = row_buttons(
+        ui,
+        &row,
+        &[(icon::PLUS, add_tip, if comparing { SUBTLE } else { ACCENT }), delete],
+    );
+    let thumb = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 28.0, rect.center().y - 24.0),
+        egui::vec2(64.0, 48.0),
+    );
+    ui.painter().rect_filled(thumb, 6, FIELD);
+    match library_thumbnail(ui.ctx(), state, asset) {
+        Some(texture) => egui::Image::new(&texture).corner_radius(6).paint_at(ui, thumb),
+        None => {
+            ui.painter().text(
+                thumb.center(),
+                egui::Align2::CENTER_CENTER,
+                icon::CUBE,
+                FontId::proportional(20.0),
+                SUBTLE,
+            );
+        }
+    }
+    let text_left = thumb.right() + 10.0;
+    let p = ui.painter().with_clip_rect(egui::Rect::from_min_max(
+        egui::pos2(text_left, rect.top()),
+        egui::pos2(right - 4.0, rect.bottom()),
+    ));
+    p.text(
+        egui::pos2(text_left, rect.center().y - 9.0),
+        egui::Align2::LEFT_CENTER,
+        &asset.name,
+        medium_font(13.5),
+        TEXT,
+    );
+    p.text(
+        egui::pos2(text_left, rect.center().y + 10.0),
+        egui::Align2::LEFT_CENTER,
+        format!(
+            "{} · {} faces",
+            plural(asset.parts, "part", "parts"),
+            compact_count(asset.faces)
+        ),
+        FontId::proportional(11.5),
+        SUBTLE,
+    );
+    let row = row.on_hover_ui(|ui| {
+        ui.label(semibold(&asset.name, 13.5));
+        if !asset.description.is_empty() {
+            ui.label(&asset.description);
+        }
+        ui.label(small_muted(format!(
+            "{:.2} × {:.2} × {:.2}",
+            asset.size[0], asset.size[1], asset.size[2]
+        )));
+        if !asset.tags.is_empty() {
+            ui.label(small_muted(asset.tags.join(", ")));
+        }
+        ui.label(small_muted("Double-click to add it to the scene"));
+    });
+    if (pressed == Some(0) || (row.double_clicked() && pressed.is_none())) && !comparing {
+        action(
+            state,
+            "library_insert_asset",
+            json!({ "asset": reference, "position": insert_at.to_array() }),
+        );
+    }
+    if pressed == Some(1) {
+        if armed {
+            state.library.confirm_delete = None;
+            match crate::library::delete_asset(root, asset) {
+                Ok(()) => state.status_message = format!("Moved '{}' to the library trash", asset.name),
+                Err(e) => state.last_error = Some(e),
+            }
+            return true;
+        }
+        state.library.confirm_delete = Some((reference, std::time::Instant::now()));
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(4));
+    }
+    false
 }
 
 fn scene_inspect_tab(
@@ -4007,6 +4584,7 @@ enum Cmd {
     Comment,
     CommentsTab,
     RevisionsTab,
+    Library,
     BackToLive,
     ClearSelection,
     Shortcuts,
@@ -4042,6 +4620,7 @@ fn draw_command_palette(
         (icon::LIGHTNING, format!("Send comments immediately: {}", if state.auto_send { "on → off" } else { "off → on" }), "", true, Cmd::AutoSend),
         (icon::CHAT_TEXT, "Show comments".into(), "", true, Cmd::CommentsTab),
         (icon::GIT_DIFF, "Show revisions".into(), "", true, Cmd::RevisionsTab),
+        (icon::BOOKS, "Open asset library".into(), "", true, Cmd::Library),
         (icon::ARROW_LEFT, "Back to live scene".into(), "", comparing, Cmd::BackToLive),
         (icon::RULER, "Measure".into(), "", !comparing, Cmd::Measure),
         (icon::AIRPLANE_TILT, "Fly mode".into(), "`", true, Cmd::Fly),
@@ -4230,6 +4809,7 @@ fn draw_command_palette(
         }
         Cmd::CommentsTab => state.review_tab = 0,
         Cmd::RevisionsTab => state.review_tab = 1,
+        Cmd::Library => state.scene_tab = 3,
         Cmd::BackToLive => {
             scene.preview_revision = None;
             state.compare_split = None;

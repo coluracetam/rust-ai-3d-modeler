@@ -257,6 +257,7 @@ pub fn is_geometry_tool(tool: &str) -> bool {
             | "add_sweep"
             | "boolean"
     ) || crate::agent_tools::GEOMETRY.contains(&tool)
+        || crate::library::GEOMETRY.contains(&tool)
 }
 
 /// Clear per-project UI state (hover, clipping, measurements, comment focus, screenshots)
@@ -291,6 +292,7 @@ pub fn is_read_only(tool: &str) -> bool {
             | "get_feedback_state"
             | "wait_for_feedback"
     ) || crate::agent_tools::READ_ONLY.contains(&tool)
+        || crate::library::READ_ONLY.contains(&tool)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2045,6 +2047,7 @@ fn dispatch(
             show_wireframe,
             show_grid,
         )
+        .or_else(|| crate::library::dispatch(req, scene, history))
         .unwrap_or_else(|| IpcResponse::error(format!("Unknown MCP tool '{other}'"))),
     }
 }

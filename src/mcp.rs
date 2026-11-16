@@ -582,6 +582,100 @@ pub fn mcp_tool_definitions() -> Value {
                 },
                 "required": ["comment_id"]
             }
+        },
+        {
+            "name": "library_list",
+            "description": "List the asset library: reusable models shared by every project, organised as sections > subsections > assets. Each asset reports its 'asset' reference (Section/Subsection/Name), part and face counts, size and thumbnail path.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "description": "Only list this section." },
+                    "search": { "type": "string", "description": "Only list assets whose name, description or tags contain this text." }
+                }
+            }
+        },
+        {
+            "name": "library_save_asset",
+            "description": "Save scene parts to the asset library as one reusable asset. Parts come from object_ids, names or group; with none of those, the current selection is saved. The asset's base centre becomes its origin. The scene is not changed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Asset name, e.g. 'Oak chair'." },
+                    "section": { "type": "string", "description": "Library section, e.g. 'Furniture'. Created if missing." },
+                    "subsection": { "type": "string", "description": "Subsection inside the section, e.g. 'Chairs' (default 'General'). Created if missing." },
+                    "object_ids": { "type": "array", "items": { "type": "integer" }, "description": "Parts to save, by id." },
+                    "names": { "type": "array", "items": { "type": "string" }, "description": "Parts to save, by name." },
+                    "group": { "type": "string", "description": "Save every part named 'Group/…', e.g. 'Chair'." },
+                    "description": { "type": "string", "description": "Optional note shown in the library." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional search tags." },
+                    "overwrite": { "type": "boolean", "description": "Replace an asset with the same name (default false)." },
+                    "thumbnail": { "type": "boolean", "description": "Render a thumbnail (default true)." }
+                },
+                "required": ["name", "section"]
+            }
+        },
+        {
+            "name": "library_insert_asset",
+            "description": "Add a copy of a library asset to the scene. Its parts are named 'AssetName/Part' (a number is added when that group already exists) and one undo step removes them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset": { "type": "string", "description": "'Section/Subsection/Name' from library_list, or just the name when it is unique." },
+                    "position": { "type": "array", "items": { "type": "number" }, "description": "World [x, y, z] where the centre of the asset's base goes (default origin)." },
+                    "rotation_y_deg": { "type": "number", "description": "Turn around the vertical axis in degrees (default 0)." },
+                    "scale": { "type": "number", "description": "Uniform scale factor (default 1)." }
+                },
+                "required": ["asset"]
+            }
+        },
+        {
+            "name": "library_create_section",
+            "description": "Create a library section, or a subsection inside it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "description": "Section name." },
+                    "subsection": { "type": "string", "description": "Subsection to create inside the section." }
+                },
+                "required": ["section"]
+            }
+        },
+        {
+            "name": "library_move_asset",
+            "description": "Move a library asset to another section/subsection and/or rename it. Omitted fields keep their current value.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset": { "type": "string", "description": "'Section/Subsection/Name', or just the name when it is unique." },
+                    "section": { "type": "string", "description": "Destination section (created if missing)." },
+                    "subsection": { "type": "string", "description": "Destination subsection (created if missing)." },
+                    "name": { "type": "string", "description": "New asset name." }
+                },
+                "required": ["asset"]
+            }
+        },
+        {
+            "name": "library_delete_asset",
+            "description": "Remove an asset from the library. Its files move to the library's .trash folder, so the user can recover them. Only do this when the user asks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset": { "type": "string", "description": "'Section/Subsection/Name', or just the name when it is unique." }
+                },
+                "required": ["asset"]
+            }
+        },
+        {
+            "name": "library_delete_section",
+            "description": "Delete an empty library subsection, or a section that holds no assets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "description": "Section name." },
+                    "subsection": { "type": "string", "description": "Delete only this subsection." }
+                },
+                "required": ["section"]
+            }
         }
     ])
 }
