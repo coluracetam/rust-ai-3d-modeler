@@ -2301,7 +2301,7 @@ fn library_save_form(
         let typed_sub = state.library.subsection.trim().to_lowercase();
         let exists = section
             .and_then(|s| s.subsections.iter().find(|sub| sub.name.to_lowercase() == typed_sub))
-            .is_some_and(|sub| sub.assets.iter().any(|a| a.name == name));
+            .is_some_and(|sub| sub.assets.iter().any(|a| a.name.to_lowercase() == name.to_lowercase()));
         let ready = !parts.is_empty()
             && !name.is_empty()
             && !typed_section.is_empty()
@@ -4171,8 +4171,6 @@ fn revisions_tab(
                                 ui.horizontal(|ui| {
                                     if primary(ui, "Revert & send notes", !state.request_notes.trim().is_empty()) {
                                         action(state, "request_changes", json!({"revision_id": rid, "notes": state.request_notes.trim()}));
-                                        state.request_changes_for = None;
-                                        state.request_notes.clear();
                                         *view_changed = true;
                                     }
                                     if ui.button("Cancel").clicked() {

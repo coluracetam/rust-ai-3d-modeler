@@ -587,10 +587,25 @@ fn drafts_are_hidden_until_sent_and_change_requests_reopen_comments() {
     let id = r.data["revision_id"].as_u64().unwrap();
     e.scene.objects[0].transform.scale.y = 2.0;
     assert!(e.call("finish_revision", json!({"revision_id":id,"summary":"Scaled"})).ok);
+    // Notes must go through while the user is looking at Before / After, not only Current.
+    assert!(e.call("preview_revision", json!({"revision_id":id,"before":true})).ok);
+    e.ui.request_changes_for = Some(id);
+    e.ui.request_notes = "Only the top half".into();
+    e.scene.objects[0].transform.scale.y = 3.0;
+    assert!(
+        !e.call("request_changes", json!({"revision_id":id,"notes":"Only the top half"}))
+            .ok
+    );
+    assert_eq!(e.ui.request_changes_for, Some(id));
+    assert_eq!(e.ui.request_notes, "Only the top half");
+    e.scene.objects[0].transform.scale.y = 2.0;
     assert!(
         e.call("request_changes", json!({"revision_id":id,"notes":"Only the top half"}))
             .ok
     );
+    assert!(e.scene.preview_revision.is_none(), "the comparison closes with the review");
+    assert!(e.ui.request_changes_for.is_none());
+    assert!(e.ui.request_notes.is_empty());
     assert_eq!(e.scene.objects[0].transform.scale.y, 1.0);
     let comment = e.scene.comments.iter().find(|x| x.id == c.id).unwrap();
     assert_eq!(comment.status, CommentStatus::Open);
