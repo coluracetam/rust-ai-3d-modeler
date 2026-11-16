@@ -1231,32 +1231,20 @@ impl Renderer3D {
         // 3D Spatial Comment Pin & Region Markers (for AI-driven review workflow)
         let mut pin_lines = Vec::new();
         for c in &scene.comments {
-            if c.resolved || c.is_general || c.object_id == 0 || scene.comment_needs_reattachment(c)
+            // Only the focused comment draws 3D markers; the UI badges mark the rest.
+            if scene.active_comment_id != Some(c.id)
+                || c.resolved
+                || c.is_general
+                || c.object_id == 0
+                || scene.comment_needs_reattachment(c)
             {
                 continue;
             }
-            // Only the focused comment draws 3D markers; the UI badges mark the rest.
-            let is_active = scene.active_comment_id == Some(c.id);
-            if !is_active {
-                continue;
-            }
-            let col = if is_active {
-                [0.18, 0.95, 1.0]
-            } else if c.draft {
-                [0.62, 0.68, 0.78]
-            } else {
-                [1.0, 0.62, 0.30]
-            };
+            let col = [0.18, 0.95, 1.0];
             let r = c.selection_radius.clamp(0.15, 2.5);
             if !c.targets.is_empty() {
-                for t in &c.targets {
-                    let refreshed = scene.refreshed_target(t);
-                    pin_lines.extend(Self::build_comment_pin_lines(
-                        refreshed.as_ref().map(|t| t.world_anchor).unwrap_or(t.world_anchor),
-                        refreshed.as_ref().map(|t| t.surface_normal).unwrap_or(t.surface_normal),
-                        r,
-                        col,
-                    ));
+                for &(anchor, normal) in &scene.comment_geometry(c).pins {
+                    pin_lines.extend(Self::build_comment_pin_lines(anchor, normal, r, col));
                 }
             } else {
                 pin_lines.extend(Self::build_comment_pin_lines(
