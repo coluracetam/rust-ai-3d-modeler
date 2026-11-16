@@ -34,6 +34,8 @@ pub struct BakedPart {
 pub struct Bake {
     /// One entry per input object, in order.
     pub parts: Vec<BakedPart>,
+    /// Optional simplified collision geometry, before hidden faces are removed.
+    pub collision_parts: Vec<BakedPart>,
     /// The atlas as an sRGB-encoded RGB PNG.
     pub png: Vec<u8>,
     pub size: u32,
@@ -522,7 +524,12 @@ fn weld(source: &Source) -> Welded {
         min = min.min(p);
         max = max.max(p);
     }
-    let cell = ((max - min).length() as f64 * 1e-6).max(1e-5);
+    // Stay below the shortest edge so welding cannot merge its endpoints.
+    let shortest_edge = source.tris.iter().flat_map(|tri| {
+        let [a, b, c] = tri.map(|v| source.positions[v as usize].as_dvec3());
+        [(b - a).length(), (c - b).length(), (a - c).length()]
+    }).fold(f64::INFINITY, f64::min);
+    let cell = (((max - min).as_dvec3().length() * 1e-6).min(shortest_edge * 0.25)).max(f64::MIN_POSITIVE);
     let mut lookup: HashMap<[i64; 3], u32> = HashMap::with_capacity(source.positions.len());
     let mut positions = Vec::new();
     let remap: Vec<u32> = source
@@ -1147,7 +1154,7 @@ struct Tile {
 }
 
 fn tile_size(extent: Vec2, density: f32, margin: u32) -> (u32, u32) {
-    let side = |length: f32| ((length * density).ceil() as u32).max(1) + 2 * margin;
+    let side = |length: f32| ((length * density).ceil() as u32).max(1).saturating_add(2 * margin);
     (side(extent.x), side(extent.y))
 }
 
@@ -1273,7 +1280,7 @@ fn pack(sizes: &[(u32, u32)], atlas: u32) -> Option<Vec<(u32, u32)>> {
     let (mut x, mut y, mut row) = (0u32, 0u32, 0u32);
     for i in order {
         let (w, h) = sizes[i];
-        if w > atlas {
+        if w > atlas || h > atlas {
             return None;
         }
         if x + w > atlas {
@@ -1318,6 +1325,7 @@ pub fn bake(
     max_triangles: Option<usize>,
     mut size: u32,
     merged: bool,
+    keep_collision: bool,
 ) -> Result<Bake, String> {
     if !(MIN_SIZE..=MAX_SIZE).contains(&size) {
         return Err(format!("The texture size must be between {MIN_SIZE} and {MAX_SIZE} pixels"));
@@ -1481,7 +1489,8 @@ pub fn bake(
         let part = &unwrapped[u];
         let chart = &part.charts[c];
         // Small charts are still looked at closely enough to see whether they are painted.
-        let density = probe.max(8.0 / chart.extent.max_element().max(1e-9)).min(probe * 64.0);
+        let span = chart.extent.max_element().max(1e-9);
+        let density = probe.max(8.0 / span).min(probe * 64.0).min(size as f32 / span);
         let mut tile = sample_chart(&part.low, chart, &uniques[u].source, &part.index, density, 0, 1);
         let detail = chart_detail(&tile);
         let sizes = &mut tile.source_sizes;
@@ -1618,7 +1627,21 @@ pub fn bake(
     let built: Vec<BakedPart> = parallel_map(&unwrapped, |u, part| {
         build_part(part, &chart_places[u], uniques[u].source.scale, size as f32)
     });
+    let collision_parts = if keep_collision {
+        object_unique.iter().map(|&u| {
+            let low = &unwrapped[u].low;
+            let scale = uniques[u].source.scale;
+            BakedPart {
+                positions: low.positions.iter().map(|&p| (p / scale).to_array()).collect(),
+                indices: low.tris.iter().flatten().copied().collect(),
+                ..Default::default()
+            }
+        }).collect()
+    } else {
+        Vec::new()
+    };
     Ok(Bake {
+        collision_parts,
         parts: object_unique.iter().map(|&u| built[u].clone()).collect(),
         png,
         size,
@@ -1770,12 +1793,20 @@ pub(crate) mod tests {
         scene.objects[1].transform.translation = Vec3::new(1.0, 0.0, 0.0);
         let parts: Vec<&SceneObject> = scene.objects.iter().collect();
         let triangles = |merged: bool| -> Vec<usize> {
-            let baked = bake(&parts, None, 256, merged).unwrap();
+            let baked = bake(&parts, None, 256, merged, false).unwrap();
             baked.parts.iter().map(|p| p.indices.len() / 3).collect()
         };
         // The two sides pressed together cannot be seen once the parts are one mesh.
         assert_eq!(triangles(true), [10, 10]);
         assert_eq!(triangles(false), [12, 12]);
+    }
+
+    #[test]
+    fn baking_preserves_small_geometry() {
+        let mut scene = Scene::empty();
+        scene.add_mesh_object("Small cube", Mesh::cube(1e-6), [1.0; 3]);
+        let baked = bake(&[&scene.objects[0]], None, 64, false, false).unwrap();
+        assert_eq!(baked.parts[0].indices.len(), 36);
     }
 
     #[test]
@@ -1808,7 +1839,7 @@ pub(crate) mod tests {
         scene.objects[1].transform.translation = Vec3::new(3.0, 0.0, 0.0);
         scene.add_mesh_object("Ball", Mesh::sphere(1.0, 64, 48), [0.2, 0.6, 0.3]);
         let parts: Vec<&SceneObject> = scene.objects.iter().collect();
-        let baked = bake(&parts, Some(400), 256, false).unwrap();
+        let baked = bake(&parts, Some(400), 256, false, false).unwrap();
         let triangles: usize = baked.parts.iter().map(|p| p.indices.len() / 3).sum();
         assert!(triangles <= 400 && triangles > 200, "{triangles}");
         // The blocks stay boxes and the sphere takes the rest of the budget.
@@ -1819,6 +1850,6 @@ pub(crate) mod tests {
             assert!(part.uvs.iter().flatten().all(|&v| (0.0..=1.0).contains(&v)));
             assert!(part.normals.iter().all(|n| (Vec3::from(*n).length() - 1.0).abs() < 1e-3));
         }
-        assert!(bake(&parts, None, 16, false).is_err());
+        assert!(bake(&parts, None, 16, false, false).is_err());
     }
 }

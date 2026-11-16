@@ -121,6 +121,7 @@ Included out-of-the-box in [`assets/scenes/clockwork_astral_cathedral_scene.json
   - Models here carry their painted detail as vertex colours on dense meshes, which a game cannot afford. With `bake_texture` (the **Bake colours into a texture** switch in both export dialogs) a `.glb` export simplifies every part by edge collapse towards `max_triangles`, leaves out faces that cannot be seen, unwraps what is left and stores the colours in one PNG inside the file (`TEXCOORD_0` + base colour texture instead of `COLOR_0`).
   - `texture_size` (1024, 2048 or 4096) is the largest texture allowed; a smaller one is written when it already holds all the painted detail. Identical parts share texture space, one-colour surfaces share a small swatch, and the rest get texels in proportion to how finely they are painted.
   - Shapes are not simplified past recognition: when the budget is smaller than the model allows, the export stops there and says so in `warnings`. Parts only hide each other's faces in a merged export; separate parts stay complete so they can be moved in the game. See [`src/bake.rs`](src/bake.rs).
+  - Use a vertex-colour export to reimport painted models into this studio. Baked textures are intended for Godot and Blender.
 
 ---
 

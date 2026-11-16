@@ -117,29 +117,35 @@ impl GltfOptions {
             Some(t) if t == "blender" || t == "generic" => self.godot = false,
             Some(t) => return Err(format!("Unknown target '{t}'. Use godot or blender.")),
         }
-        // `bake_texture` is true / false or the size itself; `texture_size` sets the size.
-        let size = args["texture_size"].as_u64().map(|s| s.min(u32::MAX as u64) as u32);
-        match &args["bake_texture"] {
-            Value::Bool(false) => self.bake_texture = None,
-            Value::Bool(true) => {
-                self.bake_texture = Some(size.or(self.bake_texture).unwrap_or(crate::bake::DEFAULT_SIZE));
-            }
-            Value::Number(n) => {
-                let n = n.as_u64().ok_or("'bake_texture' must be true, false or a texture size")? as u32;
-                self.bake_texture = (n > 0).then_some(n);
-            }
-            Value::Null => {
-                if let (Some(size), Some(_)) = (size, self.bake_texture) {
-                    self.bake_texture = Some(size);
-                }
-            }
-            _ => return Err("'bake_texture' must be true, false or a texture size".into()),
-        }
+        self.bake_texture = parse_bake_texture(args, self.bake_texture)?;
         if let Some(name) = args["root_name"].as_str().map(str::trim).filter(|n| !n.is_empty()) {
             self.root_name = name.to_string();
         }
         Ok(self)
     }
+}
+
+pub fn parse_bake_texture(args: &Value, default: Option<u32>) -> Result<Option<u32>, String> {
+    let read_size = |value: &Value| {
+        value.as_u64().and_then(|size| u32::try_from(size).ok())
+            .ok_or("The texture size must be a nonnegative integer")
+    };
+    let size = || {
+        if args["texture_size"].is_null() {
+            Ok(None)
+        } else {
+            read_size(&args["texture_size"]).map(Some)
+        }
+    };
+    let requested = match &args["bake_texture"] {
+        Value::Bool(false) => None,
+        Value::Bool(true) => size()?.or(default).or(Some(crate::bake::DEFAULT_SIZE)),
+        Value::Number(_) => Some(read_size(&args["bake_texture"])?).filter(|&n| n > 0),
+        Value::Null if default.is_some() => size()?.or(default),
+        Value::Null => None,
+        _ => return Err("'bake_texture' must be true, false or a texture size".into()),
+    };
+    Ok(requested)
 }
 
 impl Default for GltfOptions {
@@ -540,8 +546,9 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
     const KEEP_BELOW: usize = 300;
     let mut simplified: Vec<SceneObject> = Vec::new();
     // Baking simplifies by edge collapse itself and keeps the colours in a texture.
-    let baked = match options.bake_texture {
-        Some(size) => Some(crate::bake::bake(objects, options.max_triangles, size, options.merge)?),
+    let keep_collision = matches!(options.collision, Collision::Mesh | Collision::PartBoxes);
+    let mut baked = match options.bake_texture {
+        Some(size) => Some(crate::bake::bake(objects, options.max_triangles, size, options.merge, keep_collision)?),
         None => None,
     };
     let budget = options.max_triangles.filter(|&b| b < source_triangles && baked.is_none());
@@ -562,25 +569,29 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
     }
     let objects: Vec<&SceneObject> =
         if simplified.is_empty() { objects.to_vec() } else { simplified.iter().collect() };
-    let parts: Vec<(&SceneObject, Geometry)> = objects
-        .iter()
-        .enumerate()
-        .map(|(i, obj)| match &baked {
-            Some(baked) => {
-                let part = &baked.parts[i];
-                let geometry = Geometry {
-                    positions: part.positions.clone(),
-                    normals: part.normals.clone(),
-                    colors: Vec::new(),
-                    uvs: part.uvs.clone(),
-                    indices: part.indices.clone(),
-                };
-                (*obj, geometry)
-            }
-            None => (*obj, part_geometry(obj)),
-        })
-        .filter(|(_, geometry)| !geometry.indices.is_empty())
-        .collect();
+    let geometry = |part: crate::bake::BakedPart| Geometry {
+        positions: part.positions,
+        normals: part.normals,
+        colors: Vec::new(),
+        uvs: part.uvs,
+        indices: part.indices,
+    };
+    let baked_geometry = |parts: Vec<crate::bake::BakedPart>| {
+        objects.iter().copied().zip(parts.into_iter().map(geometry))
+    };
+    let parts: Vec<_> = match &mut baked {
+        Some(baked) => baked_geometry(std::mem::take(&mut baked.parts))
+            .filter(|(_, part)| !part.indices.is_empty())
+            .collect(),
+        None => objects.iter().map(|obj| (*obj, part_geometry(obj)))
+            .filter(|(_, part)| !part.indices.is_empty())
+            .collect(),
+    };
+    let collision_parts: Vec<_> = baked.as_mut().map_or_else(Vec::new, |baked| {
+        baked_geometry(std::mem::take(&mut baked.collision_parts))
+            .filter(|(_, part)| !part.indices.is_empty())
+            .collect()
+    });
     if parts.is_empty() {
         return Err("There is no geometry to export".into());
     }
@@ -699,6 +710,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
     }
     w.report.meshes = w.meshes.len();
 
+    let collision_parts = if collision_parts.is_empty() { &parts } else { &collision_parts };
     match options.collision {
         Collision::None => {}
         Collision::Box => {
@@ -706,7 +718,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         }
         Collision::Convex | Collision::Mesh => {
             let mut all = Geometry::default();
-            for (obj, geometry) in &parts {
+            for (obj, geometry) in collision_parts {
                 all.append(geometry, placement * obj.transform.matrix());
             }
             all.normals.clear();
@@ -721,7 +733,7 @@ pub fn build_glb(objects: &[&SceneObject], options: &GltfOptions) -> Result<(Vec
         }
         Collision::PartBoxes => {
             let mut boxes = Vec::new();
-            for (obj, geometry) in &parts {
+            for (obj, geometry) in collision_parts {
                 let (min, max) = bounds(geometry.positions.iter().map(|&p| p.into())).unwrap();
                 let name = obj.name.rsplit('/').next().unwrap_or("Part").trim();
                 let matrix = placement * obj.transform.matrix();
@@ -1097,6 +1109,28 @@ mod tests {
     }
 
     #[test]
+    fn baked_mesh_collision_keeps_faces_hidden_from_the_camera() {
+        let mut scene = Scene::empty();
+        scene.add_mesh_object("Cube 1", crate::mesh::Mesh::cube(1.0), [1.0; 3]);
+        scene.add_mesh_object("Cube 2", crate::mesh::Mesh::cube(1.0), [0.5; 3]);
+        scene.objects[1].transform.translation = Vec3::X;
+        let parts: Vec<_> = scene.objects.iter().collect();
+        let options = GltfOptions {
+            merge: true,
+            collision: Collision::Mesh,
+            bake_texture: Some(64),
+            ..Default::default()
+        };
+        let (glb, report) = build_glb(&parts, &options).unwrap();
+        let doc = document(&glb);
+        let collision = &doc["meshes"][1]["primitives"][0];
+        let indices = collision["indices"].as_u64().unwrap() as usize;
+        assert_eq!(report.triangles, 20);
+        assert_eq!(doc["accessors"][indices]["count"], 72);
+        assert!(collision["attributes"]["TEXCOORD_0"].is_null());
+    }
+
+    #[test]
     fn bake_arguments() {
         let with = |args: Value| GltfOptions::default().with_args(&args).map(|o| o.bake_texture);
         assert_eq!(with(json!({})), Ok(None));
@@ -1106,6 +1140,8 @@ mod tests {
         assert_eq!(with(json!({ "bake_texture": 0, "texture_size": 1024 })), Ok(None));
         assert_eq!(with(json!({ "bake_texture": false })), Ok(None));
         assert!(with(json!({ "bake_texture": "yes" })).is_err());
+        assert!(with(json!({ "bake_texture": 4294967296_u64 })).is_err());
+        assert!(with(json!({ "bake_texture": true, "texture_size": -1024 })).is_err());
         let scene = shelf();
         let parts: Vec<&SceneObject> = scene.objects.iter().collect();
         let error = build_glb(&parts, &GltfOptions { bake_texture: Some(7), ..Default::default() }).unwrap_err();
