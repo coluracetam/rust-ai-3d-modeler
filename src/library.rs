@@ -28,10 +28,11 @@ pub const READ_ONLY: &[&str] = &[
     "library_delete_asset",
     "library_delete_section",
     "library_move_asset",
+    "library_export",
 ];
 pub const GEOMETRY: &[&str] = &["library_insert_asset"];
 /// Tools worth running off the GUI thread (file parsing, thumbnail rendering).
-pub const HEAVY: &[&str] = &["library_save_asset", "library_insert_asset"];
+pub const HEAVY: &[&str] = &["library_save_asset", "library_insert_asset", "library_export"];
 
 #[derive(Serialize, Deserialize)]
 pub struct Asset {
@@ -447,6 +448,103 @@ pub fn move_asset(root: &Path, info: &AssetInfo, section: &str, subsection: &str
     Ok(asset_info(&dir, &section, &subsection, &name))
 }
 
+/// Where exported assets are going, which decides naming and defaults.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ExportTarget {
+    /// `snake_case` files, parts merged by material, optional collision shapes.
+    #[default]
+    Godot,
+    /// Original names, every part its own object, no collision helpers.
+    Blender,
+}
+
+impl ExportTarget {
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name.trim().to_lowercase().as_str() {
+            "" | "godot" => Ok(ExportTarget::Godot),
+            "blender" => Ok(ExportTarget::Blender),
+            other => Err(format!("Unknown target '{other}'. Use godot or blender.")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ExportTarget::Godot => "godot",
+            ExportTarget::Blender => "blender",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExportOptions {
+    pub target: ExportTarget,
+    pub collision: crate::gltf::Collision,
+    /// `None` = the target's default (merged for Godot, separate for Blender).
+    pub merge: Option<bool>,
+    pub scale: f32,
+    /// Triangle budget per asset; `None` exports every triangle.
+    pub max_triangles: Option<usize>,
+}
+
+/// Where an asset is written under `directory`: `section/subsection/name.glb`.
+pub fn export_path(info: &AssetInfo, directory: &Path, target: ExportTarget) -> PathBuf {
+    let spell = |name: &str| match target {
+        ExportTarget::Godot => crate::gltf::snake_case(name),
+        ExportTarget::Blender => name.to_string(),
+    };
+    directory
+        .join(spell(&info.section))
+        .join(spell(&info.subsection))
+        .join(format!("{}.glb", spell(&info.name)))
+}
+
+/// Writes one asset as a `.glb` for Godot or Blender and returns the file and what it holds.
+pub fn export_asset(
+    info: &AssetInfo,
+    directory: &Path,
+    options: &ExportOptions,
+) -> Result<(PathBuf, crate::gltf::ExportReport), String> {
+    let asset = load_asset(info)?;
+    let path = export_path(info, directory, options.target);
+    let godot = options.target == ExportTarget::Godot;
+    let gltf = crate::gltf::GltfOptions {
+        root_name: asset.name.clone(),
+        merge: options.merge.unwrap_or(godot),
+        // Collision hints are a Godot import convention; Blender would show them as meshes.
+        collision: if godot { options.collision } else { crate::gltf::Collision::None },
+        scale: options.scale,
+        center_base: false,
+        max_triangles: options.max_triangles,
+        godot,
+    };
+    let parts: Vec<&SceneObject> = asset.objects.iter().collect();
+    let report = crate::gltf::export_glb(&parts, &path, &gltf)?;
+    Ok((path, report))
+}
+
+/// Export choices remembered between sessions, kept in the library folder.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExportPrefs {
+    pub directory: String,
+    pub target: String,
+    pub collision: String,
+    pub merge: bool,
+    #[serde(default)]
+    pub max_triangles: Option<usize>,
+}
+
+pub fn load_export_prefs(root: &Path) -> Option<ExportPrefs> {
+    serde_json::from_slice(&fs::read(root.join("export.json")).ok()?).ok()
+}
+
+pub fn save_export_prefs(root: &Path, prefs: &ExportPrefs) {
+    if fs::create_dir_all(root).is_ok() {
+        if let Ok(bytes) = serde_json::to_vec_pretty(prefs) {
+            let _ = fs::write(root.join("export.json"), bytes);
+        }
+    }
+}
+
 /// A group name not used by any part yet: `Chair`, then `Chair 2`, `Chair 3`…
 fn unique_group(scene: &Scene, base: &str) -> String {
     let taken = |candidate: &str| {
@@ -685,6 +783,69 @@ pub fn dispatch(
                 }),
             ))
         }
+        "library_export" => {
+            let directory = PathBuf::from(text("directory").ok_or("Missing 'directory' to export into")?);
+            let options = ExportOptions {
+                target: ExportTarget::from_name(text("target").unwrap_or("godot"))?,
+                collision: crate::gltf::Collision::from_name(text("collision").unwrap_or("none"))?,
+                merge: args["merge"].as_bool(),
+                scale: args["scale"].as_f64().unwrap_or(1.0) as f32,
+                max_triangles: args["max_triangles"].as_u64().filter(|&b| b > 0).map(|b| b as usize),
+            };
+            let assets: Vec<AssetInfo> = match text("asset") {
+                Some(reference) => vec![find_asset(&root, reference)?],
+                None => list(&root)
+                    .into_iter()
+                    .filter(|s| text("section").is_none_or(|only| s.name.eq_ignore_ascii_case(only)))
+                    .flat_map(|s| s.subsections)
+                    .filter(|s| text("subsection").is_none_or(|only| s.name.eq_ignore_ascii_case(only)))
+                    .flat_map(|s| s.assets)
+                    .collect(),
+            };
+            if assets.is_empty() {
+                return Err("No library assets match that export".into());
+            }
+            let mut exported = Vec::new();
+            let mut failed = Vec::new();
+            for info in &assets {
+                match export_asset(info, &directory, &options) {
+                    Ok((path, report)) => {
+                        let mut entry = report.to_json();
+                        entry["asset"] = json!(info.reference());
+                        entry["path"] = json!(path.to_string_lossy());
+                        if let Some((_, res)) = crate::gltf::godot_resource_path(&path) {
+                            entry["godot_path"] = json!(res);
+                        }
+                        exported.push(entry);
+                    }
+                    Err(e) => failed.push(json!({ "asset": info.reference(), "error": e })),
+                }
+            }
+            if exported.is_empty() {
+                return Err(format!("Nothing was exported: {}", failed[0]["error"].as_str().unwrap_or("")));
+            }
+            let project = crate::gltf::godot_resource_path(&directory.join("x")).map(|(project, _)| project);
+            let mut message = format!(
+                "Exported {} asset(s) for {} to {}",
+                exported.len(),
+                if options.target == ExportTarget::Godot { "Godot" } else { "Blender" },
+                directory.display()
+            );
+            if !failed.is_empty() {
+                message.push_str(&format!(" · {} failed", failed.len()));
+            }
+            if options.target == ExportTarget::Godot && project.is_none() {
+                message.push_str(" · this folder is not inside a Godot project (no project.godot above it)");
+            }
+            Ok(IpcResponse::success(
+                message,
+                json!({
+                    "exported": exported,
+                    "failed": failed,
+                    "godot_project": project.map(|p| p.to_string_lossy().into_owned()),
+                }),
+            ))
+        }
         "library_create_section" => {
             let section = text("section").ok_or("Missing 'section'")?;
             let dir = create_section(&root, section, text("subsection"))?;
@@ -865,6 +1026,29 @@ mod tests {
         assert_eq!(inserted.data["objects"][0]["name"], "Oak chair/Seat");
         assert!(run(&mut scene, "undo", json!({})).ok);
         assert_eq!(scene.objects.len(), 3);
+
+        // Godot: snake_case path, parts merged, a collision box; Blender: names and parts kept.
+        let out = root.join("exports");
+        let godot = run(&mut scene, "library_export", json!({ "directory": out, "collision": "box" }));
+        assert!(godot.ok, "{}", godot.message);
+        let entry = &godot.data["exported"][0];
+        assert!(entry["path"].as_str().unwrap().ends_with("furniture/general/oak_chair.glb"));
+        assert_eq!((entry["meshes"].as_u64(), entry["collision_shapes"].as_u64()), (Some(1), Some(1)));
+        assert!(godot.message.contains("not inside a Godot project"));
+        let blender = run(
+            &mut scene,
+            "library_export",
+            json!({ "directory": out, "asset": "Oak chair", "target": "blender", "collision": "box" }),
+        );
+        let entry = &blender.data["exported"][0];
+        assert!(entry["path"].as_str().unwrap().ends_with("Furniture/General/Oak chair.glb"));
+        assert_eq!((entry["meshes"].as_u64(), entry["collision_shapes"].as_u64()), (Some(2), Some(0)));
+        let back = crate::io::import_glb_file(Path::new(entry["path"].as_str().unwrap())).unwrap();
+        assert_eq!(back.faces.len(), 24, "two cubes come back as triangles");
+        assert!(!run(&mut scene, "library_export", json!({ "directory": out, "section": "Nope" })).ok);
+        let exported = run(&mut scene, "export_model", json!({ "path": out.join("scene.glb"), "group": "Chair", "merge": true }));
+        assert!(exported.ok, "{}", exported.message);
+        assert_eq!(exported.data["parts"], 2);
 
         assert!(!run(&mut scene, "library_insert_asset", json!({ "asset": "Missing" })).ok);
         assert!(!run(&mut scene, "library_delete_section", json!({ "section": "Furniture" })).ok);

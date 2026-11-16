@@ -1561,9 +1561,49 @@ fn dispatch(
                 .and_then(|s| s.to_str())
                 .unwrap_or("obj")
                 .to_lowercase();
+            if matches!(ext.as_str(), "glb" | "gltf") {
+                // Game-ready glTF: chosen parts (default: everything visible), with options.
+                let chosen = ["all", "object_ids", "names", "group"].iter().any(|k| !args[*k].is_null())
+                    || args["selection"].as_bool().unwrap_or(false);
+                let indices = if chosen {
+                    match crate::library::parts_from_args(scene, args) {
+                        Ok(indices) => indices,
+                        Err(e) => return IpcResponse::error(e),
+                    }
+                } else {
+                    crate::library::visible_parts(scene)
+                };
+                let parts: Vec<&crate::scene::SceneObject> =
+                    indices.iter().map(|&i| &scene.objects[i]).collect();
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Model");
+                // Inside a Godot project the file is written the way Godot's importer needs it.
+                let options = crate::gltf::GltfOptions {
+                    root_name: stem.to_string(),
+                    godot: crate::gltf::godot_resource_path(path).is_some(),
+                    ..Default::default()
+                };
+                let report = match options.with_args(args).and_then(|o| crate::gltf::export_glb(&parts, path, &o)) {
+                    Ok(report) => report,
+                    Err(e) => return IpcResponse::error(e),
+                };
+                let mut data = report.to_json();
+                data["path"] = json!(path_str);
+                let mut message = format!(
+                    "Exported {} part(s) to {} ({} triangles, {} material(s))",
+                    report.parts,
+                    path.display(),
+                    report.triangles,
+                    report.materials
+                );
+                if let Some((_, res)) = crate::gltf::godot_resource_path(path) {
+                    data["godot_path"] = json!(res);
+                    message.push_str(&format!(" · {res}"));
+                }
+                ui_state.status_message = message.clone();
+                return IpcResponse::success(message, data);
+            }
             let res = match ext.as_str() {
                 "stl" => io::export_stl_file(scene, path),
-                "glb" | "gltf" => io::export_glb_file(scene, path),
                 _ => io::export_obj_file(scene, path),
             };
             match res {

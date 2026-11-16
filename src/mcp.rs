@@ -456,11 +456,23 @@ pub fn mcp_tool_definitions() -> Value {
         },
         {
             "name": "export_model",
-            "description": "Export the current 3D scene to a file (.obj, .stl, or .glb glTF 2.0).",
+            "description": "Export the scene to a file (.obj, .stl, or .glb). .glb is the game-ready format for Godot and Blender: named nodes ('Group/Part' names become parent nodes), PBR materials, vertex colours and flat or smooth normals. For Godot, write it inside the project folder (the response then includes its res:// path) and consider merge and collision. The options below apply to .glb only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Destination file path ending in .obj, .stl, or .glb." }
+                    "path": { "type": "string", "description": "Destination file path ending in .obj, .stl, or .glb." },
+                    "merge": { "type": "boolean", "description": "Join parts that share a material into one mesh (far fewer draw calls in a game). Default false: every part stays its own node." },
+                    "collision": { "type": "string", "enum": ["none", "box", "convex", "part_boxes", "mesh"], "description": "Add collision nodes that Godot's importer turns into a StaticBody3D: one box, one convex hull, a box per part, or the exact triangles (static geometry only). Default none." },
+                    "origin": { "type": "string", "enum": ["keep", "base"], "description": "'base' moves the model so the centre of its base is at the origin (a good pivot for placing props). Default keep." },
+                    "scale": { "type": "number", "description": "Uniform scale (default 1; the app and Godot both work in metres)." },
+                    "max_triangles": { "type": "integer", "description": "Triangle budget for the whole model. Dense parts are simplified to fit (the scene itself is not changed). The response reports triangles and source_triangles." },
+                    "root_name": { "type": "string", "description": "Name of the root node (default: the file name)." },
+                    "target": { "type": "string", "enum": ["godot", "blender"], "description": "Which importer to write for. Default: godot when the path is inside a Godot project, otherwise plain glTF (right for Blender)." },
+                    "all": { "type": "boolean", "description": "Export every visible part (the default when no parts are chosen)." },
+                    "object_ids": { "type": "array", "items": { "type": "integer" }, "description": "Export only these parts, by id." },
+                    "names": { "type": "array", "items": { "type": "string" }, "description": "Export only these parts, by name." },
+                    "group": { "type": "string", "description": "Export only the parts named 'Group/…'." },
+                    "selection": { "type": "boolean", "description": "Export only the current selection." }
                 },
                 "required": ["path"]
             }
@@ -632,6 +644,25 @@ pub fn mcp_tool_definitions() -> Value {
                     "scale": { "type": "number", "description": "Uniform scale factor (default 1)." }
                 },
                 "required": ["asset"]
+            }
+        },
+        {
+            "name": "library_export",
+            "description": "Export library assets as .glb files for Godot or Blender into 'directory', one file per asset under section/subsection folders. For Godot, point it inside the project (e.g. <project>/assets/library): files use snake_case names, parts are merged by material, and the response lists each res:// path; Godot re-imports a file when it is exported again. Without 'asset', every asset (or the given section / subsection) is exported.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "directory": { "type": "string", "description": "Folder to export into (created if missing)." },
+                    "asset": { "type": "string", "description": "Export only this asset: 'Section/Subsection/Name', or a unique name." },
+                    "section": { "type": "string", "description": "Export only this section." },
+                    "subsection": { "type": "string", "description": "Export only this subsection." },
+                    "target": { "type": "string", "enum": ["godot", "blender"], "description": "godot (default): snake_case files, merged parts, optional collision. blender: original names, every part its own object." },
+                    "collision": { "type": "string", "enum": ["none", "box", "convex", "part_boxes", "mesh"], "description": "Godot only: collision nodes the importer turns into a StaticBody3D. Default none." },
+                    "merge": { "type": "boolean", "description": "Join parts that share a material (default true for godot, false for blender)." },
+                    "scale": { "type": "number", "description": "Uniform scale (default 1)." },
+                    "max_triangles": { "type": "integer", "description": "Triangle budget per asset; dense parts are simplified to fit. The stored asset is not changed." }
+                },
+                "required": ["directory"]
             }
         },
         {

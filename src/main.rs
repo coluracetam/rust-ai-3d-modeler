@@ -6,6 +6,7 @@ mod box_select;
 pub mod codec;
 pub mod camera;
 pub mod gizmo;
+pub mod gltf;
 pub mod history;
 pub mod io;
 pub mod ipc;

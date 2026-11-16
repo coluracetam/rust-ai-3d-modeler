@@ -182,6 +182,30 @@ pub struct LibraryUi {
     pub new_folder: Option<(Option<String>, String)>,
     /// Asset whose delete button was pressed once; a second press within a few seconds deletes.
     pub confirm_delete: Option<(String, std::time::Instant)>,
+    /// The export form: `Some(Some(reference))` exports one asset, `Some(None)` every asset
+    /// the view is showing.
+    pub export_scope: Option<Option<String>>,
+    pub export: ExportUi,
+}
+
+/// Export choices shared by the library export form and the scene export dialog.
+#[derive(Clone, Default)]
+pub struct ExportUi {
+    /// The remembered choices have been read from the library folder.
+    pub loaded: bool,
+    pub directory: String,
+    pub blender: bool,
+    /// Keep every part as its own object instead of merging by material.
+    pub separate: bool,
+    pub collision: crate::gltf::Collision,
+    /// Triangle budget as typed; empty exports every triangle.
+    pub budget: String,
+}
+
+impl ExportUi {
+    pub fn max_triangles(&self) -> Option<usize> {
+        self.budget.trim().replace([',', '_', ' '], "").parse().ok().filter(|&n: &usize| n > 0)
+    }
 }
 
 impl Default for UiState {
@@ -2333,6 +2357,195 @@ fn library_save_form(
     });
 }
 
+/// Reads the remembered export choices once, then opens the export form.
+fn library_open_export(state: &mut UiState, root: &std::path::Path, asset: Option<String>) {
+    load_export_choices(&mut state.library.export, root);
+    state.library.save_open = false;
+    state.library.export_scope = Some(asset);
+}
+
+fn load_export_choices(export: &mut ExportUi, root: &std::path::Path) {
+    if std::mem::replace(&mut export.loaded, true) {
+        return;
+    }
+    if let Some(prefs) = crate::library::load_export_prefs(root) {
+        export.directory = prefs.directory;
+        export.blender = prefs.target == "blender";
+        export.separate = !prefs.merge;
+        export.collision = crate::gltf::Collision::from_name(&prefs.collision).unwrap_or_default();
+        export.budget = prefs.max_triangles.map(|n| n.to_string()).unwrap_or_default();
+    }
+}
+
+/// Merge, collision and triangle-budget controls for a glTF export.
+fn export_options(ui: &mut egui::Ui, export: &mut ExportUi, godot: bool, id: &str) {
+    let mut merge = !export.separate;
+    toggle(ui, &mut merge, "Merge parts that share a material")
+        .on_hover_text("One mesh with a surface per material: far fewer draw calls in a game. Turn it off to keep every part as its own object.");
+    export.separate = !merge;
+    if godot {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Collision").color(MUTED));
+            egui::ComboBox::from_id_salt(id)
+                .selected_text(export.collision.label())
+                .show_ui(ui, |ui| {
+                    for choice in crate::gltf::Collision::ALL {
+                        ui.selectable_value(&mut export.collision, choice, choice.label());
+                    }
+                })
+                .response
+                .on_hover_text("Godot turns these into a StaticBody3D when it imports the file. Exact mesh suits static scenery only.");
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Triangle budget").color(MUTED));
+        text_field(ui, &mut export.budget, "all triangles", 110.0)
+            .on_hover_text("Simplify dense parts so the model has about this many triangles, e.g. 20000. Leave empty to keep them all. The original is not changed.");
+    });
+}
+
+/// Where a folder sits in a Godot project, as a line under the destination field.
+fn godot_folder_note(ui: &mut egui::Ui, directory: &str) {
+    if directory.trim().is_empty() {
+        return;
+    }
+    match crate::gltf::godot_resource_path(&std::path::Path::new(directory.trim()).join("x")) {
+        Some((project, res)) => {
+            let name = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            ui.label(small_muted(format!("Godot project “{name}” · {}", res.trim_end_matches('x'))));
+        }
+        None => {
+            ui.label(
+                RichText::new("This folder is not inside a Godot project (no project.godot above it). The files are still written.")
+                    .size(12.0)
+                    .color(WARN),
+            );
+        }
+    }
+}
+
+/// Exports one asset, or every asset the view is showing, for Godot or Blender.
+fn library_export_form(
+    ui: &mut egui::Ui,
+    state: &mut UiState,
+    sections: &[crate::library::Section],
+    root: &std::path::Path,
+    search: &str,
+) {
+    use crate::library;
+    let Some(scope) = state.library.export_scope.clone() else {
+        return;
+    };
+    let assets: Vec<&library::AssetInfo> = sections
+        .iter()
+        .flat_map(|section| section.subsections.iter().flat_map(|sub| sub.assets.iter()))
+        .filter(|asset| match &scope {
+            Some(reference) => asset.reference() == *reference,
+            None => {
+                library_matches(asset, search)
+                    && state.library.filter.as_ref().is_none_or(|(section, sub)| {
+                        asset.section == *section && sub.as_ref().is_none_or(|sub| asset.subsection == *sub)
+                    })
+            }
+        })
+        .collect();
+    card().show(ui, |ui| {
+        let title = match (&scope, assets.as_slice()) {
+            (Some(_), [asset]) => format!("Export “{}”", asset.name),
+            _ => format!("Export {}", plural(assets.len(), "asset", "assets")),
+        };
+        eyebrow(ui, &title);
+        let export = &mut state.library.export;
+        segmented(
+            ui,
+            &mut export.blender,
+            &[
+                (false, "Godot".into(), "snake_case .glb files ready for a Godot project"),
+                (true, "Blender".into(), ".glb files with the original names; File > Import > glTF 2.0"),
+            ],
+        );
+        let godot = !export.blender;
+        let width = ui.available_width();
+        text_field(
+            ui,
+            &mut export.directory,
+            if godot { "Folder in your Godot project, e.g. ~/game/assets/library" } else { "Destination folder" },
+            width - 18.0,
+        );
+        let directory = expand_home(&export.directory);
+        if godot {
+            godot_folder_note(ui, &directory);
+        }
+        export_options(ui, export, godot, "library_export_collision");
+        ui.label(small_muted(if godot {
+            "One .glb per asset in section/subsection folders. Godot imports them when its window gets focus, and re-imports after every export."
+        } else {
+            "One .glb per asset in Section/Subsection folders."
+        }));
+        let ready = !assets.is_empty() && !directory.is_empty();
+        let mut run = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            run = primary(ui, "Export", ready);
+            cancel = quiet_button(ui, "Cancel", "");
+        });
+        if cancel {
+            state.library.export_scope = None;
+        }
+        if run {
+            let export = state.library.export.clone();
+            let options = library::ExportOptions {
+                target: if export.blender { library::ExportTarget::Blender } else { library::ExportTarget::Godot },
+                collision: export.collision,
+                merge: Some(!export.separate),
+                scale: 1.0,
+                max_triangles: export.max_triangles(),
+            };
+            let (mut done, mut triangles, mut failed, mut note) = (0, 0, Vec::new(), None);
+            for asset in &assets {
+                match library::export_asset(asset, std::path::Path::new(&directory), &options) {
+                    Ok((_, report)) => {
+                        done += 1;
+                        triangles += report.triangles;
+                        note = note.or(report.warnings.into_iter().next());
+                    }
+                    Err(e) => failed.push(format!("{}: {e}", asset.name)),
+                }
+            }
+            library::save_export_prefs(
+                root,
+                &library::ExportPrefs {
+                    directory: export.directory.trim().to_string(),
+                    target: options.target.name().into(),
+                    collision: options.collision.name().into(),
+                    merge: !export.separate,
+                    max_triangles: options.max_triangles,
+                },
+            );
+            state.status_message = format!(
+                "Exported {} ({} triangles) to {directory}{}",
+                plural(done, "asset", "assets"),
+                compact_count(triangles),
+                note.map(|n| format!(" · {n}")).unwrap_or_default()
+            );
+            if failed.is_empty() {
+                state.library.export_scope = None;
+            } else {
+                state.last_error = Some(format!("Could not export {}", failed.join("; ")));
+            }
+        }
+    });
+}
+
+/// `~/game` -> `/home/me/game`.
+fn expand_home(path: &str) -> String {
+    let path = path.trim();
+    match (path.strip_prefix('~'), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => format!("{home}{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 fn library_asset_tip(ui: &mut egui::Ui, asset: &crate::library::AssetInfo) {
     ui.label(semibold(&asset.name, 13.5));
     if !asset.description.is_empty() {
@@ -2680,10 +2893,18 @@ fn library_asset_card(
         medium_font(12.5),
         tint,
     );
-    let (pressed, _) = row_buttons(ui, strip, card.id, &[delete]);
+    let (pressed, _) = row_buttons(
+        ui,
+        strip,
+        card.id,
+        &[(icon::EXPORT, "Export for Godot or Blender", SUBTLE), delete],
+    );
     let card = card.on_hover_ui(|ui| library_asset_tip(ui, asset));
     let add = add.clicked() || (card.double_clicked() && pressed.is_none());
-    library_asset_actions(ui, state, root, asset, insert_at, comparing, add, pressed == Some(0), armed)
+    if pressed == Some(0) {
+        library_open_export(state, root, Some(asset.reference()));
+    }
+    library_asset_actions(ui, state, root, asset, insert_at, comparing, add, pressed == Some(1), armed)
 }
 
 /// The full-window library: sections on the left, a grid of asset previews on the right.
@@ -2752,7 +2973,18 @@ fn draw_library_view(
                 close |= icon_button(ui, icon::X, "Close  ·  Esc", false, true).clicked();
                 if primary(ui, &icon_text(icon::PLUS, "Save current model"), !scene.objects.is_empty())
                 {
+                    state.library.export_scope = None;
                     library_open_save(scene, state);
+                }
+                if tool_button(
+                    ui,
+                    &icon_text(icon::EXPORT, "Export"),
+                    total > 0,
+                    "Export the assets shown here for Godot or Blender",
+                    "There is nothing to export yet",
+                ) {
+                    state.library.save_open = false;
+                    library_open_export(state, &root, None);
                 }
                 ui.allocate_ui(egui::vec2(280.0, 32.0), |ui| {
                     search_field(ui, &mut state.library.search, "Search assets…");
@@ -2874,6 +3106,12 @@ fn draw_library_view(
                             library_save_form(ui, scene, state, &sections, &root);
                         });
                         ui.add_space(10.0);
+                    } else if state.library.export_scope.is_some() {
+                        ui.scope(|ui| {
+                            ui.set_max_width(460.0);
+                            library_export_form(ui, state, &sections, &root, &search);
+                        });
+                        ui.add_space(10.0);
                     }
                     let mut shown = 0;
                     for section in sections.iter() {
@@ -2942,6 +3180,7 @@ fn draw_library_view(
         } else if state.library.new_folder.take().is_some() {
         } else if state.library.save_open {
             state.library.save_open = false;
+        } else if state.library.export_scope.take().is_some() {
         } else {
             close = true;
         }
@@ -5370,14 +5609,30 @@ fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
                             .color(WARN),
                     );
                 }
+                let path = expand_home(&state.io_file_path);
+                if ext == "glb" {
+                    // The game-ready format: Godot and Blender both import it.
+                    let godot = crate::gltf::godot_resource_path(std::path::Path::new(&path));
+                    if let Some((_, res)) = &godot {
+                        ui.label(small_muted(format!("Godot project file · {res}")));
+                    }
+                    load_export_choices(&mut state.library.export, &crate::library::root());
+                    export_options(ui, &mut state.library.export, true, "scene_export_collision");
+                    ui.label(small_muted(
+                        "Collision shapes are read by Godot. Save inside a Godot project and it imports the file by itself.",
+                    ));
+                }
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
                     if primary(ui, "Export scene", valid) || (enter && valid) {
-                        action(
-                            state,
-                            "export_model",
-                            json!({"path": state.io_file_path.trim()}),
-                        );
+                        let export = &state.library.export;
+                        let mut args = json!({ "path": path });
+                        if ext == "glb" {
+                            args["merge"] = json!(!export.separate);
+                            args["collision"] = json!(export.collision.name());
+                            args["max_triangles"] = json!(export.max_triangles().unwrap_or(0));
+                        }
+                        action(state, "export_model", args);
                         state.show_io_modal = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -5718,6 +5973,21 @@ mod library_view_tests {
         state.library.filter = Some(("Props".into(), None));
         state.library.new_folder = Some((Some("Props".into()), "Lamps".into()));
         frame(&scene, &mut state);
+        // The export form, for everything shown and for one asset.
+        state.library.new_folder = None;
+        state.library.filter = None;
+        state.library.search.clear();
+        library_open_export(&mut state, &root, None);
+        state.library.export.directory = "~/game/assets".into();
+        frame(&scene, &mut state);
+        state.library.export.blender = true;
+        state.library.export_scope = Some(Some("Furniture/Chairs/Stool".into()));
+        frame(&scene, &mut state);
+        assert_eq!(state.library.export.max_triangles(), None);
+        state.library.export.budget = "20,000".into();
+        assert_eq!(state.library.export.max_triangles(), Some(20_000));
+        state.library.export_scope = None;
+
         // A filter whose folder is gone falls back to everything.
         state.library.filter = Some(("Gone".into(), None));
         frame(&scene, &mut state);
