@@ -9,6 +9,7 @@ pub mod gizmo;
 pub mod history;
 pub mod io;
 pub mod ipc;
+pub mod library;
 pub mod mcp;
 pub mod mesh;
 pub mod modeling;
@@ -1005,7 +1006,8 @@ impl ApplicationHandler<IpcEvent> for ModelerApp {
                 | "mirror_object"
                 | "capture_viewport"
                 | "capture_studio"
-        ) || agent_tools::HEAVY.contains(&event.request.tool.as_str()))
+        ) || agent_tools::HEAVY.contains(&event.request.tool.as_str())
+            || library::HEAVY.contains(&event.request.tool.as_str()))
             && self.background.is_none()
         {
             let request = event.request.clone();

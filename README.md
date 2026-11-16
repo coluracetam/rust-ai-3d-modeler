@@ -195,6 +195,12 @@ Includes a pre-packaged Antigravity plugin in [`.agents/plugins/rust-modeler-mcp
 | `set_camera_and_viewport` | Orbit/zoom camera, place a first-person camera (`eye` + `look_at`), set view preset (`front`, `right`, `top`), or switch shading (`lit`, `clay`, `wireframe`) | `target?: [x,y,z]`, `distance?: float`, `yaw_deg?: float`, `pitch_deg?: float`, `eye?: [x,y,z]`, `look_at?: [x,y,z]`, `preset?: string`, `shading?: string`, `wireframe_overlay?: bool`, `show_grid?: bool` |
 | `import_model` / `export_model` | Import or export `.obj`, `.stl`, or `.glb` (glTF 2.0) files | `path: string`, `name?: string`, `color?: [r,g,b]` |
 | `undo` / `redo` | Step backward or forward through the undo history | *(none)* |
+| `library_list` | List the asset library (sections > subsections > assets) shared by every project | `section?: string`, `search?: string` |
+| `library_show` | Open the full library view in the GUI | *(none)* |
+| `library_save_asset` | Save the whole model (`all: true`) or chosen parts as one reusable asset; without `all` / `object_ids` / `names` / `group` the current selection is saved | `name: string`, `section: string`, `subsection?: string`, `all?: bool`, `object_ids?: [int]`, `names?: [string]`, `group?: string`, `description?`, `tags?: [string]`, `overwrite?: bool`, `thumbnail?: bool` |
+| `library_insert_asset` | Add a copy of an asset to the scene, base centre at `position` | `asset: string` (`Section/Subsection/Name` or a unique name), `position?: [x,y,z]`, `rotation_y_deg?: float`, `scale?: float` |
+| `library_create_section` / `library_delete_section` | Create a section or subsection; delete an empty one | `section: string`, `subsection?: string` |
+| `library_move_asset` / `library_delete_asset` | Move or rename an asset; delete moves it to the library's `.trash` folder | `asset: string`, `section?`, `subsection?`, `name?` |
 
 ---
 
