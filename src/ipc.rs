@@ -369,7 +369,11 @@ fn dispatch(
         && !is_read_only(&req.tool)
         && !matches!(
             req.tool.as_str(),
-            "accept_revision" | "revert_revision" | "cancel_revision" | "preview_revision"
+            "accept_revision"
+                | "revert_revision"
+                | "request_changes"
+                | "cancel_revision"
+                | "preview_revision"
         )
     {
         return IpcResponse::error("Return to the live scene before editing");
