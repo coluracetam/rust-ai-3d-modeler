@@ -140,10 +140,6 @@ pub struct UiState {
     pub fly_toggle_requested: bool,
     /// Free-flight speed in scene units per second.
     pub fly_speed: f32,
-    /// The "Start a new project" confirmation is open.
-    pub confirm_new_project: bool,
-    /// Title typed into the new-project confirmation.
-    pub new_project_name: String,
     /// Command palette (Ctrl+K).
     pub palette_open: bool,
     pub palette_query: String,
@@ -163,6 +159,83 @@ pub struct UiState {
     pub attach_path: Option<String>,
     /// Asset library tab.
     pub library: LibraryUi,
+    /// The Projects screen.
+    pub projects: ProjectsUi,
+    /// Short confirmation of the last action, with an Undo button.
+    pub toast: Option<Toast>,
+}
+
+/// State of the Projects screen. The listing is shared so cloning `UiState` stays cheap.
+#[derive(Clone, Default)]
+pub struct ProjectsUi {
+    pub open: bool,
+    pub list: std::sync::Arc<Vec<crate::project::ProjectInfo>>,
+    /// When the projects folder was last read; `None` forces a rescan.
+    pub scanned: Option<std::time::Instant>,
+    pub search: String,
+    pub new_name: String,
+    /// Put the cursor in the new-project name field on the next frame.
+    pub focus_new: bool,
+    /// Path typed into "Open another file".
+    pub other_path: String,
+    /// Project whose delete button was pressed once; a second press within a few seconds deletes.
+    pub confirm_delete: Option<(String, std::time::Instant)>,
+}
+
+#[derive(Clone)]
+pub struct Toast {
+    pub text: String,
+    pub shown: std::time::Instant,
+    /// History entry that the Undo button can restore.
+    pub undo_id: Option<u64>,
+}
+
+/// Follow-up for a command the user ran from the GUI: confirm what happened where it can be
+/// seen and undone, and bring a newly added asset into view.
+pub fn after_action(
+    state: &mut UiState,
+    request: &crate::ipc::IpcRequest,
+    response: &crate::ipc::IpcResponse,
+    camera: &mut OrbitCamera,
+    undo_id: Option<u64>,
+) {
+    if !response.ok {
+        return;
+    }
+    let toast = |text: &str| {
+        Some(Toast {
+            text: text.to_string(),
+            shown: std::time::Instant::now(),
+            undo_id,
+        })
+    };
+    match request.tool.as_str() {
+        "library_insert_asset" => {
+            let corner = |key: &str| {
+                let v = response.data[key].as_array()?;
+                Some(Vec3::new(v.first()?.as_f64()? as f32, v.get(1)?.as_f64()? as f32, v.get(2)?.as_f64()? as f32))
+            };
+            if let (Some(min), Some(max)) = (corner("world_bounds_min"), corner("world_bounds_max")) {
+                crate::agent_tools::frame_camera(camera, (min, max), 1.8);
+            }
+            let name = request.args["asset"].as_str().and_then(|a| a.rsplit('/').next()).unwrap_or("asset");
+            state.toast = toast(&format!("Added “{name}” to the scene"));
+            state.scene_tab = 0;
+        }
+        "delete_object" => state.toast = toast(&response.message),
+        "new_project" if request.args["asset"].is_string() => {
+            state.scene_tab = 0;
+        }
+        "undo" => state.toast = None,
+        _ => {}
+    }
+}
+
+fn open_projects(state: &mut UiState, focus_new: bool) {
+    state.projects.open = true;
+    state.projects.scanned = None;
+    state.projects.focus_new = focus_new;
+    state.library.open = false;
 }
 
 /// State of the asset library tab. The listing is shared so cloning `UiState` stays cheap.
@@ -291,8 +364,6 @@ impl Default for UiState {
             fly_active: false,
             fly_toggle_requested: false,
             fly_speed: 3.0,
-            confirm_new_project: false,
-            new_project_name: String::new(),
             palette_open: false,
             palette_query: String::new(),
             palette_index: 0,
@@ -304,6 +375,8 @@ impl Default for UiState {
             focus_composer: false,
             attach_path: None,
             library: LibraryUi::default(),
+            projects: ProjectsUi::default(),
+            toast: None,
         }
     }
 }
@@ -316,6 +389,7 @@ impl UiState {
             || self.lightbox.is_some()
             || self.palette_open
             || self.library.open
+            || self.projects.open
     }
 }
 
@@ -1307,6 +1381,9 @@ pub fn draw_ui(
 
     draw_dialogs(ctx, scene, state);
     draw_library_view(ctx, scene, camera, state, comparing);
+    draw_projects_view(ctx, scene, state, comparing);
+    let can_undo = !comparing && !in_progress;
+    draw_toast(ctx, state, if can_undo { history.undo_id() } else { None });
     draw_command_palette(ctx, scene, camera, renderer, history, state, comparing, in_progress);
 
     if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
@@ -1315,7 +1392,28 @@ pub fn draw_ui(
         state.palette_index = 0;
     }
     if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) && !comparing {
-        state.confirm_new_project = true;
+        open_projects(state, true);
+    }
+    if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+        open_projects(state, false);
+    }
+    // Delete removes the selected parts (never a part that only has some faces selected).
+    if ctx.input(|i| i.key_pressed(egui::Key::Delete))
+        && !ctx.wants_keyboard_input()
+        && !state.modal_open()
+        && !comparing
+    {
+        let parts = crate::library::selected_parts(scene);
+        let whole = parts.iter().all(|&i| {
+            let mesh = &scene.objects[i].mesh;
+            mesh.selected_faces.is_empty() || mesh.selected_faces.len() == mesh.faces.len()
+        });
+        if !parts.is_empty() && whole {
+            delete_parts(state, scene, &parts);
+        } else if !parts.is_empty() {
+            state.status_message =
+                "Delete removes whole parts. Pick the part in the Parts list, then press Delete.".into();
+        }
     }
     if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) && !comparing {
         if scene.project_path.is_some() {
@@ -1381,12 +1479,12 @@ fn draw_header(
                         ui.add_enabled(enabled, egui::Button::new(icon_text(glyph, text)).shortcut_text(keys))
                             .clicked()
                     };
-                    if item(ui, icon::FILE_PLUS, "New project…", "Ctrl+N", !comparing) {
-                        state.confirm_new_project = true;
+                    if item(ui, icon::FOLDERS, "Projects…", "Ctrl+O", true) {
+                        open_projects(state, false);
                         ui.close_menu();
                     }
-                    if item(ui, icon::FOLDER_OPEN, "Open project…", "", true) {
-                        state.project_dialog = Some("open".into());
+                    if item(ui, icon::FILE_PLUS, "New project…", "Ctrl+N", !comparing) {
+                        open_projects(state, true);
                         ui.close_menu();
                     }
                     if item(ui, icon::FLOPPY_DISK, "Save project as…", "", true) {
@@ -1825,10 +1923,19 @@ fn scene_parts_tab(
     let any_hidden = scene.objects.iter().any(|o| !o.visible);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        let w = (ui.available_width() - 3.0 * 36.0).max(60.0);
+        let w = (ui.available_width() - 4.0 * 36.0).max(60.0);
         ui.allocate_ui(egui::vec2(w, 32.0), |ui| {
             search_field(ui, &mut state.outliner_search, "Search parts…");
         });
+        let chosen = crate::library::selected_parts(scene);
+        let tip = match (comparing, chosen.len()) {
+            (true, _) => "Return to the live scene to delete parts".to_string(),
+            (_, 0) => "Select a part to delete it".to_string(),
+            (_, n) => format!("Delete {}  ·  Del  (Ctrl+Z brings it back)", plural(n, "selected part", "selected parts")),
+        };
+        if icon_button(ui, icon::TRASH, &tip, false, !chosen.is_empty() && !comparing).clicked() {
+            delete_parts(state, scene, &chosen);
+        }
         if icon_button(ui, icon::EYE, if any_hidden { "Show every part" } else { "Every part is visible" }, false, any_hidden).clicked() {
             for o in &mut scene.objects {
                 o.visible = true;
@@ -1867,6 +1974,7 @@ fn scene_parts_tab(
     let mut clicked = None;
     let mut frame = false;
     let mut matches = 0;
+    let mut delete_group: Option<Vec<usize>> = None;
     egui::ScrollArea::vertical()
         .id_salt("scene_scroll")
         .auto_shrink([false, false])
@@ -1932,14 +2040,38 @@ fn scene_parts_tab(
                         medium_font(13.5),
                         TEXT,
                     );
+                    // Deleting the group removes every part in it (an inserted asset, say).
+                    let bin_rect = egui::Rect::from_center_size(
+                        egui::pos2(rect.right() - 15.0, rect.center().y),
+                        egui::vec2(26.0, 24.0),
+                    );
+                    let show_bin = !comparing && search.is_empty() && ui.rect_contains_pointer(rect);
+                    let bin = ui
+                        .interact(bin_rect, row.id.with("group_delete"), egui::Sense::click())
+                        .on_hover_text(format!(
+                            "Delete “{name}” and its {}  (Ctrl+Z brings it back)",
+                            plural(indices.len(), "part", "parts")
+                        ));
+                    let p = ui.painter();
+                    if show_bin {
+                        p.text(
+                            bin_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            icon::TRASH,
+                            FontId::proportional(15.0),
+                            if bin.hovered() { DANGER } else { SUBTLE },
+                        );
+                    }
                     p.text(
-                        egui::pos2(rect.right() - 8.0, rect.center().y),
+                        egui::pos2(rect.right() - if show_bin { 34.0 } else { 8.0 }, rect.center().y),
                         egui::Align2::RIGHT_CENTER,
                         format!("{} · {}", indices.len(), compact_count(faces)),
                         FontId::proportional(11.5),
                         SUBTLE,
                     );
-                    if eye.clicked() {
+                    if show_bin && bin.clicked() {
+                        delete_group = Some(indices.clone());
+                    } else if eye.clicked() {
                         for &i in &indices {
                             scene.objects[i].visible = !any_visible;
                         }
@@ -1994,12 +2126,15 @@ fn scene_parts_tab(
             if matches == 0 {
                 ui.add_space(12.0);
                 ui.label(small_muted(if scene.objects.is_empty() {
-                    "This scene is empty. Ask your agent to add or import geometry."
+                    "This scene is empty. Ask your agent to build something, or add an asset from the Library tab."
                 } else {
                     "No parts match your search."
                 }));
             }
         });
+    if let Some(indices) = delete_group {
+        delete_parts(state, scene, &indices);
+    }
     if let Some(i) = clicked {
         if !comparing {
             scene.selected_object = Some(i);
@@ -2231,10 +2366,59 @@ fn library_matches(asset: &crate::library::AssetInfo, search: &str) -> bool {
 }
 
 /// Where a new asset lands: the picked surface point, otherwise the centre of the view.
-fn library_insert_point(scene: &Scene, camera: &OrbitCamera) -> Vec3 {
-    match scene.pending_anchor {
-        Some((_, world, _, _)) if scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty()) => world,
-        _ => camera.target,
+fn library_insert_point(scene: &Scene, _camera: &OrbitCamera) -> InsertSpot {
+    let picked = match scene.pending_anchor {
+        Some((_, world, _, _)) if scene.objects.iter().any(|o| !o.mesh.selected_faces.is_empty()) => Some(world),
+        _ => None,
+    };
+    // Cached per-part bounds, so this stays cheap on dense scenes.
+    let bounds = scene
+        .objects
+        .iter()
+        .filter(|o| o.visible && !o.mesh.faces.is_empty())
+        .map(|o| {
+            let (min, max) = o.mesh.bounds();
+            let matrix = o.transform.matrix();
+            let corners = (0..8).map(|i| {
+                matrix.transform_point3(Vec3::new(
+                    if i & 1 == 0 { min.x } else { max.x },
+                    if i & 2 == 0 { min.y } else { max.y },
+                    if i & 4 == 0 { min.z } else { max.z },
+                ))
+            });
+            corners.fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(p), hi.max(p)))
+        })
+        .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
+    InsertSpot { picked, bounds }
+}
+
+/// Where an added asset goes: on the surface point the user picked, otherwise standing
+/// beside what is already in the scene (never inside it), or at the origin when it is empty.
+#[derive(Clone, Copy)]
+struct InsertSpot {
+    picked: Option<Vec3>,
+    bounds: Option<(Vec3, Vec3)>,
+}
+
+impl InsertSpot {
+    fn position_for(&self, asset: &crate::library::AssetInfo) -> Vec3 {
+        match (self.picked, self.bounds) {
+            (Some(point), _) => point,
+            (None, Some((min, max))) => {
+                let width = asset.size[0].max(0.0);
+                let gap = (width * 0.25).max(0.3);
+                Vec3::new(max.x + gap + width * 0.5, min.y, (min.z + max.z) * 0.5)
+            }
+            (None, None) => Vec3::ZERO,
+        }
+    }
+}
+
+/// Queues deleting `parts` as one undo step.
+fn delete_parts(state: &mut UiState, scene: &Scene, parts: &[usize]) {
+    let ids: Vec<u64> = parts.iter().filter_map(|&i| scene.objects.get(i)).map(|o| o.id).collect();
+    if !ids.is_empty() {
+        action(state, "delete_object", serde_json::json!({ "object_ids": ids }));
     }
 }
 
@@ -2591,7 +2775,7 @@ fn library_asset_tip(ui: &mut egui::Ui, asset: &crate::library::AssetInfo) {
     if !asset.tags.is_empty() {
         ui.label(small_muted(asset.tags.join(", ")));
     }
-    ui.label(small_muted("Double-click to add it to the scene"));
+    ui.label(small_muted("Add puts a copy in the current scene. Open starts a new project with it."));
 }
 
 /// The delete button of an asset: (glyph, tooltip, colour) and whether it is armed.
@@ -2615,7 +2799,7 @@ fn library_asset_actions(
     state: &mut UiState,
     root: &std::path::Path,
     asset: &crate::library::AssetInfo,
-    insert_at: Vec3,
+    insert_at: InsertSpot,
     comparing: bool,
     add: bool,
     delete: bool,
@@ -2625,7 +2809,7 @@ fn library_asset_actions(
         action(
             state,
             "library_insert_asset",
-            serde_json::json!({ "asset": asset.reference(), "position": insert_at.to_array() }),
+            serde_json::json!({ "asset": asset.reference(), "position": insert_at.position_for(asset).to_array() }),
         );
         // Show the model where the asset just landed.
         state.library.open = false;
@@ -2814,7 +2998,7 @@ fn library_asset_row(
     state: &mut UiState,
     root: &std::path::Path,
     asset: &crate::library::AssetInfo,
-    insert_at: Vec3,
+    insert_at: InsertSpot,
     comparing: bool,
 ) -> bool {
     let (delete, armed) = library_delete_button(state, &asset.reference());
@@ -2868,7 +3052,7 @@ fn library_asset_card(
     state: &mut UiState,
     root: &std::path::Path,
     asset: &crate::library::AssetInfo,
-    insert_at: Vec3,
+    insert_at: InsertSpot,
     comparing: bool,
 ) -> bool {
     let (delete, armed) = library_delete_button(state, &asset.reference());
@@ -2900,14 +3084,48 @@ fn library_asset_card(
         SUBTLE,
     );
     let strip = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.bottom() - 28.0), inner.max);
-    let add_rect = egui::Rect::from_min_size(strip.min, egui::vec2(124.0, 28.0));
+    let add_rect = egui::Rect::from_min_size(strip.min, egui::vec2(72.0, 28.0));
     let add = ui
         .interact(add_rect, card.id.with("add"), if comparing { egui::Sense::hover() } else { egui::Sense::click() })
         .on_hover_text(if comparing {
             "Return to the live scene to add assets"
         } else {
-            "Add a copy to the scene"
+            "Add a copy to the current scene, beside what is already there"
         });
+    // "Open" starts a new project holding just this asset; the current project is saved first.
+    let open_rect = egui::Rect::from_min_size(
+        egui::pos2(add_rect.right() + 6.0, strip.top()),
+        egui::vec2(64.0, 28.0),
+    );
+    let open = ui
+        .interact(open_rect, card.id.with("open"), if comparing { egui::Sense::hover() } else { egui::Sense::click() })
+        .on_hover_text(if comparing {
+            "Return to the live scene first"
+        } else {
+            "Open in a new project of its own. The current project is saved first."
+        });
+    ui.painter().rect(
+        open_rect,
+        7,
+        if open.hovered() && !comparing { Color32::from_rgb(40, 50, 66) } else { Color32::TRANSPARENT },
+        egui::Stroke::new(1.0_f32, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        open_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Open",
+        medium_font(12.5),
+        if comparing { SUBTLE } else { TEXT },
+    );
+    if open.clicked() {
+        action(
+            state,
+            "new_project",
+            serde_json::json!({ "asset": asset.reference(), "save": true, "save_current": true, "thumbnail": true }),
+        );
+        state.library.open = false;
+    }
     let tint = if comparing { SUBTLE } else { ACCENT };
     ui.painter().rect(
         add_rect,
@@ -2919,7 +3137,7 @@ fn library_asset_card(
     ui.painter().text(
         add_rect.center(),
         egui::Align2::CENTER_CENTER,
-        icon_text(icon::PLUS, "Add to scene"),
+        icon_text(icon::PLUS, "Add"),
         medium_font(12.5),
         tint,
     );
@@ -2929,12 +3147,355 @@ fn library_asset_card(
         card.id,
         &[(icon::EXPORT, "Export for Godot or Blender", SUBTLE), delete],
     );
-    let card = card.on_hover_ui(|ui| library_asset_tip(ui, asset));
-    let add = add.clicked() || (card.double_clicked() && pressed.is_none());
+    card.on_hover_ui(|ui| library_asset_tip(ui, asset));
+    let add = add.clicked();
     if pressed == Some(0) {
         library_open_export(state, root, Some(asset.reference()));
     }
     library_asset_actions(ui, state, root, asset, insert_at, comparing, add, pressed == Some(1), armed)
+}
+
+fn draw_toast(ctx: &egui::Context, state: &mut UiState, undo_id: Option<u64>) {
+    const SECONDS: f32 = 8.0;
+    let Some(toast) = state.toast.clone() else {
+        return;
+    };
+    if toast.shown.elapsed().as_secs_f32() > SECONDS || state.modal_open() {
+        if !state.modal_open() {
+            state.toast = None;
+        }
+        return;
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    let rect = if state.viewport_rect.is_positive() { state.viewport_rect } else { ctx.screen_rect() };
+    egui::Area::new("action_toast".into())
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::CENTER_BOTTOM)
+        .fixed_pos(egui::pos2(rect.center().x, rect.bottom() - 54.0))
+        .show(ctx, |ui| {
+            overlay_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::CHECK_CIRCLE).size(16.0).color(ACCENT));
+                    ui.label(RichText::new(&toast.text).color(TEXT));
+                    if let Some(id) = toast.undo_id.filter(|id| Some(*id) == undo_id)
+                        && ui
+                            .button(icon_text(icon::ARROW_COUNTER_CLOCKWISE, "Undo"))
+                            .on_hover_text("Ctrl+Z")
+                            .clicked()
+                    {
+                        action(state, "undo", serde_json::json!({ "history_id": id }));
+                        state.toast = None;
+                    }
+                    if quiet_button(ui, "×", "Dismiss") {
+                        state.toast = None;
+                    }
+                });
+            });
+        });
+}
+
+/// How long ago a file changed, from its modification time.
+fn modified_ago(seconds: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    ago(std::time::Duration::from_secs(now.saturating_sub(seconds)))
+}
+
+const PROJECT_CARD: egui::Vec2 = egui::vec2(232.0, 236.0);
+
+/// The Projects screen: start a project by name, or click one to switch to it. Projects made
+/// here live in the projects folder and the one being left is saved first, so nothing asks
+/// for a file path or a confirmation.
+fn draw_projects_view(ctx: &egui::Context, scene: &Scene, state: &mut UiState, comparing: bool) {
+    use serde_json::json;
+    if !state.projects.open {
+        return;
+    }
+    let dir = crate::project::projects_dir();
+    if state.projects.scanned.is_none_or(|t| t.elapsed().as_secs_f32() > 2.0) {
+        state.projects.list = std::sync::Arc::new(crate::project::list_projects(&dir));
+        state.projects.scanned = Some(std::time::Instant::now());
+    }
+    let projects = state.projects.list.clone();
+    let reviewing = scene.revisions.iter().any(|r| {
+        matches!(r.status, RevisionStatus::ReadyForReview | RevisionStatus::InProgress)
+    });
+    // Switching is blocked while a revision is open, exactly as the commands are.
+    let blocked = if comparing {
+        Some("Return to the live scene before switching projects.")
+    } else if reviewing {
+        Some("Accept, revert or cancel the pending revision before switching projects.")
+    } else {
+        None
+    };
+    let screen = ctx.screen_rect();
+    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut close = false;
+    let mut rescan = false;
+
+    egui::Area::new("projects_view".into())
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let (rect, scrim) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            ui.painter().rect_filled(rect, 0, Color32::from_black_alpha(170));
+            let panel = egui::Rect::from_center_size(
+                screen.center(),
+                egui::vec2((screen.width() - 64.0).min(1060.0), screen.height() - 72.0),
+            );
+            ui.interact(panel, ui.id().with("projects_panel"), egui::Sense::click());
+            ui.painter().rect(panel, 14, PANEL, egui::Stroke::new(1.0_f32, BORDER), egui::StrokeKind::Inside);
+            close |= scrim.clicked();
+
+            let inner = panel.shrink(18.0);
+            let mut top = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), 34.0)))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            top.label(RichText::new(icon::FOLDERS).size(22.0).color(ACCENT));
+            top.heading("Projects");
+            top.label(small_muted(plural(projects.len(), "project", "projects")));
+            top.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close |= icon_button(ui, icon::X, "Close  ·  Esc", false, true).clicked();
+                ui.allocate_ui(egui::vec2(260.0, 32.0), |ui| {
+                    search_field(ui, &mut state.projects.search, "Search projects…");
+                });
+            });
+            let body = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 48.0), inner.max);
+            ui.painter().line_segment(
+                [egui::pos2(panel.left(), body.top() - 8.0), egui::pos2(panel.right(), body.top() - 8.0)],
+                egui::Stroke::new(1.0_f32, BORDER),
+            );
+            let mut content = ui.new_child(
+                egui::UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("projects_scroll")
+                .auto_shrink([false, false])
+                .show(&mut content, |ui| {
+                    if let Some(reason) = blocked {
+                        ui.label(RichText::new(reason).color(WARN));
+                        ui.add_space(6.0);
+                    }
+                    // ---- Start a new project: a name is all it takes.
+                    eyebrow(ui, "New project");
+                    ui.horizontal(|ui| {
+                        let field = text_field(ui, &mut state.projects.new_name, "Project name, e.g. Castle", 320.0);
+                        if std::mem::take(&mut state.projects.focus_new) {
+                            field.request_focus();
+                        }
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let ok = blocked.is_none();
+                        if (primary(ui, &icon_text(icon::PLUS, "Create"), ok) || (enter && ok)) && ok {
+                            action(
+                                state,
+                                "new_project",
+                                json!({
+                                    "name": state.projects.new_name.trim(),
+                                    "save": true,
+                                    "save_current": true,
+                                    "thumbnail": true,
+                                }),
+                            );
+                            state.projects.new_name.clear();
+                            close = true;
+                        }
+                    });
+                    ui.label(small_muted(
+                        "Starts empty and is saved automatically. The project you are leaving is saved first.",
+                    ));
+                    ui.add_space(14.0);
+
+                    // ---- Existing projects, most recent first.
+                    eyebrow(ui, "Your projects");
+                    let search = state.projects.search.trim().to_lowercase();
+                    let shown: Vec<&crate::project::ProjectInfo> = projects
+                        .iter()
+                        .filter(|p| search.is_empty() || p.name.to_lowercase().contains(&search))
+                        .collect();
+                    if shown.is_empty() {
+                        ui.label(small_muted(if projects.is_empty() {
+                            "No projects yet. Name one above to start."
+                        } else {
+                            "No projects match your search."
+                        }));
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                        for project in shown {
+                            let current = scene.project_path.as_deref()
+                                .is_some_and(|path| crate::project::same_project(path, &project.path));
+                            match project_card(ui, state, project, current, blocked.is_some()) {
+                                Some(true) => {
+                                    action(
+                                        state,
+                                        "open_project",
+                                        json!({ "path": project.path, "save_current": true, "thumbnail": true }),
+                                    );
+                                    close = true;
+                                }
+                                Some(false) => {
+                                    match crate::project::delete_project(&dir, project) {
+                                        Ok(()) => {
+                                            state.status_message = if project.managed {
+                                                format!("Moved “{}” to the projects trash", project.name)
+                                            } else {
+                                                format!("Removed “{}” from the list; the file was not touched", project.name)
+                                            };
+                                        }
+                                        Err(e) => state.last_error = Some(e),
+                                    }
+                                    rescan = true;
+                                }
+                                None => {}
+                            }
+                        }
+                    });
+                    ui.add_space(16.0);
+
+                    // ---- A project file somewhere else.
+                    eyebrow(ui, "Open a project file from somewhere else");
+                    ui.horizontal(|ui| {
+                        let field = text_field(ui, &mut state.projects.other_path, "~/path/to/project.spatial.json", 420.0);
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let path = expand_home(&state.projects.other_path);
+                        let ok = blocked.is_none() && !path.is_empty();
+                        if (tool_button(ui, "Open", ok, "Open this file; it then stays in the list above", "Type the file's path") || (enter && ok)) && ok {
+                            action(state, "open_project", json!({ "path": path, "save_current": true, "thumbnail": true }));
+                            state.projects.other_path.clear();
+                            close = true;
+                        }
+                    });
+                    ui.add_space(10.0);
+                    let folder = dir.to_string_lossy();
+                    truncated(ui, small_muted(format!("Projects are stored in {folder}")), &folder);
+                });
+        });
+
+    if rescan {
+        state.projects.scanned = None;
+    }
+    if (escape && !state.palette_open) || close {
+        state.projects.open = false;
+    }
+}
+
+/// One project. `Some(true)` = open it, `Some(false)` = delete it (already confirmed).
+fn project_card(
+    ui: &mut egui::Ui,
+    state: &mut UiState,
+    project: &crate::project::ProjectInfo,
+    current: bool,
+    blocked: bool,
+) -> Option<bool> {
+    let armed = state
+        .projects
+        .confirm_delete
+        .as_ref()
+        .is_some_and(|(path, at)| *path == project.path && at.elapsed().as_secs_f32() < 4.0);
+    let (rect, card) = ui.allocate_exact_size(PROJECT_CARD, egui::Sense::click());
+    let hovered = ui.rect_contains_pointer(rect);
+    let can_open = !current && !blocked;
+    ui.painter().rect(
+        rect,
+        10,
+        if hovered && can_open { CARD_HI } else { CARD },
+        egui::Stroke::new(
+            1.0_f32,
+            if current { ACCENT.gamma_multiply(0.7) } else if hovered && can_open { ACCENT.gamma_multiply(0.45) } else { BORDER },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(8.0);
+    let thumb = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), inner.width() * 0.75));
+    ui.painter().rect_filled(thumb, 6, FIELD);
+    // The picture is replaced on every save, so its cache key carries the project's time.
+    let texture = project.thumbnail.as_ref().and_then(|path| {
+        let key = format!("{path}#{}", project.modified);
+        state
+            .screenshot_cache
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let image = image::open(path).map_err(|e| e.to_string())?.into_rgba8();
+                let pixels = egui::ColorImage::from_rgba_unmultiplied(
+                    [image.width() as usize, image.height() as usize],
+                    image.as_raw(),
+                );
+                Ok(ui.ctx().load_texture(key, pixels, egui::TextureOptions::LINEAR))
+            })
+            .clone()
+            .ok()
+    });
+    match texture {
+        Some(texture) => egui::Image::new(&texture).corner_radius(6).paint_at(ui, thumb),
+        None => {
+            ui.painter().text(thumb.center(), egui::Align2::CENTER_CENTER, icon::CUBE, FontId::proportional(40.0), SUBTLE);
+        }
+    }
+    let delete = if armed {
+        (
+            icon::TRASH,
+            if project.managed { "Click again to move this project to the projects trash" } else { "Click again to remove it from this list" },
+            DANGER,
+        )
+    } else {
+        (
+            icon::TRASH,
+            if project.managed { "Delete this project" } else { "Remove from this list (the file stays where it is)" },
+            SUBTLE,
+        )
+    };
+    let strip = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.bottom() - 28.0), inner.max);
+    let (pressed, right) = if current { (None, strip.right()) } else { row_buttons(ui, strip, card.id, &[delete]) };
+    let p = ui.painter().with_clip_rect(inner);
+    p.text(
+        egui::pos2(inner.left() + 2.0, thumb.bottom() + 16.0),
+        egui::Align2::LEFT_CENTER,
+        &project.name,
+        medium_font(14.0),
+        TEXT,
+    );
+    let p = ui.painter().with_clip_rect(egui::Rect::from_min_max(strip.min, egui::pos2(right - 4.0, strip.bottom())));
+    if current {
+        p.text(
+            egui::pos2(inner.left() + 2.0, strip.center().y),
+            egui::Align2::LEFT_CENTER,
+            icon_text(icon::CHECK_CIRCLE, "Open now"),
+            medium_font(12.0),
+            ACCENT,
+        );
+    } else {
+        p.text(
+            egui::pos2(inner.left() + 2.0, strip.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("Edited {}", modified_ago(project.modified)),
+            FontId::proportional(11.5),
+            SUBTLE,
+        );
+    }
+    let card = card.on_hover_ui(|ui| {
+        ui.label(semibold(&project.name, 13.5));
+        ui.label(small_muted(&project.path));
+        ui.label(small_muted(if current {
+            "This project is open now."
+        } else if blocked {
+            "Finish the open revision before switching."
+        } else {
+            "Click to switch to it. The current project is saved first."
+        }));
+    });
+    if pressed == Some(0) {
+        if armed {
+            state.projects.confirm_delete = None;
+            return Some(false);
+        }
+        state.projects.confirm_delete = Some((project.path.clone(), std::time::Instant::now()));
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(4));
+        return None;
+    }
+    (card.clicked() && can_open).then_some(true)
 }
 
 /// The full-window library: sections on the left, a grid of asset previews on the right.
@@ -5492,8 +6053,8 @@ fn draw_command_palette(
             }
         }
         Cmd::SaveAs => state.project_dialog = Some("save".into()),
-        Cmd::Open => state.project_dialog = Some("open".into()),
-        Cmd::New => state.confirm_new_project = true,
+        Cmd::Open => open_projects(state, false),
+        Cmd::New => open_projects(state, true),
         Cmd::Recover => state.project_dialog = Some("recover".into()),
         Cmd::Export => state.show_io_modal = true,
         Cmd::SendDrafts => {
@@ -5527,13 +6088,9 @@ fn draw_command_palette(
     }
 }
 
-fn draw_dialogs(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
+fn draw_dialogs(ctx: &egui::Context, _scene: &Scene, state: &mut UiState) {
     use serde_json::json;
     let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-
-    if state.confirm_new_project {
-        draw_new_project_dialog(ctx, scene, state, escape);
-    }
 
     if let Some(mode) = state.project_dialog.clone() {
         let mut open = true;
@@ -5823,87 +6380,6 @@ pub fn measurement_text(points: &[Vec3], factor: f32, unit: &str) -> Option<Stri
 }
 
 /// What starting a new project would do to the current one, as shown in the confirmation.
-fn new_project_notice(scene: &Scene) -> (bool, String) {
-    let pending = scene.revisions.iter().any(|r| {
-        matches!(
-            r.status,
-            RevisionStatus::ReadyForReview | RevisionStatus::InProgress
-        )
-    });
-    if pending {
-        return (
-            false,
-            "Accept, revert or cancel the pending revision before starting a new project.".into(),
-        );
-    }
-    let text = match &scene.project_path {
-        Some(path) => format!(
-            "\u{201c}{}\u{201d} stays saved at {path}; changes since your last save are in its autosave. \
-             Undo (Ctrl+Z) brings it back.",
-            scene.project_name
-        ),
-        None if scene.objects.is_empty() && scene.comments.is_empty() => {
-            "The current project is empty, so nothing will be lost.".into()
-        }
-        None => format!(
-            "\u{201c}{}\u{201d} has never been saved. Save it first to keep it as a file; \
-             otherwise only Undo (Ctrl+Z) can bring it back, until you close the app.",
-            scene.project_name
-        ),
-    };
-    (true, text)
-}
-
-fn draw_new_project_dialog(ctx: &egui::Context, scene: &Scene, state: &mut UiState, escape: bool) {
-    let (allowed, notice) = new_project_notice(scene);
-    let unsaved =
-        scene.project_path.is_none() && !(scene.objects.is_empty() && scene.comments.is_empty());
-    let mut open = true;
-    egui::Window::new("New project")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .default_width(460.0)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(ctx, |ui| {
-            ui.label(small_muted(
-                "Starts a blank canvas: no objects, feedback, revisions, saved selections or views.",
-            ));
-            ui.add_space(6.0);
-            eyebrow(ui, "Project title");
-            let r = text_field(ui, &mut state.new_project_name, "Untitled project", f32::INFINITY);
-            if !r.has_focus() && ui.memory(|m| m.focused().is_none()) {
-                r.request_focus();
-            }
-            ui.add_space(4.0);
-            let color = if allowed && !unsaved { MUTED } else { WARN };
-            ui.label(RichText::new(notice).size(12.0).color(color));
-            ui.add_space(6.0);
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.horizontal(|ui| {
-                if primary(ui, "Start new project", allowed) || (enter && allowed) {
-                    action(
-                        state,
-                        "new_project",
-                        serde_json::json!({"name": state.new_project_name.trim()}),
-                    );
-                    state.new_project_name.clear();
-                    state.confirm_new_project = false;
-                }
-                if unsaved && allowed && ui.button("Save first…").clicked() {
-                    state.confirm_new_project = false;
-                    state.project_dialog = Some("save".into());
-                }
-                if ui.button("Cancel").clicked() {
-                    state.confirm_new_project = false;
-                }
-            });
-        });
-    if !open || escape {
-        state.confirm_new_project = false;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6018,6 +6494,59 @@ mod library_view_tests {
         state.library.export.budget = "20,000".into();
         assert_eq!(state.library.export.max_triangles(), Some(20_000));
         state.library.export_scope = None;
+
+        // The Projects screen and the action toast lay out with and without projects.
+        let projects = root.join("projects");
+        unsafe { std::env::set_var("RUST_MODELER_PROJECTS", &projects) };
+        let frame_projects = |scene: &Scene, state: &mut UiState| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                draw_projects_view(ctx, scene, state, false);
+                draw_toast(ctx, state, Some(1));
+            });
+        };
+        state.library.open = false;
+        open_projects(&mut state, true);
+        frame_projects(&scene, &mut state);
+        assert!(state.projects.list.is_empty());
+        std::fs::create_dir_all(&projects).unwrap();
+        for name in ["Castle", "Bookshelf"] {
+            crate::project::create_project(&projects, name, &scene, &camera).unwrap();
+        }
+        state.projects.scanned = None;
+        state.projects.search = "cast".into();
+        frame_projects(&scene, &mut state);
+        assert_eq!(state.projects.list.len(), 2);
+        state.projects.open = false;
+
+        // Adding an asset reports it with Undo, frames it, and shows the Parts list.
+        let request = crate::ipc::IpcRequest {
+            tool: "library_insert_asset".into(),
+            args: serde_json::json!({ "asset": "Furniture/Chairs/Stool" }),
+        };
+        let response = crate::ipc::IpcResponse::success(
+            "Inserted",
+            serde_json::json!({ "world_bounds_min": [10.0, 0.0, 0.0], "world_bounds_max": [12.0, 2.0, 2.0] }),
+        );
+        let mut view = OrbitCamera::default();
+        state.scene_tab = 3;
+        after_action(&mut state, &request, &response, &mut view, Some(1));
+        assert_eq!(view.target, Vec3::new(11.0, 1.0, 1.0));
+        assert_eq!(state.scene_tab, 0);
+        let toast = state.toast.clone().unwrap();
+        assert!(toast.undo_id == Some(1) && toast.text.contains("Stool"));
+        frame_projects(&scene, &mut state);
+        // A new asset stands beside the scene, on its floor, never inside it.
+        let spot = library_insert_point(&scene, &camera);
+        let stool = state.library.sections[0].subsections[1].assets[0].clone();
+        let at = spot.position_for(&stool);
+        let (_, max) = spot.bounds.unwrap();
+        assert!(at.x - stool.size[0] * 0.5 > max.x && spot.picked.is_none());
+        unsafe { std::env::remove_var("RUST_MODELER_PROJECTS") };
+        state.library.open = true;
 
         // A filter whose folder is gone falls back to everything.
         state.library.filter = Some(("Gone".into(), None));

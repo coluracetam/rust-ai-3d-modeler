@@ -523,16 +523,15 @@ impl Default for Scene {
 }
 
 impl Scene {
-    /// Replace this scene with a blank, unsaved project: no objects, comments, revisions,
-    /// saved selections or views. Returns the scene that was replaced.
-    pub fn start_new_project(&mut self, name: &str) -> Scene {
+    /// Prepare a blank project for switching, with a separate undo history generation.
+    pub fn new_project(&self, name: &str) -> Scene {
         let mut fresh = Scene::empty();
         let name = name.trim();
         if !name.is_empty() {
             fresh.project_name = name.to_string();
         }
         fresh.project_generation = self.project_generation + 1;
-        std::mem::replace(self, fresh)
+        fresh
     }
 
     pub fn empty() -> Self {
