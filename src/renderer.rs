@@ -50,8 +50,8 @@ fn layer_uniforms(layers: &[crate::texture::TextureLayer], rects: &[[f32; 4]]) -
     let mut rows = [[0.0_f32; 4]; 20];
     let count = layers.len().min(crate::texture::MAX_LAYERS).min(rects.len());
     for (i, layer) in layers.iter().take(count).enumerate() {
-        let (u, v, n) = (layer.u_axis, layer.v_axis, layer.normal());
-        let (u, v) = (u / u.length_squared(), v / v.length_squared());
+        let n = layer.normal();
+        let (u, v) = layer.projection_axes(n);
         rows[i * 5] = [layer.origin.x, layer.origin.y, layer.origin.z, layer.opacity.clamp(0.0, 1.0)];
         rows[i * 5 + 1] = [u.x, u.y, u.z, layer.depth];
         rows[i * 5 + 2] = [v.x, v.y, v.z, 0.0];

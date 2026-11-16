@@ -23,13 +23,13 @@ struct ObjectUniforms {
 struct ImageLayer {
     // xyz = top-left corner, w = opacity
     origin: vec4<f32>,
-    // xyz = top edge / its squared length, w = reach in front of and behind the image plane
+    // xyz = projection axis for u, w = reach in front of and behind the image plane
     u: vec4<f32>,
-    // xyz = left edge / its squared length
+    // xyz = projection axis for v
     v: vec4<f32>,
     // xyz = direction the image faces
     normal: vec4<f32>,
-    // where the image sits in the atlas: xy = corner, zw = size (in 0..1)
+    // xy = first texel centre, zw = span to the last texel centre, in atlas coordinates
     rect: vec4<f32>,
 };
 
@@ -253,20 +253,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Image layers, lowest first. Must match TextureLayer::sample in texture.rs.
     let layer_count = i32(object.layer_info.x);
     let local_n = normalize(in.local_normal);
+    let texel_size = vec2<f32>(1.0) / vec2<f32>(textureDimensions(layer_atlas));
     for (var i = 0; i < layer_count; i = i + 1) {
         let layer = object.layers[i];
         let offset = in.local_pos - layer.origin.xyz;
         let uv = vec2<f32>(dot(offset, layer.u.xyz), dot(offset, layer.v.xyz));
-        let texel = textureSampleLevel(
-            layer_atlas,
-            layer_sampler,
-            layer.rect.xy + clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * layer.rect.zw,
-            0.0
-        );
         let covered = dot(local_n, layer.normal.xyz) >= 0.3
             && abs(dot(offset, layer.normal.xyz)) <= layer.u.w
             && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
         if (covered) {
+            // Map image UVs to its edges, then clamp the filter to its texel centres.
+            let sample_offset = uv * (layer.rect.zw + texel_size) - 0.5 * texel_size;
+            let sample_uv = layer.rect.xy + clamp(sample_offset, vec2<f32>(0.0), layer.rect.zw);
+            let texel = textureSampleLevel(layer_atlas, layer_sampler, sample_uv, 0.0);
             surface_color = mix(surface_color, texel.rgb, texel.a * layer.origin.w);
         }
     }

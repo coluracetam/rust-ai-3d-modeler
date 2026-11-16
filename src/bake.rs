@@ -18,6 +18,7 @@
 //!    times part colour, linear), found through a bounding volume hierarchy. Empty texels
 //!    are filled from their nearest neighbours so filtering and mipmaps never show seams.
 use crate::scene::SceneObject;
+use crate::texture::{FACING, TextureLayer, apply_layers};
 use glam::{DVec3, Mat4, Vec2, Vec3};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -167,7 +168,14 @@ struct Source {
     tris: Vec<[u32; 3]>,
     scale: Vec3,
     /// Image layers (titles, labels), in the part's local space.
-    layers: Vec<crate::texture::TextureLayer>,
+    layers: Vec<TextureLayer>,
+    layer_triangles: Vec<LayerTriangle>,
+    smooth_normals: Option<crate::mesh::Shared<Vec<Vec3>>>,
+}
+
+struct LayerTriangle {
+    face_normal: Vec3,
+    density: f32,
 }
 
 fn part_scale(obj: &SceneObject) -> Vec3 {
@@ -187,21 +195,65 @@ impl Source {
             })
             .collect();
         let mut tris = Vec::new();
-        for face in mesh.faces.iter() {
+        let mut layer_triangles = Vec::new();
+        let smooth_normals = (!obj.textures.is_empty() && !obj.flat_shading).then(|| mesh.normals.clone());
+        for (fi, face) in mesh.faces.iter().enumerate() {
             if face.len() < 3 || face.iter().any(|&v| v >= positions.len()) {
                 continue;
             }
+            let face_normal = if obj.textures.is_empty() { Vec3::ZERO } else { mesh.face_normal(fi) };
             for i in 1..face.len() - 1 {
                 let tri = [face[0] as u32, face[i] as u32, face[i + 1] as u32];
                 let [a, b, c] = tri.map(|v| positions[v as usize]);
                 let area = (b - a).cross(c - a).length_squared();
                 if area > 0.0 && area.is_finite() {
                     tris.push(tri);
+                    if !obj.textures.is_empty() {
+                        let normals = tri.map(|v| {
+                            smooth_normals.as_ref().and_then(|n| n.get(v as usize)).copied().unwrap_or(face_normal)
+                        });
+                        let points = tri.map(|v| mesh.positions[v as usize]);
+                        let density = obj.textures.iter().map(|layer| {
+                            layer_density(layer, scale, points, normals)
+                        }).fold(0.0, f32::max);
+                        layer_triangles.push(LayerTriangle { face_normal, density });
+                    }
                 }
             }
         }
-        Self { positions, colors, tris, scale, layers: obj.textures.clone() }
+        Self { positions, colors, tris, scale, layers: obj.textures.clone(), layer_triangles, smooth_normals }
     }
+}
+
+/// The density of a layer that could cover any of a source triangle. A probe texel can
+/// land on the triangle and still miss a small label, so use the whole triangle here.
+fn layer_density(layer: &TextureLayer, scale: Vec3, points: [Vec3; 3], normals: [Vec3; 3]) -> f32 {
+    let facing = layer.normal();
+    let [a, b, c] = normals;
+    let can_face = if a == b && b == c {
+        a.normalize_or_zero().dot(facing) >= FACING
+    } else {
+        // An interpolated normal can face the layer even if its corners fall below FACING.
+        normals.iter().any(|n| n.dot(facing) > 0.0)
+    };
+    if !can_face || layer.opacity <= 0.0 {
+        return 0.0;
+    }
+    let (u_axis, v_axis) = layer.projection_axes(facing);
+    let [a, b, c] = points.map(|p| {
+        let d = p - layer.origin;
+        Vec3::new(d.dot(u_axis), d.dot(v_axis), d.dot(facing))
+    });
+    let min = a.min(b).min(c);
+    let max = a.max(b).max(c);
+    if min.x > 1.0 || max.x < 0.0 || min.y > 1.0 || max.y < 0.0
+        || min.z > layer.depth || max.z < -layer.depth
+    {
+        return 0.0;
+    }
+    let texel = ((layer.u_axis * scale).length() / layer.image.width as f32)
+        .min((layer.v_axis * scale).length() / layer.image.height as f32);
+    1.0 / texel.max(1e-9)
 }
 
 /// Identical parts (same geometry, colours and size) are baked once.
@@ -228,6 +280,16 @@ fn source_key(obj: &SceneObject) -> (u64, usize, usize) {
     }
     for v in obj.color.iter().chain(part_scale(obj).to_array().iter()) {
         mix(v.to_bits() as u64);
+    }
+    if !obj.textures.is_empty() {
+        mix(obj.flat_shading as u64);
+        if !obj.flat_shading {
+            for n in mesh.normals.iter() {
+                for v in n.to_array() {
+                    mix(v.to_bits() as u64);
+                }
+            }
+        }
     }
     // Two books with different titles are different parts even on the same mesh.
     for layer in &obj.textures {
@@ -257,6 +319,8 @@ struct Bvh {
     nodes: Vec<Node>,
     /// Triangles in leaf order.
     tris: Vec<[u32; 3]>,
+    /// Original index of each triangle in leaf order.
+    order: Vec<u32>,
 }
 
 impl Bvh {
@@ -272,7 +336,7 @@ impl Bvh {
         if !order.is_empty() {
             Self::build(positions, tris, &centroids, &mut order, 0, &mut nodes);
         }
-        Self { nodes, tris: order.iter().map(|&i| tris[i as usize]).collect() }
+        Self { nodes, tris: order.iter().map(|&i| tris[i as usize]).collect(), order }
     }
 
     fn build(
@@ -320,7 +384,7 @@ impl Bvh {
     /// The triangle closest to `p` and the barycentric coordinates of the closest point.
     /// Surfaces facing away from `normal` count as twice as far, so the outside of a thin
     /// sheet is not painted with its inside.
-    fn closest(&self, positions: &[Vec3], p: Vec3, normal: Vec3) -> Option<([u32; 3], [f32; 3])> {
+    fn closest(&self, positions: &[Vec3], p: Vec3, normal: Vec3) -> Option<(usize, [f32; 3])> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -338,7 +402,8 @@ impl Bvh {
             }
             let node = &self.nodes[index as usize];
             if node.count > 0 {
-                for tri in &self.tris[node.a as usize..(node.a + node.count) as usize] {
+                for i in node.a as usize..(node.a + node.count) as usize {
+                    let tri = self.tris[i];
                     let [a, b, c] = tri.map(|v| positions[v as usize]);
                     let bary = closest_bary(p, a, b, c);
                     let q = a * bary[0] + b * bary[1] + c * bary[2];
@@ -348,7 +413,7 @@ impl Bvh {
                     }
                     if d < best {
                         best = d;
-                        hit = Some((*tri, bary));
+                        hit = Some((self.order[i] as usize, bary));
                     }
                 }
                 continue;
@@ -432,32 +497,31 @@ impl Bvh {
 }
 
 impl Source {
-    /// Colour of the painted surface closest to `p`, and the size of the triangle found
-    /// there (the edge length of a square of twice its area).
-    fn color_at(&self, index: &Bvh, p: Vec3, normal: Vec3) -> ([f32; 3], f32) {
-        let Some((tri, bary)) = index.closest(&self.positions, p, normal) else {
-            return ([1.0; 3], f32::INFINITY);
+    /// Colour at the closest point, the size of its source triangle, and the texel
+    /// density needed for any images on that triangle.
+    fn color_at(&self, index: &Bvh, p: Vec3, normal: Vec3) -> ([f32; 3], f32, f32) {
+        let Some((ti, bary)) = index.closest(&self.positions, p, normal) else {
+            return ([1.0; 3], f32::INFINITY, 0.0);
         };
+        let tri = self.tris[ti];
         let [ca, cb, cc] = tri.map(|v| self.colors[v as usize]);
         let [a, b, c] = tri.map(|v| self.positions[v as usize]);
         let mut color = [0, 1, 2].map(|k| ca[k] * bary[0] + cb[k] * bary[1] + cc[k] * bary[2]);
-        let mut size = (b - a).cross(c - a).length().sqrt();
-        if !self.layers.is_empty() {
+        let size = (b - a).cross(c - a).length().sqrt();
+        let mut density = 0.0;
+        if let Some(layer_triangle) = self.layer_triangles.get(ti).filter(|t| t.density > 0.0) {
             // Layers live in local space; the source is in sized space (local times scale).
             let [la, lb, lc] = [a, b, c].map(|v| v / self.scale);
             let point = la * bary[0] + lb * bary[1] + lc * bary[2];
-            let local_normal = (lb - la).cross(lc - la).normalize_or_zero();
-            for layer in &self.layers {
-                if layer.uv(point, local_normal).is_some() {
-                    // An image is as detailed as its pixels, however few triangles carry it.
-                    let texel = ((layer.u_axis * self.scale).length() / layer.image.width as f32)
-                        .min((layer.v_axis * self.scale).length() / layer.image.height as f32);
-                    size = size.min(texel);
-                }
-            }
-            color = crate::texture::apply_layers(&self.layers, color, point, local_normal);
+            let face_normal = layer_triangle.face_normal;
+            let local_normal = self.smooth_normals.as_ref().map_or(face_normal, |normals| {
+                let [a, b, c] = tri.map(|v| normals.get(v as usize).copied().unwrap_or(face_normal));
+                (a * bary[0] + b * bary[1] + c * bary[2]).normalize_or_zero()
+            });
+            color = apply_layers(&self.layers, color, point, local_normal);
+            density = layer_triangle.density;
         }
-        (color, size)
+        (color, size, density)
     }
 }
 
@@ -1177,6 +1241,7 @@ struct Tile {
     distance: Vec<f32>,
     /// Size of the source triangles found under the texels inside the chart.
     source_sizes: Vec<f32>,
+    layer_density: f32,
 }
 
 fn tile_size(extent: Vec2, density: f32, margin: u32) -> (u32, u32) {
@@ -1221,6 +1286,7 @@ fn sample_chart(
     }
     let mut colors = vec![[0.0; 3]; texels];
     let mut source_sizes = Vec::new();
+    let mut layer_density = 0.0_f32;
     for texel in 0..texels {
         let i = owner[texel];
         if i == u32::MAX {
@@ -1237,8 +1303,9 @@ fn sample_chart(
             for sx in 0..samples {
                 let offset = |s: u32| (s as f32 + 0.5) / samples as f32;
                 let bary = closest_bary(Vec3::new(x + offset(sx), y + offset(sy), 0.0), a, b, c);
-                let (color, source_size) =
+                let (color, source_size, image_density) =
                     source.color_at(index, pa * bary[0] + pb * bary[1] + pc * bary[2], normal);
+                layer_density = layer_density.max(image_density);
                 for k in 0..3 {
                     sum[k] += color[k];
                 }
@@ -1249,7 +1316,7 @@ fn sample_chart(
         }
         colors[texel] = sum.map(|v| v / (samples * samples) as f32);
     }
-    Tile { width, height, colors, distance, source_sizes }
+    Tile { width, height, colors, distance, source_sizes, layer_density }
 }
 
 /// How much atlas a chart needs.
@@ -1518,17 +1585,17 @@ pub fn bake(
         let span = chart.extent.max_element().max(1e-9);
         let density = probe.max(8.0 / span).min(probe * 64.0).min(size as f32 / span);
         let mut tile = sample_chart(&part.low, chart, &uniques[u].source, &part.index, density, 0, 1);
-        let detail = chart_detail(&tile);
+        let detail = if tile.layer_density > 0.0 { Detail::Painted } else { chart_detail(&tile) };
         let sizes = &mut tile.source_sizes;
         let wanted = if sizes.is_empty() {
             density
         } else {
-            // The finer third of the chart sets the pace, so lettering on a mostly plain
-            // surface stays sharp.
+            // The finer third of the chart sets the pace for vertex-painted details.
             let third = sizes.len() / 3;
             let (_, fine, _) = sizes.select_nth_unstable_by(third, f32::total_cmp);
             TEXELS_PER_SOURCE_EDGE / fine.max(1e-9)
         };
+        let wanted = wanted.max(tile.layer_density);
         (detail, if detail == Detail::Smooth { wanted * 0.5 } else { wanted })
     });
 
@@ -1800,9 +1867,9 @@ pub(crate) mod tests {
         let scene = striped_block();
         let source = Source::new(&scene.objects[0]);
         let index = Bvh::new(&source.positions, &source.tris);
-        let (red, size) = source.color_at(&index, Vec3::new(0.6, -0.4, 0.1), Vec3::X);
-        let (blue, _) = source.color_at(&index, Vec3::new(0.6, -0.1, 0.1), Vec3::X);
-        let (grey, _) = source.color_at(&index, Vec3::new(-0.7, 0.0, 0.0), Vec3::NEG_X);
+        let (red, size, _) = source.color_at(&index, Vec3::new(0.6, -0.4, 0.1), Vec3::X);
+        let (blue, _, _) = source.color_at(&index, Vec3::new(0.6, -0.1, 0.1), Vec3::X);
+        let (grey, _, _) = source.color_at(&index, Vec3::new(-0.7, 0.0, 0.0), Vec3::NEG_X);
         assert!((size - 1.0 / 16.0).abs() < 1e-4, "{size}");
         // A ray from inside the block is stopped; one from outside pointing away is not.
         assert!(index.blocked(&source.positions, Vec3::ZERO, Vec3::new(0.3, 0.2, 0.9)));
@@ -1810,6 +1877,32 @@ pub(crate) mod tests {
         assert!(red[0] > 0.9 && red[2] < 0.1, "{red:?}");
         assert!(blue[2] > 0.9 && blue[0] < 0.1, "{blue:?}");
         assert!((grey[0] - 0.8).abs() < 1e-3);
+    }
+
+    #[test]
+    fn small_image_layers_keep_their_space_in_the_atlas() {
+        use crate::texture::{TextureImage, TextureLayer};
+        use std::sync::Arc;
+
+        let mut scene = Scene::empty();
+        scene.add_mesh_object("Crate", Mesh::cube(1.0), [0.4; 3]);
+        let obj = &mut scene.objects[0];
+        obj.textures.push(TextureLayer {
+            name: "Decal".into(),
+            image: Arc::new(TextureImage::new(32, 32, [255, 0, 0, 255].repeat(32 * 32)).unwrap()),
+            origin: Vec3::new(0.217, 0.338, 0.5),
+            u_axis: Vec3::X * 0.017,
+            v_axis: Vec3::NEG_Y * 0.014,
+            depth: 0.01,
+            opacity: 1.0,
+        });
+        let baked = bake(&[obj], None, 512, false, false).unwrap();
+        let atlas = image::load_from_memory(&baked.png).unwrap().to_rgb8();
+        let red_texels = atlas
+            .pixels()
+            .filter(|p| p[0] > 220 && p[1] < 60 && p[2] < 60)
+            .count();
+        assert!(red_texels >= 20, "{red_texels} red texels");
     }
 
     #[test]

@@ -141,9 +141,20 @@ impl TextureLayer {
         self.v_axis.cross(self.u_axis).normalize_or_zero()
     }
 
+    /// Vector dot products with these axes recover the image coordinates.
+    pub fn projection_axes(&self, normal: Vec3) -> (Vec3, Vec3) {
+        let u = normal.cross(self.v_axis);
+        let v = self.u_axis.cross(normal);
+        (u / u.dot(self.u_axis), v / v.dot(self.v_axis))
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let finite = self.origin.is_finite() && self.u_axis.is_finite() && self.v_axis.is_finite();
-        if !finite || self.u_axis.length() < 1e-6 || self.v_axis.length() < 1e-6 || self.normal() == Vec3::ZERO {
+        let normal = self.normal();
+        let (u, v) = self.projection_axes(normal);
+        if !finite || self.u_axis.length() < 1e-6 || self.v_axis.length() < 1e-6
+            || normal == Vec3::ZERO || !u.is_finite() || !v.is_finite()
+        {
             return Err(format!("Texture layer '{}' has no usable rectangle", self.name));
         }
         if !(self.depth.is_finite() && self.depth > 0.0 && self.opacity.is_finite()) {
@@ -167,8 +178,9 @@ impl TextureLayer {
         if normal.dot(towards) < FACING || offset.dot(towards).abs() > self.depth {
             return None;
         }
-        let u = offset.dot(self.u_axis) / self.u_axis.length_squared();
-        let v = offset.dot(self.v_axis) / self.v_axis.length_squared();
+        let (u_axis, v_axis) = self.projection_axes(towards);
+        let u = offset.dot(u_axis);
+        let v = offset.dot(v_axis);
         ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some((u, v))
     }
 
@@ -363,5 +375,14 @@ mod tests {
         assert!(label.rgba.chunks_exact(4).any(|p| p[0] < 40) && label.rgba[0] == 255);
         assert!(render_text("  ", 64, 64, &style).is_err());
         assert!(TextureImage::new(4096, 16, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn image_coordinates_follow_skewed_axes() {
+        let mut layer = front_layer();
+        layer.v_axis += layer.u_axis * 0.5;
+        layer.validate().unwrap();
+        let point = layer.origin + layer.u_axis * 0.75 + layer.v_axis * 0.75;
+        assert_eq!(layer.uv(point, Vec3::Z), Some((0.75, 0.75)));
     }
 }
